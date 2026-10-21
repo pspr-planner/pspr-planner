@@ -1,0 +1,208 @@
+{
+  "domain": {
+    "name": "transport",
+    "types": [
+      { "name": "locatable" },
+      { "name": "truck", "symbol_type": "locatable" },
+      { "name": "place", "symbol_type": "locatable" }
+    ],
+    "constants": [
+      { "name": "depot", "symbol_type": "place" }
+    ],
+    "requirements": [
+      "Hierarchy",
+      "TypedObjects",
+      "MethodPreconditions",
+      "NegativePreconditions"
+    ],
+    "predicates": [
+      {
+        "name": "at",
+        "variables": [
+          { "name": "?t", "symbol_type": "truck" },
+          { "name": "?p", "symbol_type": "place" }
+        ]
+      },
+      {
+        "name": "road",
+        "variables": [
+          { "name": "?from", "symbol_type": "place" },
+          { "name": "?to", "symbol_type": "place" }
+        ]
+      }
+    ],
+    "compound_tasks": [
+      {
+        "name": "deliver",
+        "parameters": [
+          { "name": "?p", "symbol_type": "place" }
+        ]
+      }
+    ],
+    "methods": [
+      {
+        "name": { "name": "m-deliver" },
+        "task": { "name": "deliver" },
+        "task_terms": [
+          { "name": "?p", "symbol_type": "place" }
+        ],
+        "params": [
+          { "name": "?p", "symbol_type": "place" }
+        ],
+        "precondition": {
+          "And": [
+            {
+              "Atom": {
+                "name": "road",
+                "variables": [
+                  { "name": "depot" },
+                  { "name": "?p" }
+                ]
+              }
+            }
+          ]
+        },
+        "tn": {
+          "subtasks": [
+            {
+              "id": { "name": "t1" },
+              "task": { "name": "drive" },
+              "terms": [
+                { "name": "depot" },
+                { "name": "?p" }
+              ]
+            },
+            {
+              "task": { "name": "noop" },
+              "terms": []
+            }
+          ],
+          "orderings": {
+            "Partial": [
+              ["t1", "t2"]
+            ]
+          },
+          "constraints": [
+            { "Equal": ["?p", "depot"] },
+            { "NotEqual": ["?p", "other"] }
+          ]
+        }
+      },
+      {
+        "name": { "name": "m-noop" },
+        "task": { "name": "deliver" },
+        "task_terms": [],
+        "params": [],
+        "tn": {
+          "subtasks": [],
+          "orderings": "Total"
+        }
+      }
+    ],
+    "actions": [
+      {
+        "name": "drive",
+        "parameters": [
+          { "name": "?from", "symbol_type": "place" },
+          { "name": "?to", "symbol_type": "place" }
+        ],
+        "preconditions": {
+          "And": [
+            {
+              "Atom": {
+                "name": "road",
+                "variables": [
+                  { "name": "?from" },
+                  { "name": "?to" }
+                ]
+              }
+            },
+            {
+              "Not": {
+                "Atom": {
+                  "name": "at",
+                  "variables": [
+                    { "name": "?to" }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "effects": {
+          "Not": {
+            "Atom": {
+              "name": "at",
+              "variables": [
+                { "name": "?from" }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "name": "noop",
+        "parameters": []
+      }
+    ],
+    "functions": [
+      {
+        "name": "distance",
+        "variables": [
+          { "name": "?x", "symbol_type": "place" },
+          { "name": "?y", "symbol_type": "place" }
+        ]
+      }
+    ]
+  },
+  "problem": {
+    "name": "p1",
+    "domain_name": "transport",
+    "requirements": [
+      "Hierarchy"
+    ],
+    "init_tn": {
+      "parameters": [
+        { "name": "?p", "symbol_type": "place" }
+      ],
+      "tn": {
+        "subtasks": [
+          {
+            "id": { "name": "t0" },
+            "task": { "name": "deliver" },
+            "terms": [
+              { "name": "?p" }
+            ]
+          }
+        ],
+        "orderings": "Total"
+      }
+    },
+    "init_state": [
+      {
+        "name": "at",
+        "variables": [
+          { "name": "truck1" },
+          { "name": "depot" }
+        ]
+      }
+    ],
+    "goal": {
+      "And": [
+        {
+          "Atom": {
+            "name": "at",
+            "variables": [
+              { "name": "truck1" },
+              { "name": "depot" }
+            ]
+          }
+        }
+      ]
+    },
+    "objects": [
+      { "name": "truck1", "symbol_type": "truck" },
+      { "name": "depot", "symbol_type": "place" }
+    ]
+  }
+}

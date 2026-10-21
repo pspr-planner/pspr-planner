@@ -1,0 +1,16 @@
+{
+  "domain": {
+    "name": "minimal",
+    "requirements": [],
+    "predicates": [],
+    "compound_tasks": [],
+    "methods": [],
+    "actions": [
+      {
+        "name": "noop",
+        "parameters": []
+      }
+    ],
+    "functions": []
+  }
+}

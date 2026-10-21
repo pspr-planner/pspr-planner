@@ -1,0 +1,60 @@
+{
+  "domain": {
+    "name": "formulas",
+    "types": null,
+    "constants": null,
+    "requirements": [],
+    "predicates": [
+      { "name": "p", "variables": [] },
+      { "name": "q", "variables": [] }
+    ],
+    "compound_tasks": [],
+    "methods": [],
+    "actions": [
+      {
+        "name": "a",
+        "parameters": [],
+        "preconditions": {
+          "And": [
+            { "Atom": { "name": "p", "variables": [] } },
+            { "Not": { "Atom": { "name": "q", "variables": [] } } },
+            { "Or": [ { "Atom": { "name": "p", "variables": [] } } ] },
+            { "Xor": [ { "Atom": { "name": "p", "variables": [] } } ] },
+            {
+              "Imply": [
+                { "Atom": { "name": "p", "variables": [] } },
+                { "Atom": { "name": "q", "variables": [] } }
+              ]
+            },
+            {
+              "Exists": [
+                [ { "name": "?x", "symbol_type": "t" } ],
+                { "Atom": { "name": "p", "variables": [ { "name": "?x" } ] } }
+              ]
+            },
+            {
+              "ForAll": [
+                [ { "name": "?x" } ],
+                { "Equals": ["?x", "a"] }
+              ]
+            },
+            {
+              "Probabilistic": [
+                { "Real": 0.25 },
+                { "Equals": ["a", "b"] }
+              ]
+            },
+            {
+              "Probabilistic": [
+                { "Integer": 2 },
+                "Empty"
+              ]
+            }
+          ]
+        },
+        "effects": "Empty"
+      }
+    ],
+    "functions": []
+  }
+}

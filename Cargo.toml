@@ -1,0 +1,25 @@
+[package]
+name = "pspr-planner"
+version = "0.1.0"
+edition = "2024"
+description = "HDDL domain/problem loader and solver scaffold"
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+
+[lib]
+name = "pspr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pspr"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+good_lp = { version = "1.15.3", features = ["scip", "scip_bundled"] }
+nalgebra = "0.35.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
