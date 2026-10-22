@@ -1,0 +1,511 @@
+% Bibliography for pspr.
+%
+% Every entry has an `annote` field describing why the work is relevant, where
+% it is used in this repository, and any citation caveats. Entries are grouped
+% by topic; the grouping is only a comment, the file is a single BibTeX
+% database.
+%
+% Quick index:
+%   Planning languages/formalism ... holler2020hddl, mcdermott1998pddl,
+%                                   erol1994umcp, erol1996complexity,
+%                                   ghallab2004automated
+%   Planning algorithms .......... helmert2006fastdownward, hoffmann2001ff,
+%                                   bonet2001planning, hsu2006sgplan,
+%                                   nau2003shop2, alford2009translating,
+%                                   behnke2019bringing, korf1985macro
+%   Clustering ................... gilpin2013hierarchical, braun2023bisbm,
+%                                   vonluxburg2007spectral,
+%                                   arthur2007kmeanspp, hakimi1965optimum
+%   Numerical optimization ....... kingma2015adam, achterberg2009scip,
+%                                   hojny2025scipsuite
+%   Algorithms/utilities ......... tarjan1972depth, steele2014splitmix
+%   Software and data ............ yousefi2025hddlparser, sleath2023detecting,
+%                                   holler2021panda, behnke2020grounding,
+%                                   goodlp, ipc2023domains
+
+% ---------------------------------------------------------------------------
+% Planning languages and formalism
+% ---------------------------------------------------------------------------
+
+@inproceedings{holler2020hddl,
+  author    = {H{\"o}ller, Daniel and Behnke, Gregor and Bercher, Pascal and
+               Biundo, Susanne and Fiorino, Humbert and Pellier, Damien and
+               Alford, Ron},
+  title     = {{HDDL}: An Extension to {PDDL} for Expressing Hierarchical
+               Planning Problems},
+  booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume    = {34},
+  pages     = {9883--9891},
+  year      = {2020},
+  doi       = {10.1609/aaai.v34i06.6542},
+  annote    = {Defines HDDL, the input language of the planner. Cite it whenever
+               the accepted input format or its semantics are described.
+               Used throughout src/parsing/ (the JSON AST mirrors the HDDL
+               grammar), in the README requirements, and in tests/ipc.rs, which
+               runs the IPC HDDL benchmarks.}
+}
+
+@techreport{mcdermott1998pddl,
+  author      = {McDermott, Drew and Ghallab, Malik and Howe, Adele and
+                 Knoblock, Craig and Ram, Ashwin and Veloso, Manuela and
+                 Weld, Daniel and Wilkins, David},
+  title       = {{PDDL}---The Planning Domain Definition Language},
+  institution = {Yale Center for Computational Vision and Control},
+  number      = {CVC TR-98-003/DCS TR-1165},
+  year        = {1998},
+  annote      = {The classical planning language that HDDL extends, and the
+                 origin of the formula concepts (preconditions, effects, ADL
+                 constructs) translated in src/solver/evaluation_tree/formula.rs.
+                 Cite as background when comparing the formula fragment to
+                 PDDL/ADL.}
+}
+
+@inproceedings{erol1994umcp,
+  author    = {Erol, Kutluhan and Hendler, James and Nau, Dana S.},
+  title     = {{UMCP}: A Sound and Complete Procedure for Hierarchical Task
+               Network Planning},
+  booktitle = {Proceedings of the Second International Conference on Artificial
+               Intelligence Planning Systems (AIPS-94)},
+  pages     = {249--254},
+  publisher = {AAAI Press},
+  year      = {1994},
+  annote    = {Formal HTN planning with task networks, methods and ordering
+               constraints; the semantics that the evaluation tree approximates.
+               Cite in discussions of the task network, compound tasks and
+               method decomposition, e.g. src/solver/evaluation_tree/mod.rs and
+               the "Modelling limitations" section of the docs.}
+}
+
+@article{erol1996complexity,
+  author  = {Erol, Kutluhan and Hendler, James and Nau, Dana S.},
+  title   = {Complexity Results for {HTN} Planning},
+  journal = {Annals of Mathematics and Artificial Intelligence},
+  volume  = {18},
+  number  = {1},
+  pages   = {69--93},
+  year    = {1996},
+  doi     = {10.1007/BF02136175},
+  annote  = {Complexity results for hierarchical task-network planning. Use it
+             when discussing why eager expansion, progression search and exact
+             method-choice encodings can blow up, and why the bounded-depth
+             encodings in docs/compound-tasks.md need an explicit bound.}
+}
+
+@book{ghallab2004automated,
+  author    = {Ghallab, Malik and Nau, Dana and Traverso, Paolo},
+  title     = {Automated Planning: Theory and Practice},
+  publisher = {Morgan Kaufmann},
+  address   = {San Francisco, CA},
+  year      = {2004},
+  isbn      = {1-55860-856-7},
+  annote    = {Textbook treatment of state-transition planning, HTN planning,
+               partial-order planning and plan-refinement semantics. Cite for
+               the formal definitions that docs/compound-tasks.md uses when
+               extending PSPR's task-network relaxation to compound tasks.}
+}
+
+% ---------------------------------------------------------------------------
+% Planning algorithms
+% ---------------------------------------------------------------------------
+
+@article{helmert2006fastdownward,
+  author  = {Helmert, Malte},
+  title   = {The {Fast Downward} Planning System},
+  journal = {Journal of Artificial Intelligence Research},
+  volume  = {26},
+  pages   = {191--246},
+  year    = {2006},
+  doi     = {10.1613/jair.1705},
+  url     = {https://jair.org/index.php/jair/article/view/10457},
+  annote  = {Primary reference for src/solver/fast_downward/: multi-valued
+             planning tasks (Section 4), domain transition graphs and causal
+             graph pruning (Section 5), the causal graph heuristic and the
+             relaxed planning graph (Section 6.1/6.2), and best-first search
+             with preferred operators and deferred evaluation (Sections 6.3
+             and 6.4). Each submodule names the section it follows.}
+}
+
+@article{hoffmann2001ff,
+  author  = {Hoffmann, J{\"o}rg and Nebel, Bernhard},
+  title   = {The {FF} Planning System: Fast Plan Generation Through Heuristic
+             Search},
+  journal = {Journal of Artificial Intelligence Research},
+  volume  = {14},
+  pages   = {253--302},
+  year    = {2001},
+  doi     = {10.1613/jair.855},
+  annote  = {Origin of the h-FF heuristic implemented in
+             src/solver/fast_downward/heuristics.rs::ff_heuristic. Cite it
+             together with helmert2006fastdownward whenever the heuristic is
+             described; Helmert's description of the relaxed planning graph is
+             the implementation reference, FF is the algorithmic source.}
+}
+
+@article{bonet2001planning,
+  author  = {Bonet, Blai and Geffner, H{\'e}ctor},
+  title   = {Planning as Heuristic Search},
+  journal = {Artificial Intelligence},
+  volume  = {129},
+  number  = {1--2},
+  pages   = {5--33},
+  year    = {2001},
+  doi     = {10.1016/S0004-3702(01)00108-8},
+  annote  = {Origin of the h-max heuristic implemented in
+             src/solver/fast_downward/heuristics.rs::h_max (and of the
+             additive heuristic family). Cite together with
+             helmert2006fastdownward when describing h-max; the DTG-based
+             computation follows Helmert.}
+}
+
+@article{hsu2006sgplan,
+  author  = {Hsu, Chih-Wei and Wah, Benjamin W. and Huang, Ruoyun and
+             Chen, Yixin},
+  title   = {Constraint Partitioning in Penalty Formulations for Solving
+             Temporal Planning Problems},
+  journal = {Artificial Intelligence},
+  volume  = {170},
+  number  = {3},
+  pages   = {187--231},
+  year    = {2006},
+  doi     = {10.1016/j.artint.2005.07.001},
+  annote  = {The constraint-partitioning and penalty formulation this planner is
+             based on. Cite in the README, in
+             src/solver/evaluation_tree/mod.rs (pipeline overview) and in
+             src/solver/evaluation_tree/merge/mod.rs and merge/sgplan.rs, which
+             implement the relaxed penalty merger. The continuous relaxation,
+             Adam optimizer and multi-space continuation are extensions of
+             this formulation, not part of the original SGPlan paper.}
+}
+
+@article{nau2003shop2,
+  author  = {Nau, Dana S. and Au, Tsz-Chiu and Ilghami, Okhtay and Kuter,
+             Ugur and Murdock, J. William and Wu, Dan and Yaman, Fusun},
+  title   = {{SHOP2}: An {HTN} Planning System},
+  journal = {Journal of Artificial Intelligence Research},
+  volume  = {20},
+  pages   = {379--404},
+  year    = {2003},
+  doi     = {10.1613/jair.1141},
+  annote  = {A canonical progression HTN planner with ordered and unordered
+             task decomposition. Cite for the agenda-based decomposition and
+             execution loop in docs/compound-tasks.md (Approach B) and for
+             the idea of interleaving method expansion with primitive
+             execution.}
+}
+
+@inproceedings{alford2009translating,
+  author    = {Alford, Ronald and Kuter, Ugur and Nau, Dana S.},
+  title     = {Translating {HTNs} to {PDDL}: A Small Amount of Domain
+               Knowledge Can Go a Long Way},
+  booktitle = {Proceedings of the 21st International Joint Conference on
+               Artificial Intelligence (IJCAI)},
+  pages     = {1629--1634},
+  year      = {2009},
+  url       = {https://www.ijcai.org/Proceedings/09/Papers/272.pdf},
+  annote    = {Compiles HTN planning into classical PDDL with task and
+               completion predicates. Cite in docs/compound-tasks.md
+               (Approach E) as the origin of the task-atom compilation. The
+               translation is for a restricted, totally ordered fragment and
+               assumes a bound on the non-tail decomposition height.}
+}
+
+@inproceedings{behnke2019bringing,
+  author    = {Behnke, Gregor and H{\"o}ller, Daniel and Biundo, Susanne},
+  title     = {Bringing Order to Chaos -- A Compact Representation of Partial
+               Order in {SAT}-Based {HTN} Planning},
+  booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume    = {33},
+  pages     = {7520--7529},
+  year      = {2019},
+  doi       = {10.1609/aaai.v33i01.33017520},
+  annote    = {Compact SAT encoding of partial-order HTN planning. Cite in
+               docs/compound-tasks.md (Approach F) for the bounded-depth
+               method-choice and ordering encoding, and as the theoretical
+               reference for pandaPI's SAT search mode.}
+}
+
+@article{korf1985macro,
+  author  = {Korf, Richard E.},
+  title   = {Macro-Operators: A Weak Method for Learning},
+  journal = {Artificial Intelligence},
+  volume  = {26},
+  number  = {1},
+  pages   = {35--77},
+  year    = {1985},
+  doi     = {10.1016/0004-3702(85)90012-8},
+  annote  = {Origin of macro-operators: summarising a fixed action sequence
+             as one operator. Cite in docs/compound-tasks.md (Approach G) for
+             the summarised-effect compilation of a method; the exactness
+             conditions stated there are the standard caveats for macros.}
+}
+
+% ---------------------------------------------------------------------------
+% Clustering
+% ---------------------------------------------------------------------------
+
+@inproceedings{gilpin2013hierarchical,
+  author    = {Gilpin, Sean and Nijssen, Siegfried and Davidson, Ian},
+  title     = {Formalizing Hierarchical Clustering as Integer Linear
+               Programming},
+  booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume    = {27},
+  pages     = {372--378},
+  year      = {2013},
+  doi       = {10.1609/aaai.v27i1.8671},
+  annote    = {Source of the merge-level ILP in
+               src/solver/partition/agglomeration/hierarchy.rs (the formulation
+               in their Figure 2) and of the dendrogram formulation in
+               agglomeration/mod.rs. The scheduling ILP, the shared-constraint
+               height objective and the planning-style search are extensions
+               built on top of it.}
+}
+
+@misc{braun2023bisbm,
+  author        = {Braun, Guillaume},
+  title         = {Strong Consistency Guarantees for Clustering
+                   High-Dimensional Bipartite Graphs with the Spectral Method},
+  year          = {2023},
+  eprint        = {2304.06903},
+  archivePrefix = {arXiv},
+  primaryClass  = {math.ST},
+  doi           = {10.48550/arXiv.2304.06903},
+  url           = {https://arxiv.org/abs/2304.06903},
+  annote        = {The BiSBM spectral method implemented in
+                   src/solver/partition/bisbm/: the hollowed Gram matrix
+                   H(A A^T), the AdaSpec rank rule and the normalized-Laplacian
+                   fallback. Cite wherever the bipartite spectral clustering is
+                   described (bisbm/mod.rs, spectral.rs and the evaluation-tree
+                   pipeline docs).}
+}
+
+@article{vonluxburg2007spectral,
+  author  = {von Luxburg, Ulrike},
+  title   = {A Tutorial on Spectral Clustering},
+  journal = {Statistics and Computing},
+  volume  = {17},
+  number  = {4},
+  pages   = {395--416},
+  year    = {2007},
+  doi     = {10.1007/s11222-007-9033-z},
+  annote  = {Background for the normalized Laplacian, its spectrum and the
+             eigengap heuristic used in src/solver/partition/bisbm/spectral.rs
+             and for the spectral clustering step in
+             src/solver/evaluation_tree/clustering.rs. Cite as the general
+             reference, with braun2023bisbm as the problem-specific method.}
+}
+
+@inproceedings{arthur2007kmeanspp,
+  author    = {Arthur, David and Vassilvitskii, Sergei},
+  title     = {k-means++: The Advantages of Careful Seeding},
+  booktitle = {Proceedings of the Eighteenth Annual ACM-SIAM Symposium on
+               Discrete Algorithms (SODA)},
+  pages     = {1027--1035},
+  publisher = {SIAM},
+  year      = {2007},
+  annote    = {Origin of the D^2 seeding used by
+               src/solver/partition/bisbm/kmedians.rs::initial_centers. The
+               implementation is deterministic (SplitMix64, fixed seed), but
+               the seeding rule is the k-means++ one. Cite when describing the
+               cluster initialization.}
+}
+
+@article{hakimi1965optimum,
+  author  = {Hakimi, S. L.},
+  title   = {Optimum Distribution of Switching Centers in a Communication
+             Network and Some Related Graph Theoretic Problems},
+  journal = {Operations Research},
+  volume  = {13},
+  number  = {3},
+  pages   = {462--475},
+  year    = {1965},
+  doi     = {10.1287/opre.13.3.462},
+  annote  = {Classic reference for the k-medians objective minimised by
+             src/solver/partition/bisbm/kmedians.rs (coordinate-wise median
+             updates). Optional background; cite if the k-medians step is
+             described as a standalone algorithm.}
+}
+
+% ---------------------------------------------------------------------------
+% Numerical optimization
+% ---------------------------------------------------------------------------
+
+@inproceedings{kingma2015adam,
+  author    = {Kingma, Diederik P. and Ba, Jimmy},
+  title     = {Adam: A Method for Stochastic Optimization},
+  booktitle = {Proceedings of the 3rd International Conference on Learning
+               Representations (ICLR)},
+  year      = {2015},
+  eprint    = {1412.6980},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url       = {https://arxiv.org/abs/1412.6980},
+  annote    = {The optimizer implemented in
+               src/solver/evaluation_tree/merge/adam.rs and used by
+               merge/sgplan.rs to minimise the relaxed SGPlan objective. Cite
+               whenever the Adam update, its bias correction or the
+               per-coordinate step normalization is discussed.}
+}
+
+@article{achterberg2009scip,
+  author  = {Achterberg, Tobias},
+  title   = {{SCIP}: Solving Constraint Integer Programs},
+  journal = {Mathematical Programming Computation},
+  volume  = {1},
+  number  = {1},
+  pages   = {1--41},
+  year    = {2009},
+  doi     = {10.1007/s12532-008-0001-1},
+  annote  = {The algorithmic reference for the branch-and-cut solver behind the
+             ILPs in src/solver/partition/agglomeration/hierarchy.rs and
+             schedule.rs. Cargo.toml uses good_lp with the scip and
+             scip_bundled features; scip-sys bundles SCIP 10.0.2. For the exact
+             bundled version, cite hojny2025scipsuite as well; this entry is
+             the stable algorithmic reference.}
+}
+
+@techreport{hojny2025scipsuite,
+  author      = {Hojny, Christopher and Besan{\c c}on, Mathieu and
+                 Bestuzheva, Ksenia and Borst, Sander and Chmiela, Antonia and
+                 Dion{\'i}sio, Jo{\~a}o and Eifler, Leon and Ghannam, Mohammed and
+                 Gleixner, Ambros and G{\"o}{\ss}, Adrian and Hoen, Alexander and
+                 van der Hulst, Rolf and Kamp, Dominik and Koch, Thorsten and
+                 Kofler, Kevin and Lentz, Jurgen and Maher, Stephen J. and
+                 Mexi, Gioni and M{\"u}hmer, Erik and Pfetsch, Marc E. and
+                 Pokutta, Sebastian and Serrano, Felipe and Shinano, Yuji and
+                 Turner, Mark and Vigerske, Stefan and Walter, Matthias and
+                 Weninger, Dieter and Xu, Liding},
+  title       = {The {SCIP} Optimization Suite 10.0},
+  institution = {Optimization Online},
+  year        = {2025},
+  month       = nov,
+  url         = {https://optimization-online.org/2025/11/the-scip-optimization-suite-10-0/},
+  annote      = {Release report recommended by the SCIP project for SCIP 10.0.
+                 The scip-sys crate used here bundles SCIP 10.0.2, so this is
+                 the version-specific citation to use next to
+                 achterberg2009scip.}
+}
+
+% ---------------------------------------------------------------------------
+% Algorithms and utilities
+% ---------------------------------------------------------------------------
+
+@article{tarjan1972depth,
+  author  = {Tarjan, Robert Endre},
+  title   = {Depth-First Search and Linear Graph Algorithms},
+  journal = {SIAM Journal on Computing},
+  volume  = {1},
+  number  = {2},
+  pages   = {146--160},
+  year    = {1972},
+  doi     = {10.1137/0201010},
+  annote  = {The strongly connected component algorithm used for cycle pruning
+             in src/solver/fast_downward/transitions.rs. Cite when describing
+             the SCC-based pruning of domain transition graphs.}
+}
+
+@inproceedings{steele2014splitmix,
+  author    = {Steele, Jr., Guy L. and Lea, Doug and Flood, Christine H.},
+  title     = {Fast Splittable Pseudorandom Number Generators},
+  booktitle = {Proceedings of the 2014 ACM International Conference on
+               Object Oriented Programming Systems Languages and Applications
+               (OOPSLA)},
+  pages     = {453--472},
+  year      = {2014},
+  doi       = {10.1145/2660193.2660195},
+  annote    = {The SplitMix64 generator implemented in
+             src/solver/partition/bisbm/kmedians.rs::SplitMix64 and used with a
+             fixed seed to make the k-medians initialization reproducible.
+             Cite when describing how deterministic seeding is achieved.}
+}
+
+% ---------------------------------------------------------------------------
+% Software and data
+% ---------------------------------------------------------------------------
+
+@inproceedings{yousefi2025hddlparser,
+  author    = {Yousefi, Mohammad and Bercher, Pascal},
+  title     = {{HDDL Parser}: A Realtime Hierarchical Planning Language
+               Validation Toolkit},
+  booktitle = {Proceedings of the 35th International Conference on Automated
+               Planning and Scheduling (ICAPS), Demonstration Track},
+  address   = {Melbourne, Australia},
+  year      = {2025},
+  url       = {https://icaps25.icaps-conference.org/program/demos-pdfs/ICAPS25-Demo_paper_2.pdf},
+  annote    = {The external hddl_analyzer executable used by
+               src/parsing/parser.rs to convert HDDL into the JSON AST mirrored
+               in src/parsing/json.rs. Cite whenever the parser dependency,
+               its JSON export or the IPC integration tests are discussed.
+               The README also notes that the parser's licence restricts
+               commercial use.}
+}
+
+@article{holler2021panda,
+  author  = {H{\"o}ller, Daniel and Behnke, Gregor and Bercher, Pascal and
+             Biundo, Susanne},
+  title   = {The {PANDA} Framework for Hierarchical Planning},
+  journal = {KI -- K{\"u}nstliche Intelligenz},
+  volume  = {35},
+  number  = {3--4},
+  pages   = {391--396},
+  year    = {2021},
+  doi     = {10.1007/s13218-020-00699-y},
+  annote  = {Overview of the PANDA planner family, including the progression
+             search used by pandaPI. Cite in the README when introducing the
+             empirical PANDA baseline, and when explaining why PANDA is a
+             full HTN planner rather than the task-network relaxation solved
+             by PSPR.}
+}
+
+@inproceedings{behnke2020grounding,
+  author    = {Behnke, Gregor and H{\"o}ller, Daniel and Schmid, Alexander and
+               Bercher, Pascal and Biundo, Susanne},
+  title     = {On Succinct Groundings of {HTN} Planning Problems},
+  booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume    = {34},
+  pages     = {9775--9784},
+  year      = {2020},
+  doi       = {10.1609/aaai.v34i06.6529},
+  annote    = {The grounding algorithm behind pandaPIgrounder, which turns the
+               lifted HTN problem into the SAS+ task solved by pandaPIengine.
+               Cite when describing the pandaPI pipeline or comparing PSPR's
+               partition-local grounding with full grounding.}
+}
+
+@inproceedings{sleath2023detecting,
+  author    = {Sleath, Kayleigh and Bercher, Pascal},
+  title     = {Detecting {AI} Planning Modelling Mistakes -- Potential Errors
+               and Benchmark Domains},
+  booktitle = {PRICAI 2023: Trends in Artificial Intelligence},
+  series    = {Lecture Notes in Computer Science},
+  pages     = {448--454},
+  publisher = {Springer},
+  year      = {2023},
+  doi       = {10.1007/978-981-99-7022-3_41},
+  annote    = {The error catalogue behind HDDL-Parser's validation checks
+               (cited by that project's README). Cite when discussing why the
+               external parser rejects malformed HDDL models; it is not used
+               directly by this crate's own validation code.}
+}
+
+@misc{goodlp,
+  key          = {goodlp},
+  title        = {good\_lp: A Rust Mixed-Integer Linear Programming Interface},
+  howpublished = {\url{https://crates.io/crates/good_lp}},
+  note         = {Rust crate, version 1.15.3},
+  annote       = {The MILP modelling layer used by
+                  src/solver/partition/agglomeration/ and configured in
+                  Cargo.toml with default-features = false to select the SCIP
+                  backend. Software dependency; cite in artefact or
+                  reproducibility sections together with achterberg2009scip.}
+}
+
+@misc{ipc2023domains,
+  key          = {IPC 2023},
+  title        = {{IPC} 2023 Hierarchical Planning Domains},
+  year         = {2023},
+  howpublished = {\url{https://github.com/ipc2023-htn/ipc2023-domains}},
+  annote       = {Benchmark data exercised by tests/ipc.rs through the local
+                  checkout at ../hddl/test_data/ipc. That checkout also
+                  contains older HTN domains; cite the suite when reporting
+                  IPC results.}
+}

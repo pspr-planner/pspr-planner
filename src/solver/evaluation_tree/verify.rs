@@ -30,6 +30,7 @@ use crate::solver::problem::Problem;
 use super::formula::Universe;
 use super::graph::{
     ConstraintNode, TaskNode, bindings_from, build_task_constraint_graph, ground_atom,
+    ground_methods,
 };
 use super::leaf::initial_atoms;
 
@@ -194,21 +195,21 @@ pub fn validate_plan(
     })
 }
 
-enum Step {
+pub(super) enum Step {
     Action(TaskNode),
     Method { name: String, task: TaskNode },
     Compound(TaskNode),
 }
 
 impl Step {
-    fn task(&self) -> &TaskNode {
+    pub(super) fn task(&self) -> &TaskNode {
         match self {
             Step::Action(task) | Step::Method { task, .. } | Step::Compound(task) => task,
         }
     }
 }
 
-fn parse_step(step: &str) -> Result<Step> {
+pub(super) fn parse_step(step: &str) -> Result<Step> {
     let step = step.trim();
     if let Some(inner) = step
         .strip_prefix("task[")
@@ -269,7 +270,7 @@ fn resolve<'a>(name: &'a str, bindings: &'a BTreeMap<String, String>) -> &'a str
     bindings.get(name).map(String::as_str).unwrap_or(name)
 }
 
-fn apply_action(
+pub(super) fn apply_action(
     domain: &Domain,
     task: &TaskNode,
     state: &BTreeSet<String>,
@@ -360,6 +361,34 @@ fn check_method(
     else {
         bail!("no method `{method_name}` decomposes `{task}`");
     };
+
+    // A plan step records only the method name, not the grounding of its
+    // auxiliary parameters. Accept the step if any grounding satisfies the
+    // method precondition. When the method has too many groundings to
+    // enumerate, fall back to the task-term binding used by the abstract
+    // encoding.
+    if let Ok(instances) = ground_methods(domain, universe, task, budget) {
+        let mut found = false;
+        for instance in instances {
+            if instance.method.name.name != method_name {
+                continue;
+            }
+            found = true;
+            if holds_optional(
+                instance.method.precondition.as_ref(),
+                &instance.bindings,
+                state,
+                universe,
+                budget,
+            )? {
+                return Ok(());
+            }
+        }
+        if found {
+            bail!("the precondition of method `{method_name}` does not hold for `{task}`");
+        }
+    }
+
     let bindings = bindings_from(&method.task_terms, &task.terms);
     ensure!(
         holds_optional(
@@ -398,7 +427,7 @@ fn holds_optional(
     }
 }
 
-fn holds(
+pub(super) fn holds(
     formula: &Formula,
     bindings: &BTreeMap<String, String>,
     state: &BTreeSet<String>,

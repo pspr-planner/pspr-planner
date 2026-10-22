@@ -18,10 +18,13 @@ use std::sync::OnceLock;
 use pspr::parsing::parser::{ParserConfig, parse_program, resolve_parser_config};
 use pspr::solver::domain::{Domain, process_domain};
 use pspr::solver::evaluation_tree::{
-    EvaluationOptions, GoalStatus, ValidationOptions, build_evaluation_tree, validate_plan,
+    EvaluationOptions, GoalStatus, MethodSummary, RefinementOptions, ValidationOptions,
+    build_evaluation_tree, validate_plan, validate_refinement,
 };
 use pspr::solver::problem::{Problem, load_problem};
-use pspr::solver::solve::solve;
+use pspr::solver::solve::{
+    solve, solve_hierarchical, solve_hierarchical_with_options, solve_recursive, solve_with_options,
+};
 
 struct Ipc {
     root: PathBuf,
@@ -141,6 +144,99 @@ fn check(
             report.goal
         );
     }
+}
+
+#[test]
+fn blocksworld_hierarchical_refinement_reaches_the_goal() {
+    let Some(ipc) = ipc() else {
+        return;
+    };
+    let (domain, problem) = load_ipc(ipc, "Blocksworld-GTOHP", "p01.hddl");
+    let refined = solve_hierarchical(&domain, &problem)
+        .unwrap_or_else(|error| panic!("Blocksworld-GTOHP/p01.hddl: {error}"));
+    assert!(refined.plan.len() >= 3, "plan {:?}", refined.plan);
+    assert_eq!(refined.goal, GoalStatus::Satisfied);
+    let report = validate_refinement(&domain, &problem, &refined, &RefinementOptions::default())
+        .expect("strict refinement validation");
+    assert_eq!(report.goal, GoalStatus::Satisfied);
+    assert_eq!(report.steps, refined.plan.len());
+}
+
+#[test]
+fn blocksworld_primitive_summaries_keep_the_tree_solvable() {
+    let Some(ipc) = ipc() else {
+        return;
+    };
+    let (domain, problem) = load_ipc(ipc, "Blocksworld-GTOHP", "p01.hddl");
+    let options = EvaluationOptions {
+        method_summary: MethodSummary::PrimitiveOnly,
+        ..EvaluationOptions::default()
+    };
+    let result = solve_with_options(&domain, &problem, &options)
+        .unwrap_or_else(|error| panic!("Blocksworld-GTOHP/p01.hddl: {error}"));
+    assert!(result.solved);
+    let report = validate_plan(
+        &domain,
+        &problem,
+        &result.plan,
+        &ValidationOptions {
+            require_goal: false,
+            ..ValidationOptions::default()
+        },
+    )
+    .expect("summary plan validation");
+    assert_eq!(report.steps, result.plan.len());
+
+    let refined =
+        solve_hierarchical_with_options(&domain, &problem, &RefinementOptions::default(), &options)
+            .expect("summary refinement");
+    assert_eq!(refined.goal, GoalStatus::Satisfied);
+}
+
+#[test]
+fn blocksworld_recursive_refinement_reaches_the_goal() {
+    let Some(ipc) = ipc() else {
+        return;
+    };
+    let (domain, problem) = load_ipc(ipc, "Blocksworld-GTOHP", "p01.hddl");
+    let refined = solve_recursive(&domain, &problem)
+        .unwrap_or_else(|error| panic!("Blocksworld-GTOHP/p01.hddl: {error}"));
+    assert_eq!(refined.goal, GoalStatus::Satisfied);
+    let report = validate_refinement(&domain, &problem, &refined, &RefinementOptions::default())
+        .expect("strict recursive validation");
+    assert_eq!(report.goal, GoalStatus::Satisfied);
+}
+
+#[test]
+fn depots_hierarchical_refinement_reaches_the_goal() {
+    let Some(ipc) = ipc() else {
+        return;
+    };
+    let (domain, problem) = load_ipc(ipc, "Depots", "p01.hddl");
+    let refined = solve_hierarchical(&domain, &problem)
+        .unwrap_or_else(|error| panic!("Depots/p01.hddl: {error}"));
+    assert!(refined.plan.len() > 2, "plan {:?}", refined.plan);
+    assert_eq!(refined.goal, GoalStatus::Satisfied);
+    let report = validate_refinement(&domain, &problem, &refined, &RefinementOptions::default())
+        .expect("strict Depots validation");
+    assert_eq!(report.goal, GoalStatus::Satisfied);
+}
+
+#[test]
+fn transport_recursive_refinement_executes() {
+    let Some(ipc) = ipc() else {
+        return;
+    };
+    let (domain, problem) = load_ipc(ipc, "Transport", "pfile01.hddl");
+    let refined = solve_recursive(&domain, &problem)
+        .unwrap_or_else(|error| panic!("Transport/pfile01.hddl: {error}"));
+    assert!(!refined.plan.is_empty());
+    let report = validate_refinement(&domain, &problem, &refined, &RefinementOptions::default())
+        .expect("strict recursive validation");
+    assert!(matches!(
+        report.goal,
+        GoalStatus::Absent | GoalStatus::Satisfied
+    ));
 }
 
 #[test]

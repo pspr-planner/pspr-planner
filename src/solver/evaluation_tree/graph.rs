@@ -6,7 +6,7 @@ use std::fmt;
 use anyhow::{Result, ensure};
 
 use crate::parsing::json::{
-    Constraint as NetworkConstraint, Formula, Predicate, Symbol, TaskOrdering,
+    Constraint as NetworkConstraint, Formula, Method, Predicate, Symbol, TaskOrdering,
 };
 use crate::solver::domain::Domain;
 use crate::solver::problem::Problem;
@@ -108,6 +108,67 @@ pub struct TaskConstraintGraph {
 struct Grounding {
     bindings: BTreeMap<String, String>,
     tasks: Vec<TaskNode>,
+}
+
+/// A method schema together with one grounding of its parameters.
+pub(super) struct GroundedMethod<'a> {
+    pub(super) method: &'a Method,
+    pub(super) bindings: BTreeMap<String, String>,
+}
+
+/// Ground every method instance that can decompose `task`.
+///
+/// The task terms bind `method.task_terms`; the remaining method parameters are
+/// enumerated over the typed universe. The method precondition is **not**
+/// checked here, because callers evaluate it in their own state.
+pub(super) fn ground_methods<'a>(
+    domain: &'a Domain,
+    universe: &Universe<'_>,
+    task: &TaskNode,
+    budget: usize,
+) -> Result<Vec<GroundedMethod<'a>>> {
+    let mut grounded = Vec::new();
+    for method in domain.methods_for(&task.name) {
+        if method.task_terms.len() != task.terms.len() {
+            continue;
+        }
+        if !method
+            .task_terms
+            .iter()
+            .zip(&task.terms)
+            .all(|(parameter, term)| universe.compatible(parameter, term))
+        {
+            continue;
+        }
+
+        let bindings = bindings_from(&method.task_terms, &task.terms);
+        let task_names: BTreeSet<&str> = method
+            .task_terms
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect();
+        let extra: Vec<Symbol> = method
+            .params
+            .iter()
+            .filter(|parameter| !task_names.contains(parameter.name.as_str()))
+            .cloned()
+            .collect();
+
+        for assignment in universe.assignments(&extra, budget)? {
+            let mut instance = bindings.clone();
+            instance.extend(assignment);
+            grounded.push(GroundedMethod {
+                method,
+                bindings: instance,
+            });
+            ensure!(
+                grounded.len() <= budget,
+                "task `{task}` has more than {budget} method groundings; \
+                 raise EvaluationOptions::max_groundings"
+            );
+        }
+    }
+    Ok(grounded)
 }
 
 pub(super) fn bindings_from(parameters: &[Symbol], terms: &[String]) -> BTreeMap<String, String> {
@@ -246,6 +307,7 @@ fn task_atoms(
     universe: &Universe<'_>,
     task: &TaskNode,
     budget: usize,
+    summaries: bool,
     unmodeled: &mut usize,
 ) -> Result<BTreeSet<Atom>> {
     let mut atoms = BTreeSet::new();
@@ -284,6 +346,72 @@ fn task_atoms(
             )?;
         }
     }
+
+    if summaries {
+        for instance in ground_methods(domain, universe, task, budget)? {
+            if !matches!(instance.method.tn.orderings, TaskOrdering::Total)
+                || instance.method.tn.constraints.is_some()
+            {
+                continue;
+            }
+            let subtasks: Vec<TaskNode> = instance
+                .method
+                .tn
+                .subtasks
+                .iter()
+                .map(|subtask| TaskNode {
+                    name: subtask.task.name.clone(),
+                    terms: subtask
+                        .terms
+                        .iter()
+                        .map(|term| {
+                            instance
+                                .bindings
+                                .get(&term.name)
+                                .cloned()
+                                .unwrap_or_else(|| term.name.clone())
+                        })
+                        .collect(),
+                })
+                .collect();
+            if subtasks.is_empty()
+                || !subtasks.iter().all(|subtask| {
+                    domain.actions_for(&subtask.name).next().is_some()
+                        && domain.methods_for(&subtask.name).next().is_none()
+                })
+            {
+                continue;
+            }
+            for subtask in &subtasks {
+                for action in domain.actions_for(&subtask.name) {
+                    if action.parameters.len() != subtask.terms.len() {
+                        continue;
+                    }
+                    let action_bindings = bindings_from(&action.parameters, &subtask.terms);
+                    if let Some(precondition) = &action.preconditions {
+                        collect_atoms(
+                            precondition,
+                            &action_bindings,
+                            universe,
+                            budget,
+                            &mut atoms,
+                            unmodeled,
+                        )?;
+                    }
+                    if let Some(effects) = &action.effects {
+                        collect_atoms(
+                            effects,
+                            &action_bindings,
+                            universe,
+                            budget,
+                            &mut atoms,
+                            unmodeled,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
     Ok(atoms)
 }
 
@@ -312,6 +440,17 @@ pub fn build_task_constraint_graph(
     problem: &Problem,
     max_groundings: usize,
 ) -> Result<TaskConstraintGraph> {
+    build_task_constraint_graph_with_summary(domain, problem, max_groundings, false)
+}
+
+/// Like [`build_task_constraint_graph`], optionally including the atoms read
+/// and written by eligible primitive method summaries.
+pub(super) fn build_task_constraint_graph_with_summary(
+    domain: &Domain,
+    problem: &Problem,
+    max_groundings: usize,
+    summaries: bool,
+) -> Result<TaskConstraintGraph> {
     let universe = Universe::new(domain, problem);
     let groundings = ground_task_network(&universe, problem, max_groundings)?;
     let mut tasks = Vec::new();
@@ -325,7 +464,14 @@ pub fn build_task_constraint_graph(
     let mut index = ConstraintIndex::default();
     let mut incidence: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); tasks.len()];
     for (task_index, task) in tasks.iter().enumerate() {
-        for atom in task_atoms(domain, &universe, task, max_groundings, &mut unmodeled)? {
+        for atom in task_atoms(
+            domain,
+            &universe,
+            task,
+            max_groundings,
+            summaries,
+            &mut unmodeled,
+        )? {
             let constraint = index.intern(ConstraintNode::Atom(atom));
             incidence[task_index].insert(constraint);
         }

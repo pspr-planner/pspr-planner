@@ -4,13 +4,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Result, ensure};
 
+use crate::parsing::json::TaskOrdering;
 use crate::solver::domain::Domain;
 use crate::solver::fast_downward;
 use crate::solver::problem::Problem;
 
 use super::clustering::EvaluationTree;
 use super::formula::{self, Universe};
-use super::graph::{Atom, ConstraintNode, bindings_from};
+use super::graph::{Atom, ConstraintNode, TaskNode, bindings_from, ground_methods};
 
 pub(super) struct LeafPlanningTask {
     pub(super) task: fast_downward::Task,
@@ -71,6 +72,190 @@ fn grounded_name(name: &str, terms: &[String]) -> String {
     }
 }
 
+struct SummaryOperator {
+    name: String,
+    precondition: Vec<(Atom, bool)>,
+    add: BTreeSet<Atom>,
+    del: BTreeSet<Atom>,
+}
+
+/// Compile a method whose subtasks are primitive, totally ordered and free of
+/// conditional effects into a macro operator. The summary is exact under the
+/// restrictions stated in `docs/compound-tasks.md` (Approach G); any method
+/// outside those restrictions is skipped and stays opaque.
+fn summary_operators(
+    domain: &Domain,
+    universe: &Universe<'_>,
+    task: &TaskNode,
+    max_groundings: usize,
+) -> Result<Vec<SummaryOperator>> {
+    let mut summaries = Vec::new();
+    for instance in ground_methods(domain, universe, task, max_groundings)? {
+        let method = instance.method;
+        if !matches!(method.tn.orderings, TaskOrdering::Total) || method.tn.constraints.is_some() {
+            continue;
+        }
+
+        let mut actions = Vec::new();
+        let mut valid = true;
+        for subtask in &method.tn.subtasks {
+            let terms: Vec<String> = subtask
+                .terms
+                .iter()
+                .map(|term| {
+                    instance
+                        .bindings
+                        .get(&term.name)
+                        .cloned()
+                        .unwrap_or_else(|| term.name.clone())
+                })
+                .collect();
+            if domain.methods_for(&subtask.task.name).next().is_some() {
+                valid = false;
+                break;
+            }
+            let Some(action) = domain
+                .actions_for(&subtask.task.name)
+                .find(|action| action.parameters.len() == terms.len())
+            else {
+                valid = false;
+                break;
+            };
+            let action_bindings = bindings_from(&action.parameters, &terms);
+            let clauses = formula::precondition_clauses(
+                action.preconditions.as_ref(),
+                &action_bindings,
+                universe,
+                max_groundings,
+            )?;
+            let effects = formula::effect_alternatives_of(
+                action.effects.as_ref(),
+                &action_bindings,
+                universe,
+                max_groundings,
+            )?;
+            if clauses.len() != 1 || effects.len() != 1 {
+                valid = false;
+                break;
+            }
+            let alternative = &effects[0];
+            if alternative.iter().any(|term| !term.condition.is_empty()) {
+                valid = false;
+                break;
+            }
+            let add: BTreeSet<Atom> = alternative
+                .iter()
+                .filter(|term| term.value)
+                .map(|term| term.atom.clone())
+                .collect();
+            let del: BTreeSet<Atom> = alternative
+                .iter()
+                .filter(|term| !term.value)
+                .map(|term| term.atom.clone())
+                .collect();
+            if !add.is_disjoint(&del) {
+                valid = false;
+                break;
+            }
+            actions.push((clauses[0].clone(), add, del));
+        }
+        if !valid {
+            continue;
+        }
+
+        let mut required: BTreeMap<Atom, bool> = BTreeMap::new();
+        let mut add: BTreeSet<Atom> = BTreeSet::new();
+        let mut del: BTreeSet<Atom> = BTreeSet::new();
+        for (clause, action_add, action_del) in actions.iter().rev() {
+            // `required` describes the formula that must hold after this
+            // action. Regress it through the action's effects.
+            let mut next = BTreeMap::new();
+            for (atom, positive) in &required {
+                if action_add.contains(atom) {
+                    if !*positive {
+                        valid = false;
+                        break;
+                    }
+                } else if action_del.contains(atom) {
+                    if *positive {
+                        valid = false;
+                        break;
+                    }
+                } else {
+                    next.insert(atom.clone(), *positive);
+                }
+            }
+            if !valid {
+                break;
+            }
+
+            // The action's own precondition must hold before the action; it
+            // cannot be satisfied by the action's or a later action's effects.
+            for (atom, positive) in clause {
+                match next.get(atom) {
+                    Some(existing) if existing != positive => {
+                        valid = false;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        next.insert(atom.clone(), *positive);
+                    }
+                }
+            }
+            if !valid {
+                break;
+            }
+            required = next;
+
+            for atom in action_add {
+                if !del.contains(atom) {
+                    add.insert(atom.clone());
+                }
+            }
+            for atom in action_del {
+                if !add.contains(atom) {
+                    del.insert(atom.clone());
+                }
+            }
+        }
+        if !valid {
+            continue;
+        }
+
+        let method_clauses = formula::precondition_clauses(
+            method.precondition.as_ref(),
+            &instance.bindings,
+            universe,
+            max_groundings,
+        )?;
+        for clause in method_clauses {
+            let mut precondition = clause;
+            let mut compatible = true;
+            for (atom, &positive) in &required {
+                match precondition.iter().find(|(candidate, _)| candidate == atom) {
+                    Some((_, existing)) if *existing != positive => {
+                        compatible = false;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => precondition.push((atom.clone(), positive)),
+                }
+            }
+            if !compatible {
+                continue;
+            }
+            summaries.push(SummaryOperator {
+                name: format!("{}[{task}]", method.name.name),
+                precondition,
+                add: add.clone(),
+                del: del.clone(),
+            });
+        }
+    }
+    Ok(summaries)
+}
+
 pub(super) fn build_leaf_task(
     domain: &Domain,
     problem: &Problem,
@@ -78,6 +263,7 @@ pub(super) fn build_leaf_task(
     cluster_index: usize,
     initial_atoms: &BTreeSet<String>,
     max_groundings: usize,
+    summaries: bool,
 ) -> Result<LeafPlanningTask> {
     let cluster = &tree.clusters[cluster_index];
     let local_ids = &tree.local[cluster_index];
@@ -211,11 +397,10 @@ pub(super) fn build_leaf_task(
                 }
             }
         } else {
-            let methods: Vec<_> = domain
+            let has_methods = domain
                 .methods_for(&task.name)
-                .filter(|method| method.task_terms.len() == task.terms.len())
-                .collect();
-            if methods.is_empty() {
+                .any(|method| method.task_terms.len() == task.terms.len());
+            if !has_methods {
                 operators.push((
                     format!("task[{task}]"),
                     base.clone(),
@@ -225,7 +410,55 @@ pub(super) fn build_leaf_task(
                 effect_atoms.push(BTreeSet::new());
                 operator_tasks.push(task_index);
             } else {
-                for method in methods {
+                let summaries = if summaries {
+                    summary_operators(domain, &universe, task, max_groundings)?
+                } else {
+                    Vec::new()
+                };
+                let mut summarised_methods = BTreeSet::new();
+                for summary in summaries {
+                    summarised_methods.insert(
+                        summary
+                            .name
+                            .split_once('[')
+                            .map(|(name, _)| name.to_string())
+                            .unwrap_or_else(|| summary.name.clone()),
+                    );
+                    let mut precondition = base.clone();
+                    for (atom, positive) in &summary.precondition {
+                        if let Some(&variable) = local_index.get(atom) {
+                            precondition.push((variable, usize::from(*positive)));
+                        }
+                    }
+                    let mut effects = Vec::new();
+                    let mut grounded_effects = BTreeSet::new();
+                    for atom in &summary.add {
+                        grounded_effects.insert(atom.clone());
+                        if let Some(&variable) = local_index.get(atom) {
+                            effects.push((Vec::new(), variable, 1));
+                        }
+                    }
+                    for atom in &summary.del {
+                        if let Some(&variable) = local_index.get(atom) {
+                            effects.push((Vec::new(), variable, 0));
+                        }
+                    }
+                    effects.push((Vec::new(), executed(position), 1));
+                    precondition.sort_unstable();
+                    precondition.dedup();
+                    operators.push((summary.name, precondition, effects, 1.0));
+                    effect_atoms.push(grounded_effects);
+                    operator_tasks.push(task_index);
+                }
+
+                // Methods that could not be summarised remain opaque.
+                for method in domain
+                    .methods_for(&task.name)
+                    .filter(|method| method.task_terms.len() == task.terms.len())
+                {
+                    if summarised_methods.contains(&method.name.name) {
+                        continue;
+                    }
                     let bindings = bindings_from(&method.task_terms, &task.terms);
                     let clauses = formula::precondition_clauses(
                         method.precondition.as_ref(),

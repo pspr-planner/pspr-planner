@@ -89,12 +89,17 @@ use crate::solver::problem::Problem;
 mod clustering;
 mod formula;
 mod graph;
+mod hierarchical;
 mod leaf;
 mod merge;
 mod verify;
 
 pub use clustering::EvaluationTree;
 pub use graph::{Atom, ConstraintNode, TaskConstraintGraph, TaskNode, build_task_constraint_graph};
+pub use hierarchical::{
+    Refinement, RefinementOptions, RefinementStep, refine_plan, refine_plan_with_mode,
+    solve_hierarchical, solve_recursive, validate_refinement,
+};
 pub use merge::{
     AdamOptions, MergeOutcome, MergeProblem, MergeRecord, MergeSolver, PartialSolution,
     PenaltyReport, PenaltySpace, SgplanMerger,
@@ -103,6 +108,17 @@ pub use verify::{GoalStatus, ValidationOptions, ValidationReport, validate_plan}
 
 use clustering::{attach_shared_constraints, build_agglomeration, cluster_tasks};
 use leaf::{build_leaf_task, initial_atoms};
+
+/// How method-local effects are summarised in compound-task operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MethodSummary {
+    /// Keep compound tasks opaque (the historical behaviour).
+    #[default]
+    Off,
+    /// Summarise methods whose subtasks are primitive, totally ordered and
+    /// deterministic; fall back to an opaque operator otherwise.
+    PrimitiveOnly,
+}
 
 /// Options for building and evaluating the tree.
 #[derive(Debug, Clone)]
@@ -127,6 +143,9 @@ pub struct EvaluationOptions {
     pub max_groundings: usize,
     /// Expansion limit of the Fast Downward search inside a leaf.
     pub leaf_max_expansions: usize,
+    /// Whether primitive method effects are summarised into compound-task
+    /// operators (Approach G in `docs/compound-tasks.md`).
+    pub method_summary: MethodSummary,
 }
 
 impl Default for EvaluationOptions {
@@ -140,6 +159,7 @@ impl Default for EvaluationOptions {
             search_expansions: 1_000,
             max_groundings: 256,
             leaf_max_expansions: 100_000,
+            method_summary: MethodSummary::Off,
         }
     }
 }
@@ -150,7 +170,12 @@ pub fn build_evaluation_tree(
     problem: &Problem,
     options: &EvaluationOptions,
 ) -> Result<EvaluationTree> {
-    let graph = build_task_constraint_graph(domain, problem, options.max_groundings)?;
+    let graph = graph::build_task_constraint_graph_with_summary(
+        domain,
+        problem,
+        options.max_groundings,
+        options.method_summary != MethodSummary::Off,
+    )?;
     let clusters = cluster_tasks(&graph, options)?;
 
     if clusters.is_empty() {
@@ -242,6 +267,7 @@ pub fn evaluate(
             cluster_index,
             &atoms,
             options.max_groundings,
+            options.method_summary != MethodSummary::Off,
         )?;
         let search = fast_downward::search(
             &leaf.task,
@@ -377,8 +403,8 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use crate::parsing::json::{
-        Action, Formula, Htn, InitialTaskNetwork, NumberType, Predicate, Subtask, Symbol,
-        TaskOrdering,
+        Action, Formula, Htn, InitialTaskNetwork, Method, NumberType, Predicate, Subtask, Symbol,
+        Task, TaskOrdering,
     };
 
     use super::*;
@@ -778,6 +804,99 @@ mod tests {
         assert!(solve_with(&domain, &problem).solved);
     }
 
+    fn summarised_method_domain() -> (Domain, Problem) {
+        let domain = Domain {
+            name: "summary".to_string(),
+            requirements: Vec::new(),
+            types: vec![symbol("place", None)],
+            constants: Vec::new(),
+            predicates: vec![
+                Predicate {
+                    name: "at".to_string(),
+                    variables: vec![symbol("?p", Some("place"))],
+                },
+                Predicate {
+                    name: "done".to_string(),
+                    variables: vec![symbol("?p", Some("place"))],
+                },
+            ],
+            compound_tasks: vec![Task {
+                name: "finish".to_string(),
+                parameters: vec![symbol("?p", Some("place"))],
+            }],
+            methods: vec![Method {
+                name: symbol("m_finish", None),
+                task: symbol("finish", None),
+                task_terms: vec![symbol("?p", Some("place"))],
+                params: vec![symbol("?p", Some("place"))],
+                precondition: Some(Formula::Empty),
+                tn: Htn {
+                    subtasks: vec![subtask("t1", "do", &["?p"])],
+                    orderings: TaskOrdering::Total,
+                    constraints: None,
+                },
+            }],
+            actions: vec![Action {
+                name: "do".to_string(),
+                parameters: vec![symbol("?p", Some("place"))],
+                preconditions: Some(Formula::Atom(atom("at", &["?p"]))),
+                effects: Some(Formula::Atom(atom("done", &["?p"]))),
+            }],
+            functions: Vec::new(),
+        };
+        let problem = Problem {
+            name: "p".to_string(),
+            domain_name: "summary".to_string(),
+            objects: vec![symbol("a", Some("place"))],
+            init_state: vec![atom("at", &["a"])],
+            goal: Some(Formula::Atom(atom("done", &["a"]))),
+            init_task_network: Some(InitialTaskNetwork {
+                parameters: None,
+                tn: Htn {
+                    subtasks: vec![subtask("t1", "finish", &["a"])],
+                    orderings: TaskOrdering::Total,
+                    constraints: None,
+                },
+            }),
+        };
+        (domain, problem)
+    }
+
+    #[test]
+    fn recursive_refinement_solves_a_method_subproblem() {
+        let (domain, problem) = summarised_method_domain();
+        let refined = refine_plan_with_mode(
+            &domain,
+            &problem,
+            &["m_finish[finish(a)]".to_string()],
+            &RefinementOptions::default(),
+            true,
+        )
+        .expect("recursive refinement");
+        assert_eq!(refined.goal, GoalStatus::Satisfied);
+        assert!(refined.plan.iter().any(|step| step == "do(a)"));
+    }
+
+    #[test]
+    fn primitive_method_summaries_expose_their_effects() {
+        let (domain, problem) = summarised_method_domain();
+        let options = EvaluationOptions {
+            method_summary: MethodSummary::PrimitiveOnly,
+            ..EvaluationOptions::default()
+        };
+        let mut merger = SgplanMerger::default();
+        let evaluation = evaluate(&domain, &problem, &mut merger, &options).unwrap();
+        assert!(evaluation.solved);
+        assert!(
+            evaluation.leaves[0]
+                .final_atoms
+                .iter()
+                .any(|atom| atom.starts_with("done(")),
+            "final atoms: {:?}",
+            evaluation.leaves[0].final_atoms
+        );
+    }
+
     #[test]
     fn implications_in_effects_become_conditional_effects() {
         let domain = single_action_domain(
@@ -790,7 +909,7 @@ mod tests {
         let problem = move_problem(vec![atom("road", &["a", "b"])]);
         let tree = build_evaluation_tree(&domain, &problem, &EvaluationOptions::default()).unwrap();
         let atoms = initial_atoms(&problem);
-        let leaf = build_leaf_task(&domain, &problem, &tree, 0, &atoms, 256).unwrap();
+        let leaf = build_leaf_task(&domain, &problem, &tree, 0, &atoms, 256, false).unwrap();
         assert!(
             leaf.task.operators.iter().any(|operator| operator
                 .effects
@@ -819,7 +938,7 @@ mod tests {
         let problem = move_problem(vec![atom("road", &["a", "b"])]);
         let tree = build_evaluation_tree(&domain, &problem, &EvaluationOptions::default()).unwrap();
         let atoms = initial_atoms(&problem);
-        let leaf = build_leaf_task(&domain, &problem, &tree, 0, &atoms, 256).unwrap();
+        let leaf = build_leaf_task(&domain, &problem, &tree, 0, &atoms, 256, false).unwrap();
         assert_eq!(leaf.task.operators.len(), 2, "one operator per outcome");
         assert_eq!(leaf.operator_tasks, vec![0, 0]);
     }

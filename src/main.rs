@@ -9,8 +9,11 @@ use pspr::parsing::parser::{
     ParserConfig, is_json_file, parse_program, read_program_json, resolve_parser_config,
 };
 use pspr::solver::domain::{Domain, process_domain};
+use pspr::solver::evaluation_tree::{EvaluationOptions, MethodSummary};
 use pspr::solver::problem::{Problem, load_problem};
-use pspr::solver::solve::solve;
+use pspr::solver::solve::{
+    solve_hierarchical_with_options, solve_recursive_with_options, solve_with_options,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,6 +35,22 @@ struct Options {
     /// Path to the hddl_analyzer executable (default: $HDDL_PARSER or hddl_analyzer on PATH)
     #[arg(long, value_name = "PATH")]
     parser: Option<PathBuf>,
+
+    /// Refine the abstract plan into a complete HTN plan
+    #[arg(long, conflicts_with = "recursive")]
+    hierarchical: bool,
+
+    /// Use recursive method subproblem evaluation when refining
+    #[arg(long)]
+    recursive: bool,
+
+    /// Summarise primitive, totally ordered method effects into compound operators
+    #[arg(long)]
+    summary: bool,
+
+    /// Maximum number of task and method groundings
+    #[arg(long, default_value_t = 256, value_name = "N")]
+    max_groundings: usize,
 }
 
 fn main() -> ExitCode {
@@ -68,7 +87,7 @@ fn run_json_input(options: &Options) -> Result<(), String> {
 
     match &program.problem {
         None => println!("No problem is embedded in the JSON input."),
-        Some(problem_ast) => handle_problem(&domain, problem_ast)?,
+        Some(problem_ast) => handle_problem(&domain, problem_ast, options)?,
     }
     Ok(())
 }
@@ -94,7 +113,9 @@ fn run_hddl_input(options: &Options) -> Result<(), String> {
     println!("Loading {} problem file(s).", problem_paths.len());
     let mut failed = false;
     for path in &problem_paths {
-        if let Err(message) = solve_problem_file(&config, &domain, &options.domain_path, path) {
+        if let Err(message) =
+            solve_problem_file(&config, &domain, &options.domain_path, path, options)
+        {
             eprintln!("pspr: {message}");
             failed = true;
         }
@@ -128,6 +149,7 @@ fn solve_problem_file(
     domain: &Domain,
     domain_path: &std::path::Path,
     problem_path: &std::path::Path,
+    options: &Options,
 ) -> Result<(), String> {
     let program: Program = parse_program(config, domain_path, Some(problem_path))?;
     let problem_ast: ProblemAst = program.problem.ok_or_else(|| {
@@ -136,11 +158,15 @@ fn solve_problem_file(
             problem_path.display()
         )
     })?;
-    handle_problem(domain, &problem_ast)
+    handle_problem(domain, &problem_ast, options)
 }
 
-/// Problem AST -> [`Problem`] -> [`solve`].
-fn handle_problem(domain: &Domain, problem_ast: &ProblemAst) -> Result<(), String> {
+/// Problem AST -> [`Problem`] -> the selected solver.
+fn handle_problem(
+    domain: &Domain,
+    problem_ast: &ProblemAst,
+    options: &Options,
+) -> Result<(), String> {
     let problem: Problem = load_problem(domain, problem_ast)?;
     println!(
         "  problem {} ({} objects)",
@@ -148,19 +174,58 @@ fn handle_problem(domain: &Domain, problem_ast: &ProblemAst) -> Result<(), Strin
         problem.objects.len()
     );
 
-    let result = solve(domain, &problem)?;
-    if result.solved {
+    let evaluation_options = EvaluationOptions {
+        method_summary: if options.summary {
+            MethodSummary::PrimitiveOnly
+        } else {
+            MethodSummary::Off
+        },
+        max_groundings: options.max_groundings,
+        ..EvaluationOptions::default()
+    };
+    let refinement_options = pspr::solver::evaluation_tree::RefinementOptions {
+        max_groundings: options.max_groundings,
+        ..pspr::solver::evaluation_tree::RefinementOptions::default()
+    };
+
+    if options.hierarchical || options.recursive {
+        let refinement = if options.recursive {
+            solve_recursive_with_options(
+                domain,
+                &problem,
+                &refinement_options,
+                &evaluation_options,
+            )?
+        } else {
+            solve_hierarchical_with_options(
+                domain,
+                &problem,
+                &refinement_options,
+                &evaluation_options,
+            )?
+        };
         println!(
-            "    solve {}: plan length {}",
-            result.problem,
-            result.plan.len()
+            "    solve {}: plan length {} ({} methods, goal {:?})",
+            problem.name,
+            refinement.plan.len(),
+            refinement.method_count(),
+            refinement.goal
         );
     } else {
-        println!(
-            "    solve {}: unsolved ({} steps found)",
-            result.problem,
-            result.plan.len()
-        );
+        let result = solve_with_options(domain, &problem, &evaluation_options)?;
+        if result.solved {
+            println!(
+                "    solve {}: plan length {}",
+                result.problem,
+                result.plan.len()
+            );
+        } else {
+            println!(
+                "    solve {}: unsolved ({} steps found)",
+                result.problem,
+                result.plan.len()
+            );
+        }
     }
     Ok(())
 }
