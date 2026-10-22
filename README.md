@@ -95,6 +95,14 @@ Loading 1 problem file(s).
 | `src/solver/partition/bisbm/` | Spectral clustering of bipartite task/constraint graphs |
 | `src/main.rs` | CLI pipeline |
 
+## Formula support
+
+The translation of the parser's formula language into leaf planning tasks is
+documented in [`docs/unsupported-atoms.md`](docs/unsupported-atoms.md): the
+DNF and conditional-effect encoding, the supported constructors, and the
+remaining gaps (probabilistic formulas, the unused problem goal, and method
+decomposition).
+
 ## Validation
 
 The decoder has been exercised against all 43 IPC domains and all 767 problem

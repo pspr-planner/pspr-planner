@@ -11,6 +11,8 @@ use crate::parsing::json::{
 use crate::solver::domain::Domain;
 use crate::solver::problem::Problem;
 
+use super::formula::Universe;
+
 /// A ground atom `predicate(term, ...)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Atom {
@@ -94,7 +96,8 @@ pub struct TaskConstraintGraph {
     pub constraints: Vec<ConstraintNode>,
     /// `incidence[task][constraint]` is `true` iff the task touches the constraint.
     pub incidence: Vec<Vec<bool>>,
-    /// Number of formulas that could not be encoded as conjunctive literals.
+    /// Number of probabilistic formulas, the only constructor the leaf encoding
+    /// cannot translate.
     pub unmodeled: usize,
 }
 
@@ -134,7 +137,7 @@ pub(super) fn ground_atom(predicate: &Predicate, bindings: &BTreeMap<String, Str
 /// Ground the free parameters of the initial task network over the constants
 /// and objects of the problem.
 fn ground_task_network(
-    domain: &Domain,
+    universe: &Universe<'_>,
     problem: &Problem,
     max_groundings: usize,
 ) -> Result<Vec<Grounding>> {
@@ -143,7 +146,7 @@ fn ground_task_network(
     };
     let mut assignments: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
     for parameter in problem.network_parameters() {
-        let candidates = type_candidates(domain, problem, parameter);
+        let candidates = universe.candidates(parameter);
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -188,73 +191,63 @@ fn ground_task_network(
         .collect())
 }
 
-fn type_candidates(domain: &Domain, problem: &Problem, parameter: &Symbol) -> Vec<String> {
-    let mut names = BTreeSet::new();
-    for symbol in domain.constants.iter().chain(problem.objects.iter()) {
-        let compatible = match (&parameter.symbol_type, &symbol.symbol_type) {
-            (Some(required), Some(actual)) => domain.is_subtype_of(actual, required),
-            (Some(_), None) => true,
-            (None, _) => true,
-        };
-        if compatible {
-            names.insert(symbol.name.clone());
-        }
-    }
-    names.into_iter().collect()
-}
-
 // ---------------------------------------------------------------------------
 // Constraint extraction
 // ---------------------------------------------------------------------------
 
-/// Traverse a formula and collect every atom it mentions. Unsupported
-/// constructs are counted in `unmodeled` but their atoms are still collected.
+/// Traverse a formula and collect every atom it mentions.
+///
+/// The traversal expands quantifiers over the typed universe, so the incidence
+/// graph contains the same ground atoms the leaf encoding will use. Only
+/// [`Formula::Probabilistic`] is counted in `unmodeled`; the other constructors
+/// are translated by [`super::formula`].
 fn collect_atoms(
     formula: &Formula,
     bindings: &BTreeMap<String, String>,
+    universe: &Universe<'_>,
+    budget: usize,
     atoms: &mut BTreeSet<Atom>,
     unmodeled: &mut usize,
-) {
+) -> Result<()> {
     match formula {
-        Formula::Empty => {}
+        Formula::Empty | Formula::Equals(_, _) => {}
         Formula::Atom(predicate) => {
             atoms.insert(ground_atom(predicate, bindings));
         }
         Formula::Not(inner) => {
-            if !matches!(inner.as_ref(), Formula::Atom(_)) {
-                *unmodeled += 1;
-            }
-            collect_atoms(inner, bindings, atoms, unmodeled);
+            collect_atoms(inner, bindings, universe, budget, atoms, unmodeled)?;
         }
-        Formula::And(items) => {
+        Formula::And(items) | Formula::Or(items) | Formula::Xor(items) => {
             for item in items {
-                collect_atoms(item, bindings, atoms, unmodeled);
-            }
-        }
-        Formula::Or(items) | Formula::Xor(items) => {
-            *unmodeled += 1;
-            for item in items {
-                collect_atoms(item, bindings, atoms, unmodeled);
+                collect_atoms(item, bindings, universe, budget, atoms, unmodeled)?;
             }
         }
         Formula::Imply(left, right) => {
-            *unmodeled += 1;
-            collect_atoms(left, bindings, atoms, unmodeled);
-            collect_atoms(right, bindings, atoms, unmodeled);
+            collect_atoms(left, bindings, universe, budget, atoms, unmodeled)?;
+            collect_atoms(right, bindings, universe, budget, atoms, unmodeled)?;
         }
-        Formula::Exists(_, inner) | Formula::ForAll(_, inner) => {
-            *unmodeled += 1;
-            collect_atoms(inner, bindings, atoms, unmodeled);
+        Formula::Exists(variables, inner) | Formula::ForAll(variables, inner) => {
+            for assignment in universe.assignments(variables, budget)? {
+                let mut local = bindings.clone();
+                local.extend(assignment);
+                collect_atoms(inner, &local, universe, budget, atoms, unmodeled)?;
+            }
         }
         Formula::Probabilistic(_, inner) => {
             *unmodeled += 1;
-            collect_atoms(inner, bindings, atoms, unmodeled);
+            collect_atoms(inner, bindings, universe, budget, atoms, unmodeled)?;
         }
-        Formula::Equals(_, _) => *unmodeled += 1,
     }
+    Ok(())
 }
 
-fn task_atoms(domain: &Domain, task: &TaskNode, unmodeled: &mut usize) -> BTreeSet<Atom> {
+fn task_atoms(
+    domain: &Domain,
+    universe: &Universe<'_>,
+    task: &TaskNode,
+    budget: usize,
+    unmodeled: &mut usize,
+) -> Result<BTreeSet<Atom>> {
     let mut atoms = BTreeSet::new();
     for action in domain.actions_for(&task.name) {
         if action.parameters.len() != task.terms.len() {
@@ -262,10 +255,17 @@ fn task_atoms(domain: &Domain, task: &TaskNode, unmodeled: &mut usize) -> BTreeS
         }
         let bindings = bindings_from(&action.parameters, &task.terms);
         if let Some(precondition) = &action.preconditions {
-            collect_atoms(precondition, &bindings, &mut atoms, unmodeled);
+            collect_atoms(
+                precondition,
+                &bindings,
+                universe,
+                budget,
+                &mut atoms,
+                unmodeled,
+            )?;
         }
         if let Some(effects) = &action.effects {
-            collect_atoms(effects, &bindings, &mut atoms, unmodeled);
+            collect_atoms(effects, &bindings, universe, budget, &mut atoms, unmodeled)?;
         }
     }
     for method in domain.methods_for(&task.name) {
@@ -274,10 +274,17 @@ fn task_atoms(domain: &Domain, task: &TaskNode, unmodeled: &mut usize) -> BTreeS
         }
         let bindings = bindings_from(&method.task_terms, &task.terms);
         if let Some(precondition) = &method.precondition {
-            collect_atoms(precondition, &bindings, &mut atoms, unmodeled);
+            collect_atoms(
+                precondition,
+                &bindings,
+                universe,
+                budget,
+                &mut atoms,
+                unmodeled,
+            )?;
         }
     }
-    atoms
+    Ok(atoms)
 }
 
 #[derive(Default)]
@@ -305,7 +312,8 @@ pub fn build_task_constraint_graph(
     problem: &Problem,
     max_groundings: usize,
 ) -> Result<TaskConstraintGraph> {
-    let groundings = ground_task_network(domain, problem, max_groundings)?;
+    let universe = Universe::new(domain, problem);
+    let groundings = ground_task_network(&universe, problem, max_groundings)?;
     let mut tasks = Vec::new();
     let mut offsets = Vec::new();
     for grounding in &groundings {
@@ -317,7 +325,7 @@ pub fn build_task_constraint_graph(
     let mut index = ConstraintIndex::default();
     let mut incidence: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); tasks.len()];
     for (task_index, task) in tasks.iter().enumerate() {
-        for atom in task_atoms(domain, task, &mut unmodeled) {
+        for atom in task_atoms(domain, &universe, task, max_groundings, &mut unmodeled)? {
             let constraint = index.intern(ConstraintNode::Atom(atom));
             incidence[task_index].insert(constraint);
         }

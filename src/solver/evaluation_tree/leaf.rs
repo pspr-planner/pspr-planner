@@ -4,13 +4,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Result, ensure};
 
-use crate::parsing::json::Formula;
 use crate::solver::domain::Domain;
 use crate::solver::fast_downward;
 use crate::solver::problem::Problem;
 
 use super::clustering::EvaluationTree;
-use super::graph::{Atom, ConstraintNode, bindings_from, ground_atom};
+use super::formula::{self, Universe};
+use super::graph::{Atom, ConstraintNode, bindings_from};
 
 pub(super) struct LeafPlanningTask {
     pub(super) task: fast_downward::Task,
@@ -38,44 +38,6 @@ pub(super) fn initial_atoms(problem: &Problem) -> BTreeSet<String> {
             .to_string()
         })
         .collect()
-}
-
-/// Return the conjunctive literals of a formula, or `None` when the formula is
-/// outside the supported fragment.
-fn conjunctive_literals(
-    formula: Option<&Formula>,
-    bindings: &BTreeMap<String, String>,
-) -> Option<Vec<(Atom, bool)>> {
-    fn walk(
-        formula: &Formula,
-        bindings: &BTreeMap<String, String>,
-        literals: &mut Vec<(Atom, bool)>,
-    ) -> bool {
-        match formula {
-            Formula::Empty => true,
-            Formula::Atom(predicate) => {
-                literals.push((ground_atom(predicate, bindings), true));
-                true
-            }
-            Formula::Not(inner) => match inner.as_ref() {
-                Formula::Atom(predicate) => {
-                    literals.push((ground_atom(predicate, bindings), false));
-                    true
-                }
-                _ => false,
-            },
-            Formula::And(items) => items.iter().all(|item| walk(item, bindings, literals)),
-            _ => false,
-        }
-    }
-
-    let formula = formula?;
-    let mut literals = Vec::new();
-    if !walk(formula, bindings, &mut literals) {
-        return None;
-    }
-    literals.sort_by(|left, right| left.0.cmp(&right.0));
-    Some(literals)
 }
 
 /// Transitive closure of the ordering constraints inside a cluster.
@@ -111,12 +73,15 @@ fn grounded_name(name: &str, terms: &[String]) -> String {
 
 pub(super) fn build_leaf_task(
     domain: &Domain,
+    problem: &Problem,
     tree: &EvaluationTree,
     cluster_index: usize,
     initial_atoms: &BTreeSet<String>,
+    max_groundings: usize,
 ) -> Result<LeafPlanningTask> {
     let cluster = &tree.clusters[cluster_index];
     let local_ids = &tree.local[cluster_index];
+    let universe = Universe::new(domain, problem);
 
     let mut local_atoms: Vec<Atom> = local_ids
         .iter()
@@ -184,37 +149,66 @@ pub(super) fn build_leaf_task(
         if !actions.is_empty() {
             for action in actions {
                 let bindings = bindings_from(&action.parameters, &task.terms);
-                let mut precondition = base.clone();
-                if let Some(literals) =
-                    conjunctive_literals(action.preconditions.as_ref(), &bindings)
-                {
-                    for (atom, positive) in &literals {
-                        if let Some(&variable) = local_index.get(atom) {
-                            precondition.push((variable, usize::from(*positive)));
+                let clauses = formula::precondition_clauses(
+                    action.preconditions.as_ref(),
+                    &bindings,
+                    &universe,
+                    max_groundings,
+                )?;
+                if clauses.is_empty() {
+                    // The precondition is unsatisfiable: the action can never run.
+                    continue;
+                }
+                let alternatives = formula::effect_alternatives_of(
+                    action.effects.as_ref(),
+                    &bindings,
+                    &universe,
+                    max_groundings,
+                )?;
+                if alternatives.is_empty() {
+                    // Every outcome of the effect formula is impossible.
+                    continue;
+                }
+                for clause in &clauses {
+                    for alternative in &alternatives {
+                        let mut precondition = base.clone();
+                        for (atom, positive) in clause {
+                            if let Some(&variable) = local_index.get(atom) {
+                                precondition.push((variable, usize::from(*positive)));
+                            }
                         }
+                        let mut effects = Vec::new();
+                        let mut grounded_effects = BTreeSet::new();
+                        for term in alternative {
+                            if term.value {
+                                grounded_effects.insert(term.atom.clone());
+                            }
+                            if let Some(&variable) = local_index.get(&term.atom) {
+                                let condition: Vec<(usize, usize)> = term
+                                    .condition
+                                    .iter()
+                                    .filter_map(|(atom, positive)| {
+                                        local_index
+                                            .get(atom)
+                                            .map(|&variable| (variable, usize::from(*positive)))
+                                    })
+                                    .collect();
+                                effects.push((condition, variable, usize::from(term.value)));
+                            }
+                        }
+                        effects.push((Vec::new(), executed(position), 1));
+                        precondition.sort_unstable();
+                        precondition.dedup();
+                        operators.push((
+                            grounded_name(&action.name, &task.terms),
+                            precondition,
+                            effects,
+                            1.0,
+                        ));
+                        effect_atoms.push(grounded_effects);
+                        operator_tasks.push(task_index);
                     }
                 }
-                let mut effects = Vec::new();
-                let mut grounded_effects = BTreeSet::new();
-                if let Some(literals) = conjunctive_literals(action.effects.as_ref(), &bindings) {
-                    for (atom, positive) in literals {
-                        grounded_effects.insert(atom.clone());
-                        if let Some(&variable) = local_index.get(&atom) {
-                            effects.push((Vec::new(), variable, usize::from(positive)));
-                        }
-                    }
-                }
-                effects.push((Vec::new(), executed(position), 1));
-                precondition.sort_unstable();
-                precondition.dedup();
-                operators.push((
-                    grounded_name(&action.name, &task.terms),
-                    precondition,
-                    effects,
-                    1.0,
-                ));
-                effect_atoms.push(grounded_effects);
-                operator_tasks.push(task_index);
             }
         } else {
             let methods: Vec<_> = domain
@@ -233,26 +227,33 @@ pub(super) fn build_leaf_task(
             } else {
                 for method in methods {
                     let bindings = bindings_from(&method.task_terms, &task.terms);
-                    let mut precondition = base.clone();
-                    if let Some(literals) =
-                        conjunctive_literals(method.precondition.as_ref(), &bindings)
-                    {
-                        for (atom, positive) in &literals {
+                    let clauses = formula::precondition_clauses(
+                        method.precondition.as_ref(),
+                        &bindings,
+                        &universe,
+                        max_groundings,
+                    )?;
+                    if clauses.is_empty() {
+                        continue;
+                    }
+                    for clause in &clauses {
+                        let mut precondition = base.clone();
+                        for (atom, positive) in clause {
                             if let Some(&variable) = local_index.get(atom) {
                                 precondition.push((variable, usize::from(*positive)));
                             }
                         }
+                        precondition.sort_unstable();
+                        precondition.dedup();
+                        operators.push((
+                            format!("{}[{task}]", method.name.name),
+                            precondition,
+                            vec![(Vec::new(), executed(position), 1)],
+                            1.0,
+                        ));
+                        effect_atoms.push(BTreeSet::new());
+                        operator_tasks.push(task_index);
                     }
-                    precondition.sort_unstable();
-                    precondition.dedup();
-                    operators.push((
-                        format!("{}[{task}]", method.name.name),
-                        precondition,
-                        vec![(Vec::new(), executed(position), 1)],
-                        1.0,
-                    ));
-                    effect_atoms.push(BTreeSet::new());
-                    operator_tasks.push(task_index);
                 }
             }
         }

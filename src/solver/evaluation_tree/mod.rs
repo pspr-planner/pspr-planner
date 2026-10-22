@@ -36,6 +36,8 @@
 //! # Layout
 //!
 //! * `graph`: grounding of the initial task network and the incidence graph.
+//! * `formula`: expansion, negation normal form and DNF translation of action
+//!   and method formulas.
 //! * `clustering`: spectral clustering and the merge tree over clusters.
 //! * `leaf`: encoding and solving a cluster as a planning task.
 //! * `merge`: the merge-solver interface, the relaxed SGPlan MINLP, Adam, and
@@ -43,12 +45,20 @@
 //!
 //! # Modelling limitations
 //!
-//! * Only the conjunctive fragment of the formula language is encoded in the
-//!   leaf planning tasks (`Empty`, `Atom`, `Not(Atom)` and conjunctions of
-//!   these). Disjunctive, quantified, probabilistic and equality formulas still
-//!   connect tasks to their atoms for the incidence graph, but are not imposed
-//!   as leaf preconditions; they are counted in
-//!   [`EvaluationTree::unmodeled`].
+//! * Action and method formulas are translated to the leaf encoding by
+//!   `formula`: `Imply`, `Xor` and composite `Not` are rewritten in negation
+//!   normal form, quantifiers are expanded over the typed constants and
+//!   objects, `Equals` is evaluated during grounding, and preconditions are
+//!   converted to disjunctive normal form. Every clause and every disjunctive
+//!   effect alternative becomes an operator variant; implications in effects
+//!   become conditional effects. `Probabilistic` is the only constructor that
+//!   cannot be translated, because the leaf planning tasks and the search are
+//!   deterministic; it is counted in [`EvaluationTree::unmodeled`] and makes
+//!   leaf construction fail.
+//! * The DNF expansion is capped at 4096 clauses or alternatives per formula,
+//!   and quantifier expansion is charged against
+//!   [`EvaluationOptions::max_groundings`] in addition to the grounding of the
+//!   initial task network.
 //! * The initial task network is grounded over the constants and objects of the
 //!   problem (respecting the type hierarchy) up to
 //!   [`EvaluationOptions::max_groundings`] assignments.
@@ -73,6 +83,7 @@ use crate::solver::partition::bisbm::Grouping;
 use crate::solver::problem::Problem;
 
 mod clustering;
+mod formula;
 mod graph;
 mod leaf;
 mod merge;
@@ -101,7 +112,8 @@ pub struct EvaluationOptions {
     pub use_search: bool,
     /// Expansion limit of that search.
     pub search_expansions: usize,
-    /// Maximum number of groundings of the initial task network.
+    /// Maximum number of groundings of the initial task network, and of the
+    /// bindings produced by expanding a quantified formula.
     pub max_groundings: usize,
     /// Expansion limit of the Fast Downward search inside a leaf.
     pub leaf_max_expansions: usize,
@@ -212,7 +224,14 @@ pub fn evaluate(
     let atoms = initial_atoms(problem);
     let mut leaves = Vec::with_capacity(tree.clusters.len());
     for cluster_index in 0..tree.clusters.len() {
-        let leaf = build_leaf_task(domain, &tree, cluster_index, &atoms)?;
+        let leaf = build_leaf_task(
+            domain,
+            problem,
+            &tree,
+            cluster_index,
+            &atoms,
+            options.max_groundings,
+        )?;
         let search = fast_downward::search(
             &leaf.task,
             &[HeuristicKind::Ff],
@@ -347,7 +366,8 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use crate::parsing::json::{
-        Action, Formula, Htn, InitialTaskNetwork, Predicate, Subtask, Symbol, TaskOrdering,
+        Action, Formula, Htn, InitialTaskNetwork, NumberType, Predicate, Subtask, Symbol,
+        TaskOrdering,
     };
 
     use super::*;
@@ -579,5 +599,240 @@ mod tests {
                 .iter()
                 .all(|task| task.terms != vec!["truck".to_string()])
         );
+    }
+
+    fn single_action_domain(preconditions: Formula, effects: Formula) -> Domain {
+        Domain {
+            name: "test".to_string(),
+            requirements: Vec::new(),
+            types: vec![symbol("place", None)],
+            constants: Vec::new(),
+            predicates: vec![
+                Predicate {
+                    name: "at".to_string(),
+                    variables: vec![symbol("?p", Some("place"))],
+                },
+                Predicate {
+                    name: "road".to_string(),
+                    variables: vec![symbol("?a", Some("place")), symbol("?b", Some("place"))],
+                },
+                Predicate {
+                    name: "marked".to_string(),
+                    variables: vec![symbol("?p", Some("place"))],
+                },
+            ],
+            compound_tasks: Vec::new(),
+            methods: Vec::new(),
+            actions: vec![Action {
+                name: "move".to_string(),
+                parameters: vec![symbol("?from", Some("place")), symbol("?to", Some("place"))],
+                preconditions: Some(preconditions),
+                effects: Some(effects),
+            }],
+            functions: Vec::new(),
+        }
+    }
+
+    fn move_problem(init_state: Vec<Predicate>) -> Problem {
+        Problem {
+            name: "p".to_string(),
+            domain_name: "test".to_string(),
+            objects: vec![
+                symbol("a", Some("place")),
+                symbol("b", Some("place")),
+                symbol("c", Some("place")),
+            ],
+            init_state,
+            goal: None,
+            init_task_network: Some(InitialTaskNetwork {
+                parameters: None,
+                tn: Htn {
+                    subtasks: vec![subtask("t1", "move", &["a", "b"])],
+                    orderings: TaskOrdering::Total,
+                    constraints: None,
+                },
+            }),
+        }
+    }
+
+    fn solve_with(domain: &Domain, problem: &Problem) -> Evaluation {
+        let mut merger = SgplanMerger::default();
+        evaluate(domain, problem, &mut merger, &EvaluationOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn or_precondition_is_translated_to_dnf() {
+        let domain = single_action_domain(
+            Formula::Or(vec![
+                Formula::Atom(atom("at", &["?from"])),
+                Formula::Atom(atom("road", &["?from", "?to"])),
+            ]),
+            Formula::Atom(atom("at", &["?to"])),
+        );
+        // `at(a)` does not hold, so the second disjunct must be used.
+        let evaluation = solve_with(&domain, &move_problem(vec![atom("road", &["a", "b"])]));
+        assert!(evaluation.solved);
+        assert_eq!(evaluation.tree.unmodeled, 0);
+        assert_eq!(evaluation.plan, vec!["move(a, b)".to_string()]);
+    }
+
+    #[test]
+    fn quantified_preconditions_expand_over_the_typed_universe() {
+        let universal = single_action_domain(
+            Formula::ForAll(
+                vec![symbol("?p", Some("place"))],
+                Box::new(Formula::Atom(atom("at", &["?p"]))),
+            ),
+            Formula::Atom(atom("at", &["?to"])),
+        );
+        let all = move_problem(vec![
+            atom("at", &["a"]),
+            atom("at", &["b"]),
+            atom("at", &["c"]),
+        ]);
+        assert!(solve_with(&universal, &all).solved);
+        let partial = move_problem(vec![atom("at", &["a"]), atom("at", &["b"])]);
+        assert!(!solve_with(&universal, &partial).solved);
+
+        let existential = single_action_domain(
+            Formula::Exists(
+                vec![symbol("?p", Some("place"))],
+                Box::new(Formula::Atom(atom("at", &["?p"]))),
+            ),
+            Formula::Atom(atom("at", &["?to"])),
+        );
+        assert!(solve_with(&existential, &move_problem(vec![atom("at", &["b"])])).solved);
+        assert!(!solve_with(&existential, &move_problem(Vec::new())).solved);
+    }
+
+    #[test]
+    fn composite_negation_and_implication_are_rewritten() {
+        let negation = single_action_domain(
+            Formula::Not(Box::new(Formula::And(vec![
+                Formula::Atom(atom("at", &["?from"])),
+                Formula::Atom(atom("road", &["?from", "?to"])),
+            ]))),
+            Formula::Atom(atom("at", &["?to"])),
+        );
+        // Both conjuncts hold, so the negated conjunction is false.
+        let blocked = move_problem(vec![atom("at", &["a"]), atom("road", &["a", "b"])]);
+        assert!(!solve_with(&negation, &blocked).solved);
+        let open = move_problem(vec![atom("road", &["a", "b"])]);
+        assert!(solve_with(&negation, &open).solved);
+
+        let implication = single_action_domain(
+            Formula::Imply(
+                Box::new(Formula::Atom(atom("road", &["?from", "?to"]))),
+                Box::new(Formula::Atom(atom("at", &["?from"]))),
+            ),
+            Formula::Atom(atom("at", &["?to"])),
+        );
+        assert!(!solve_with(&implication, &move_problem(vec![atom("road", &["a", "b"])])).solved);
+        assert!(
+            solve_with(
+                &implication,
+                &move_problem(vec![atom("road", &["a", "b"]), atom("at", &["a"])])
+            )
+            .solved
+        );
+    }
+
+    #[test]
+    fn xor_precondition_requires_exactly_one_disjunct() {
+        let domain = single_action_domain(
+            Formula::Xor(vec![
+                Formula::Atom(atom("at", &["?from"])),
+                Formula::Atom(atom("road", &["?from", "?to"])),
+            ]),
+            Formula::Atom(atom("at", &["?to"])),
+        );
+        let both = move_problem(vec![atom("at", &["a"]), atom("road", &["a", "b"])]);
+        assert!(!solve_with(&domain, &both).solved);
+        let one = move_problem(vec![atom("road", &["a", "b"])]);
+        assert!(solve_with(&domain, &one).solved);
+    }
+
+    #[test]
+    fn equality_preconditions_are_evaluated() {
+        let domain = single_action_domain(
+            Formula::Equals("?from".to_string(), "?to".to_string()),
+            Formula::Atom(atom("at", &["?to"])),
+        );
+        assert!(!solve_with(&domain, &move_problem(Vec::new())).solved);
+
+        let mut problem = move_problem(Vec::new());
+        if let Some(network) = problem.init_task_network.as_mut() {
+            network.tn.subtasks = vec![subtask("t1", "move", &["a", "a"])];
+        }
+        assert!(solve_with(&domain, &problem).solved);
+    }
+
+    #[test]
+    fn implications_in_effects_become_conditional_effects() {
+        let domain = single_action_domain(
+            Formula::Atom(atom("road", &["?from", "?to"])),
+            Formula::Imply(
+                Box::new(Formula::Atom(atom("at", &["?from"]))),
+                Box::new(Formula::Atom(atom("marked", &["?to"]))),
+            ),
+        );
+        let problem = move_problem(vec![atom("road", &["a", "b"])]);
+        let tree = build_evaluation_tree(&domain, &problem, &EvaluationOptions::default()).unwrap();
+        let atoms = initial_atoms(&problem);
+        let leaf = build_leaf_task(&domain, &problem, &tree, 0, &atoms, 256).unwrap();
+        assert!(
+            leaf.task.operators.iter().any(|operator| operator
+                .effects
+                .iter()
+                .any(|effect| !effect.condition.is_empty())),
+            "the implication must become a conditional effect"
+        );
+        assert!(
+            leaf.task
+                .variables
+                .iter()
+                .any(|variable| variable.name.starts_with("marked(")),
+            "the effect atom must be a leaf variable"
+        );
+    }
+
+    #[test]
+    fn disjunctive_effects_split_the_operator() {
+        let domain = single_action_domain(
+            Formula::Atom(atom("road", &["?from", "?to"])),
+            Formula::Or(vec![
+                Formula::Atom(atom("at", &["?to"])),
+                Formula::Atom(atom("marked", &["?to"])),
+            ]),
+        );
+        let problem = move_problem(vec![atom("road", &["a", "b"])]);
+        let tree = build_evaluation_tree(&domain, &problem, &EvaluationOptions::default()).unwrap();
+        let atoms = initial_atoms(&problem);
+        let leaf = build_leaf_task(&domain, &problem, &tree, 0, &atoms, 256).unwrap();
+        assert_eq!(leaf.task.operators.len(), 2, "one operator per outcome");
+        assert_eq!(leaf.operator_tasks, vec![0, 0]);
+    }
+
+    #[test]
+    fn probabilistic_formulas_are_rejected() {
+        let domain = single_action_domain(
+            Formula::Probabilistic(
+                NumberType::Real(0.5),
+                Box::new(Formula::Atom(atom("road", &["?from", "?to"]))),
+            ),
+            Formula::Atom(atom("at", &["?to"])),
+        );
+        let problem = move_problem(vec![atom("road", &["a", "b"])]);
+        let mut merger = SgplanMerger::default();
+        let error = evaluate(
+            &domain,
+            &problem,
+            &mut merger,
+            &EvaluationOptions::default(),
+        )
+        .expect_err("probabilistic formulas cannot be modelled deterministically");
+        assert!(format!("{error}").contains("probabilistic"));
+        let graph = build_task_constraint_graph(&domain, &problem, 256).unwrap();
+        assert_eq!(graph.unmodeled, 1);
     }
 }

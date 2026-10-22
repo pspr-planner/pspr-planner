@@ -27,7 +27,8 @@ pub struct EvaluationTree {
     pub agglomeration: Option<Agglomeration>,
     /// Shared constraint ids attached to every merge node (evaluation id).
     pub merge_constraints: HashMap<usize, Vec<usize>>,
-    /// Number of formulas that could not be encoded in the leaf models.
+    /// Number of probabilistic formulas, the only constructor the leaf encoding
+    /// cannot translate.
     pub unmodeled: usize,
 }
 
