@@ -87,9 +87,12 @@ Loading 1 problem file(s).
 | `src/solver/` | Solver-facing representations and entry point |
 | `src/solver/domain.rs` | `process_domain`: parser AST to solver-facing domain |
 | `src/solver/problem.rs` | `load_problem`: parser AST to solver-facing problem |
-| `src/solver/solve.rs` | `solve`: the planner entry point (stub) |
-| `src/partition/` | Graph partitioning passes |
-| `src/partition/agglomeration.rs`, `src/partition/bisbm.rs` | Placeholders for the SGPlan passes |
+| `src/solver/solve.rs` | `solve`: evaluation-tree entry point |
+| `src/solver/evaluation_tree/` | Incidence graph, clustering/tree, leaf solving, and merging |
+| `src/solver/fast_downward/` | Multi-valued planning tasks, heuristics, and best-first search |
+| `src/solver/partition/` | Graph partitioning passes |
+| `src/solver/partition/agglomeration/` | Gilpin et al. merge-level ILP and evaluation scheduling |
+| `src/solver/partition/bisbm/` | Spectral clustering of bipartite task/constraint graphs |
 | `src/main.rs` | CLI pipeline |
 
 ## Validation

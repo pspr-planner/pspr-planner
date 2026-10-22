@@ -1,4 +1,4 @@
-use crate::parsing::json::{Formula, InitialTaskNetwork, Predicate, ProblemAst, Symbol};
+use crate::parsing::json::{Formula, Htn, InitialTaskNetwork, Predicate, ProblemAst, Symbol};
 use crate::solver::domain::Domain;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,4 +23,22 @@ pub fn load_problem(_domain: &Domain, ast: &ProblemAst) -> Result<Problem, Strin
         goal: ast.goal.clone(),
         init_task_network: ast.init_tn.clone(),
     })
+}
+
+impl Problem {
+    /// The initial task network, if the problem is hierarchical.
+    pub fn task_network(&self) -> Option<&Htn> {
+        self.init_task_network.as_ref().map(|network| &network.tn)
+    }
+
+    /// The free parameters of the initial task network.
+    ///
+    /// They are grounded over the domain's constants and the problem's objects
+    /// when the evaluation tree is built.
+    pub fn network_parameters(&self) -> &[Symbol] {
+        self.init_task_network
+            .as_ref()
+            .and_then(|network| network.parameters.as_deref())
+            .unwrap_or(&[])
+    }
 }

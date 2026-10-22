@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::parsing::json::{
     Action, DomainAst, Function, Method, Predicate, RequirementType, Symbol, Task,
 };
@@ -28,4 +30,42 @@ pub fn process_domain(ast: &DomainAst) -> Result<Domain, String> {
         actions: ast.actions.clone(),
         functions: ast.functions.clone(),
     })
+}
+
+impl Domain {
+    /// Actions whose name matches the primitive task `task`.
+    pub fn actions_for(&self, task: &str) -> impl Iterator<Item = &Action> {
+        self.actions
+            .iter()
+            .filter(move |action| action.name == task)
+    }
+
+    /// Methods that decompose the compound task `task`.
+    pub fn methods_for(&self, task: &str) -> impl Iterator<Item = &Method> {
+        self.methods
+            .iter()
+            .filter(move |method| method.task.name == task)
+    }
+
+    /// Whether `type_name` is `ancestor` or a (transitive) subtype of it.
+    ///
+    /// Unknown types are only considered equal to themselves.
+    pub fn is_subtype_of(&self, type_name: &str, ancestor: &str) -> bool {
+        if type_name == ancestor {
+            return true;
+        }
+        let mut visited = HashSet::new();
+        let mut current = type_name;
+        while visited.insert(current) {
+            let Some(symbol) = self.types.iter().find(|symbol| symbol.name == current) else {
+                return false;
+            };
+            match symbol.symbol_type.as_deref() {
+                Some(parent) if parent == ancestor => return true,
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+        false
+    }
 }

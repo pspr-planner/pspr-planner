@@ -132,7 +132,10 @@ fn domain_problem_solve() {
     assert_eq!(problem.name, "p1");
 
     let result: SolveResult = solve(&domain, &problem).expect("solve");
-    assert!(result.plan.is_empty(), "stub plan");
+    // The only task is `deliver(depot)` and its method requires
+    // `road(depot, depot)`, which no operator can establish; the evaluation
+    // tree therefore reports the problem as unsolvable and returns no plan.
+    assert!(result.plan.is_empty(), "unsolvable fixture");
 }
 
 #[test]

@@ -139,7 +139,7 @@ fn solve_problem_file(
     handle_problem(domain, &problem_ast)
 }
 
-/// Stub boundary: problem AST -> [`Problem`] -> [`solve`].
+/// Problem AST -> [`Problem`] -> [`solve`].
 fn handle_problem(domain: &Domain, problem_ast: &ProblemAst) -> Result<(), String> {
     let problem: Problem = load_problem(domain, problem_ast)?;
     println!(
@@ -150,7 +150,7 @@ fn handle_problem(domain: &Domain, problem_ast: &ProblemAst) -> Result<(), Strin
 
     let result = solve(domain, &problem)?;
     println!(
-        "    solve {}: stub, plan length {}",
+        "    solve {}: plan length {}",
         result.problem,
         result.plan.len()
     );

@@ -1,0 +1,420 @@
+//! Grounding and the task/constraint incidence graph.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+
+use anyhow::{Result, ensure};
+
+use crate::parsing::json::{
+    Constraint as NetworkConstraint, Formula, Predicate, Symbol, TaskOrdering,
+};
+use crate::solver::domain::Domain;
+use crate::solver::problem::Problem;
+
+/// A ground atom `predicate(term, ...)`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Atom {
+    pub predicate: String,
+    pub terms: Vec<String>,
+}
+
+impl Atom {
+    pub fn new(predicate: impl Into<String>, terms: Vec<String>) -> Self {
+        Atom {
+            predicate: predicate.into(),
+            terms,
+        }
+    }
+}
+
+impl fmt::Display for Atom {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.terms.is_empty() {
+            write!(formatter, "{}", self.predicate)
+        } else {
+            write!(formatter, "{}({})", self.predicate, self.terms.join(", "))
+        }
+    }
+}
+
+/// A task of the initial task network after grounding.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskNode {
+    pub name: String,
+    pub terms: Vec<String>,
+}
+
+impl fmt::Display for TaskNode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.terms.is_empty() {
+            write!(formatter, "{}", self.name)
+        } else {
+            write!(formatter, "{}({})", self.name, self.terms.join(", "))
+        }
+    }
+}
+
+/// A constraint node of the incidence graph.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConstraintNode {
+    /// A ground atom occurring in an action or method schema of the task.
+    Atom(Atom),
+    /// `before` must be executed before `after` (task indices).
+    Ordering { before: usize, after: usize },
+    /// An `Equal`/`NotEqual` constraint between two terms of the network.
+    Equality {
+        left: String,
+        right: String,
+        equal: bool,
+    },
+}
+
+impl fmt::Display for ConstraintNode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConstraintNode::Atom(atom) => write!(formatter, "{atom}"),
+            ConstraintNode::Ordering { before, after } => {
+                write!(formatter, "before({before}, {after})")
+            }
+            ConstraintNode::Equality { left, right, equal } => {
+                write!(
+                    formatter,
+                    "{left} {} {right}",
+                    if *equal { "=" } else { "!=" }
+                )
+            }
+        }
+    }
+}
+
+/// The task/constraint incidence graph.
+#[derive(Debug, Clone)]
+pub struct TaskConstraintGraph {
+    pub tasks: Vec<TaskNode>,
+    pub constraints: Vec<ConstraintNode>,
+    /// `incidence[task][constraint]` is `true` iff the task touches the constraint.
+    pub incidence: Vec<Vec<bool>>,
+    /// Number of formulas that could not be encoded as conjunctive literals.
+    pub unmodeled: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Grounding
+// ---------------------------------------------------------------------------
+
+struct Grounding {
+    bindings: BTreeMap<String, String>,
+    tasks: Vec<TaskNode>,
+}
+
+pub(super) fn bindings_from(parameters: &[Symbol], terms: &[String]) -> BTreeMap<String, String> {
+    parameters
+        .iter()
+        .zip(terms)
+        .map(|(parameter, term)| (parameter.name.clone(), term.clone()))
+        .collect()
+}
+
+pub(super) fn ground_atom(predicate: &Predicate, bindings: &BTreeMap<String, String>) -> Atom {
+    Atom::new(
+        predicate.name.clone(),
+        predicate
+            .variables
+            .iter()
+            .map(|symbol| {
+                bindings
+                    .get(&symbol.name)
+                    .cloned()
+                    .unwrap_or_else(|| symbol.name.clone())
+            })
+            .collect(),
+    )
+}
+
+/// Ground the free parameters of the initial task network over the constants
+/// and objects of the problem.
+fn ground_task_network(
+    domain: &Domain,
+    problem: &Problem,
+    max_groundings: usize,
+) -> Result<Vec<Grounding>> {
+    let Some(network) = problem.task_network() else {
+        return Ok(Vec::new());
+    };
+    let mut assignments: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
+    for parameter in problem.network_parameters() {
+        let candidates = type_candidates(domain, problem, parameter);
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut extended = Vec::new();
+        for assignment in &assignments {
+            for candidate in &candidates {
+                let mut copy = assignment.clone();
+                copy.insert(parameter.name.clone(), candidate.clone());
+                extended.push(copy);
+                ensure!(
+                    extended.len() <= max_groundings,
+                    "the initial task network has more than {max_groundings} groundings; \
+                     raise EvaluationOptions::max_groundings"
+                );
+            }
+        }
+        assignments = extended;
+    }
+
+    Ok(assignments
+        .into_iter()
+        .map(|bindings| Grounding {
+            tasks: network
+                .subtasks
+                .iter()
+                .map(|subtask| TaskNode {
+                    name: subtask.task.name.clone(),
+                    terms: subtask
+                        .terms
+                        .iter()
+                        .map(|term| {
+                            bindings
+                                .get(&term.name)
+                                .cloned()
+                                .unwrap_or_else(|| term.name.clone())
+                        })
+                        .collect(),
+                })
+                .collect(),
+            bindings,
+        })
+        .collect())
+}
+
+fn type_candidates(domain: &Domain, problem: &Problem, parameter: &Symbol) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for symbol in domain.constants.iter().chain(problem.objects.iter()) {
+        let compatible = match (&parameter.symbol_type, &symbol.symbol_type) {
+            (Some(required), Some(actual)) => domain.is_subtype_of(actual, required),
+            (Some(_), None) => true,
+            (None, _) => true,
+        };
+        if compatible {
+            names.insert(symbol.name.clone());
+        }
+    }
+    names.into_iter().collect()
+}
+
+// ---------------------------------------------------------------------------
+// Constraint extraction
+// ---------------------------------------------------------------------------
+
+/// Traverse a formula and collect every atom it mentions. Unsupported
+/// constructs are counted in `unmodeled` but their atoms are still collected.
+fn collect_atoms(
+    formula: &Formula,
+    bindings: &BTreeMap<String, String>,
+    atoms: &mut BTreeSet<Atom>,
+    unmodeled: &mut usize,
+) {
+    match formula {
+        Formula::Empty => {}
+        Formula::Atom(predicate) => {
+            atoms.insert(ground_atom(predicate, bindings));
+        }
+        Formula::Not(inner) => {
+            if !matches!(inner.as_ref(), Formula::Atom(_)) {
+                *unmodeled += 1;
+            }
+            collect_atoms(inner, bindings, atoms, unmodeled);
+        }
+        Formula::And(items) => {
+            for item in items {
+                collect_atoms(item, bindings, atoms, unmodeled);
+            }
+        }
+        Formula::Or(items) | Formula::Xor(items) => {
+            *unmodeled += 1;
+            for item in items {
+                collect_atoms(item, bindings, atoms, unmodeled);
+            }
+        }
+        Formula::Imply(left, right) => {
+            *unmodeled += 1;
+            collect_atoms(left, bindings, atoms, unmodeled);
+            collect_atoms(right, bindings, atoms, unmodeled);
+        }
+        Formula::Exists(_, inner) | Formula::ForAll(_, inner) => {
+            *unmodeled += 1;
+            collect_atoms(inner, bindings, atoms, unmodeled);
+        }
+        Formula::Probabilistic(_, inner) => {
+            *unmodeled += 1;
+            collect_atoms(inner, bindings, atoms, unmodeled);
+        }
+        Formula::Equals(_, _) => *unmodeled += 1,
+    }
+}
+
+fn task_atoms(domain: &Domain, task: &TaskNode, unmodeled: &mut usize) -> BTreeSet<Atom> {
+    let mut atoms = BTreeSet::new();
+    for action in domain.actions_for(&task.name) {
+        if action.parameters.len() != task.terms.len() {
+            continue;
+        }
+        let bindings = bindings_from(&action.parameters, &task.terms);
+        if let Some(precondition) = &action.preconditions {
+            collect_atoms(precondition, &bindings, &mut atoms, unmodeled);
+        }
+        if let Some(effects) = &action.effects {
+            collect_atoms(effects, &bindings, &mut atoms, unmodeled);
+        }
+    }
+    for method in domain.methods_for(&task.name) {
+        if method.task_terms.len() != task.terms.len() {
+            continue;
+        }
+        let bindings = bindings_from(&method.task_terms, &task.terms);
+        if let Some(precondition) = &method.precondition {
+            collect_atoms(precondition, &bindings, &mut atoms, unmodeled);
+        }
+    }
+    atoms
+}
+
+#[derive(Default)]
+struct ConstraintIndex {
+    by_node: BTreeMap<ConstraintNode, usize>,
+    nodes: Vec<ConstraintNode>,
+}
+
+impl ConstraintIndex {
+    fn intern(&mut self, node: ConstraintNode) -> usize {
+        if let Some(&index) = self.by_node.get(&node) {
+            index
+        } else {
+            let index = self.nodes.len();
+            self.by_node.insert(node.clone(), index);
+            self.nodes.push(node);
+            index
+        }
+    }
+}
+
+/// Build the task/constraint incidence graph of the initial task network.
+pub fn build_task_constraint_graph(
+    domain: &Domain,
+    problem: &Problem,
+    max_groundings: usize,
+) -> Result<TaskConstraintGraph> {
+    let groundings = ground_task_network(domain, problem, max_groundings)?;
+    let mut tasks = Vec::new();
+    let mut offsets = Vec::new();
+    for grounding in &groundings {
+        offsets.push((tasks.len(), grounding));
+        tasks.extend(grounding.tasks.iter().cloned());
+    }
+
+    let mut unmodeled = 0;
+    let mut index = ConstraintIndex::default();
+    let mut incidence: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); tasks.len()];
+    for (task_index, task) in tasks.iter().enumerate() {
+        for atom in task_atoms(domain, task, &mut unmodeled) {
+            let constraint = index.intern(ConstraintNode::Atom(atom));
+            incidence[task_index].insert(constraint);
+        }
+    }
+
+    if let Some(network) = problem.task_network() {
+        let id_of: HashMap<&str, usize> = network
+            .subtasks
+            .iter()
+            .enumerate()
+            .filter_map(|(position, subtask)| {
+                subtask.id.as_ref().map(|id| (id.name.as_str(), position))
+            })
+            .collect();
+
+        for &(offset, grounding) in &offsets {
+            let count = grounding.tasks.len();
+            let mut add_ordering = |before: usize, after: usize| {
+                let constraint = index.intern(ConstraintNode::Ordering { before, after });
+                incidence[before].insert(constraint);
+                incidence[after].insert(constraint);
+            };
+            match &network.orderings {
+                TaskOrdering::Total => {
+                    for position in 0..count.saturating_sub(1) {
+                        add_ordering(offset + position, offset + position + 1);
+                    }
+                }
+                TaskOrdering::Partial(pairs) => {
+                    for (before, after) in pairs {
+                        let before = id_of.get(before.as_str()).copied().ok_or_else(|| {
+                            anyhow::anyhow!("unknown subtask id `{before}` in the task ordering")
+                        })?;
+                        let after = id_of.get(after.as_str()).copied().ok_or_else(|| {
+                            anyhow::anyhow!("unknown subtask id `{after}` in the task ordering")
+                        })?;
+                        add_ordering(offset + before, offset + after);
+                    }
+                }
+            }
+
+            if let Some(constraints) = &network.constraints {
+                for constraint in constraints {
+                    let (left, right, equal) = match constraint {
+                        NetworkConstraint::Equal(left, right) => (left, right, true),
+                        NetworkConstraint::NotEqual(left, right) => (left, right, false),
+                    };
+                    let left = grounding
+                        .bindings
+                        .get(left)
+                        .cloned()
+                        .unwrap_or_else(|| left.clone());
+                    let right = grounding
+                        .bindings
+                        .get(right)
+                        .cloned()
+                        .unwrap_or_else(|| right.clone());
+                    let node = ConstraintNode::Equality {
+                        left: left.clone(),
+                        right: right.clone(),
+                        equal,
+                    };
+                    let id = index.intern(node);
+                    let mut matched = false;
+                    for position in 0..count {
+                        let task = &grounding.tasks[position];
+                        if task.terms.contains(&left) || task.terms.contains(&right) {
+                            incidence[offset + position].insert(id);
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        // A network-level constraint that names no subtask term
+                        // still partitions with every task of the grounding.
+                        for position in 0..count {
+                            incidence[offset + position].insert(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let constraints = index.nodes;
+    let incidence = incidence
+        .into_iter()
+        .map(|touched| {
+            (0..constraints.len())
+                .map(|id| touched.contains(&id))
+                .collect()
+        })
+        .collect();
+
+    Ok(TaskConstraintGraph {
+        tasks,
+        constraints,
+        incidence,
+        unmodeled,
+    })
+}
