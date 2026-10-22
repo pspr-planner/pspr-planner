@@ -149,11 +149,19 @@ fn handle_problem(domain: &Domain, problem_ast: &ProblemAst) -> Result<(), Strin
     );
 
     let result = solve(domain, &problem)?;
-    println!(
-        "    solve {}: plan length {}",
-        result.problem,
-        result.plan.len()
-    );
+    if result.solved {
+        println!(
+            "    solve {}: plan length {}",
+            result.problem,
+            result.plan.len()
+        );
+    } else {
+        println!(
+            "    solve {}: unsolved ({} steps found)",
+            result.problem,
+            result.plan.len()
+        );
+    }
     Ok(())
 }
 

@@ -172,7 +172,11 @@ by the merge solver.
 ## Related gaps outside the formula language
 
 - **Problem goal.** `Problem::goal` is decoded and stored but never used by the
-  evaluation tree; leaf goals are "all tasks executed".
+  evaluation tree; leaf goals are "all tasks executed". `validate_plan` does
+  evaluate the goal and reports it as a `GoalStatus`, and
+  `ValidationOptions::require_goal` turns a violation into an error. Because
+  compound tasks are opaque, goals that need method decomposition are reported
+  as violated even when the task network itself was executed correctly.
 - **Method decomposition.** Compound tasks are represented by a synthetic
   operator that requires the method precondition and marks the task executed.
   Method subtasks are not added to the task universe.

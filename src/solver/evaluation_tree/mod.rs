@@ -45,6 +45,7 @@
 //! * `leaf`: encoding and solving a cluster as a planning task.
 //! * `merge`: the merge-solver interface, the relaxed SGPlan MINLP, Adam, and
 //!   the adaptive penalty continuation.
+//! * `verify`: re-execution of a merged plan against the full HDDL semantics.
 //!
 //! # Modelling limitations
 //!
@@ -90,6 +91,7 @@ mod formula;
 mod graph;
 mod leaf;
 mod merge;
+mod verify;
 
 pub use clustering::EvaluationTree;
 pub use graph::{Atom, ConstraintNode, TaskConstraintGraph, TaskNode, build_task_constraint_graph};
@@ -97,6 +99,7 @@ pub use merge::{
     AdamOptions, MergeOutcome, MergeProblem, MergeRecord, MergeSolver, PartialSolution,
     PenaltyReport, PenaltySpace, SgplanMerger,
 };
+pub use verify::{GoalStatus, ValidationOptions, ValidationReport, validate_plan};
 
 use clustering::{attach_shared_constraints, build_agglomeration, cluster_tasks};
 use leaf::{build_leaf_task, initial_atoms};

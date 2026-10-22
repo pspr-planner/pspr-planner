@@ -136,6 +136,7 @@ fn domain_problem_solve() {
     // `road(depot, depot)`, which no operator can establish; the evaluation
     // tree therefore reports the problem as unsolvable and returns no plan.
     assert!(result.plan.is_empty(), "unsolvable fixture");
+    assert!(!result.solved, "unsolvable fixture");
 }
 
 #[test]

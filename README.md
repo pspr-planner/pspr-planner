@@ -34,6 +34,17 @@ cargo build
 cargo test
 ```
 
+`cargo test` also runs `tests/ipc.rs` against the IPC HTN benchmarks in
+`../hddl/test_data/ipc`. The tests are skipped when that directory or the
+`hddl_analyzer` executable is missing. Set `PSPR_IPC_DIR` to point at another
+benchmark checkout and `HDDL_PARSER` to the parser executable.
+
+Every IPC plan is re-executed with
+`pspr::solver::evaluation_tree::validate_plan`, which checks action and method
+preconditions, full effect semantics, grounding coverage, the ordering and
+equality constraints of the task network, and the problem goal (reported as a
+`GoalStatus`).
+
 ## Usage
 
 ```bash
@@ -73,7 +84,7 @@ Domain BLOCKS
   5 actions, 4 compound tasks, 8 methods
 Loading 1 problem file(s).
   problem BW-rand-5 (5 objects)
-    solve BW-rand-5: stub, plan length 0
+    solve BW-rand-5: plan length 3
 ```
 
 ## Layout

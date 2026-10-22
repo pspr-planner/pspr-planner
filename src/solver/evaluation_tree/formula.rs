@@ -68,16 +68,23 @@ impl<'a> Universe<'a> {
     /// Names compatible with the declared type of `variable`.
     pub(super) fn candidates(&self, variable: &Symbol) -> Vec<String> {
         self.symbols
-            .iter()
-            .filter(
-                |(_, symbol_type)| match (&variable.symbol_type, symbol_type) {
-                    (Some(required), Some(actual)) => self.domain.is_subtype_of(actual, required),
-                    (Some(_), None) => true,
-                    (None, _) => true,
-                },
-            )
-            .map(|(name, _)| name.clone())
+            .keys()
+            .filter(|name| self.compatible(variable, name))
+            .cloned()
             .collect()
+    }
+
+    /// Whether `name` is an object or constant compatible with the declared
+    /// type of `variable`.
+    pub(super) fn compatible(&self, variable: &Symbol, name: &str) -> bool {
+        let Some(symbol_type) = self.symbols.get(name) else {
+            return false;
+        };
+        match (&variable.symbol_type, symbol_type) {
+            (Some(required), Some(actual)) => self.domain.is_subtype_of(actual, required),
+            (Some(_), None) => true,
+            (None, _) => true,
+        }
     }
 
     /// Every assignment of the quantified `variables`, at most `budget`.
