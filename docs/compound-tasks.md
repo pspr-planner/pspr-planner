@@ -1,7 +1,8 @@
 # Compound tasks in PSPR
 
-Status: implementation note, 2026-10-22. Stages C, G and the bounded form of
-D are implemented; A, B, E and F remain design options.
+Status: implementation note, 2026-10-22. Stages C and G are implemented
+together as the hierarchical path. Approach D was implemented, measured against
+C+G, and removed; A, B, E and F remain design options.
 
 By default the evaluation tree solves a projection of the HTN problem in which
 every compound task is opaque. `graph.rs` collects only the atoms of the
@@ -17,12 +18,14 @@ This note records several ways to close that gap. Each approach is stated with
 its formal model, pseudo-code, the points in PSPR where it would attach, and
 its correctness and cost conditions. The approaches are deliberately
 independent: they can be combined, and the recommended roadmap at the end
-orders them by implementation cost and expected value. In short, start with
-the two-phase refinement of Approach C, add primitive-only macro summaries
-(Approach G), and then move to recursive evaluation trees (Approach D);
-progression (Approach B) and exact encodings (Approach F) are the completeness
-fallbacks, while eager expansion (Approach A) and task-atom compilation
-(Approach E) are baseline implementations.
+orders them by implementation cost and expected value. In short, run the
+two-phase refinement of Approach C together with primitive-only macro
+summaries (Approach G); the benchmark showed C+G is faster in the median than
+the adaptive C-first path and at least as complete as C alone. Progression
+(Approach B) and exact encodings (Approach F) are the completeness fallbacks,
+while eager expansion (Approach A) and task-atom compilation (Approach E) are
+baseline implementations. Approach D was tried and removed because it matched
+C+G coverage while adding overhead.
 
 ## Implementation status
 
@@ -30,9 +33,13 @@ fallbacks, while eager expansion (Approach A) and task-atom compilation
   `src/solver/evaluation_tree/hierarchical.rs`. `solve_hierarchical` builds
   the abstract plan with the existing evaluation tree, then recursively
   grounds methods and actions. It uses the method recorded in the abstract
-  plan first and then tries the other applicable methods. The refinement is
-  depth-first and first-success, with method order chosen by preferred method
-  and then by subtask count; it is sound but not exhaustive.
+  plan first and then tries the other applicable methods. The refinement is a
+  bounded breadth-first enumeration of alternatives (up to 2,048 partial
+  refinements per level), so it can backtrack over method choices and reject a
+  decomposition that leaves the state goal false. A path-local visited set of
+  `(task, state)` pairs prunes recursive methods that rediscover the same
+  subproblem (for example `get_to` through an intermediate location). The
+  search is sound and bounded, but not exhaustive.
 - **Approach G, primitive-only summaries.** Implemented as
   `EvaluationOptions::method_summary = MethodSummary::PrimitiveOnly` and
   `leaf.rs::summary_operators`. Only methods with primitive, totally ordered,
@@ -40,25 +47,31 @@ fallbacks, while eager expansion (Approach A) and task-atom compilation
   the summary is skipped when a precondition clause or effect alternative
   would require a conditional or disjunctive encoding. `--summary` exposes
   this mode in the CLI.
-- **Approach D, recursive evaluation.** Implemented as `solve_recursive` and
-  `refine_plan_with_mode(..., recursive = true)`. A method-local subproblem is
-  evaluated with the existing partitioner when its subtasks are primitive; if
-  the subproblem is incomplete or contains compound subtasks whose effects
-  feed later subtasks, the solver falls back to the linear refinement. This is
-  a bounded recursive tree, not a fully general interface-state search.
+- **C+G hierarchical path.** `solve_hierarchical` enables primitive method
+  summaries unconditionally; the benchmark showed this is faster in the median
+  than the adaptive C-first path and at least as complete as C alone.
+  `--hierarchical` selects this path.
+- **Approach D, recursive evaluation.** Removed after the comparison: it
+  matched C+G coverage on the 27-instance suite but added overhead. Section 5
+  is retained as a design record, not as implemented code.
 - **Validation.** `validate_refinement` recursively re-executes method
   preconditions, subtask order and primitive effects, and checks the final
   state and goal. `ValidationOptions` and `validate_plan` retain their
   network-level semantics for the default abstract planner.
-- **CLI.** `--hierarchical`, `--recursive` and `--summary` select the stages;
-  without them, PSPR keeps its historical abstract behaviour. `--max-groundings`
-  raises the task/method grounding budget.
+- **CLI.** `--hierarchical` selects C+G; `--summary` without refinement
+  summarises the abstract solver; without either, PSPR keeps its historical
+  abstract behaviour. `--max-groundings` raises the task/method grounding
+  budget.
 
-The implemented refinement is deliberately bounded and depth-first. It handles
-the Blocksworld, Depots, Satellite, AssemblyHierarchical and Transport
-instances exercised locally, but recursive or tightly state-dependent methods
-(for example the PCP_1 task network) can still require the exhaustive search
-described in Approaches B or F. Those remain future work.
+The implemented refinement is deliberately bounded and backtracking over a
+finite set of alternatives. It handles the Blocksworld, Depots, Satellite,
+AssemblyHierarchical, Transport and Logistics instances exercised in the
+README comparison, but recursive or tightly state-dependent methods (for
+example the PCP_1 task network and Barman's level-dependent pouring methods)
+can still require the exhaustive search described in Approaches B or F. The
+learned Freecell model also exceeds the 4,096-method grounding limit on one
+task, and the Minecraft and Monroe instances exceed the benchmark's
+30-second refinement budget. Those remain future work.
 
 ## 1. HTN semantics and the current abstraction
 
@@ -743,7 +756,11 @@ This approach is also the easiest to validate against PANDA: the primitive
 plan can be checked with the same strict validator, and the abstract plan can
 be kept as a certificate of the method choices.
 
-## 5. Approach D: recursive evaluation trees
+## 5. Approach D: recursive evaluation trees (removed)
+
+This approach was implemented, measured, and removed: on the 27-instance IPC
+suite it produced the same complete plans as C+G but added overhead. The
+design is retained below for reference.
 
 ### 5.1 Idea
 
@@ -1403,9 +1420,9 @@ should be capped.
   approach that leaves the current abstract planner untouched. It is the
   right first step, but it should be measured as a liftability filter rather
   than assumed to be complete.
-- **D (recursive trees).** The approach that best matches PSPR's architecture.
-  It reuses the ILP hierarchy and the Adam merge at every level and keeps the
-  partition-local grounding advantage. It is the main research direction.
+- **D (recursive trees).** The approach that best matches PSPR's architecture,
+  but the benchmark showed no coverage gain over C+G and extra overhead; it was
+  removed from the implementation. The design remains in section 5 as a record.
 - **E (task-atom compilation).** A sound and complete reference for finite
   closures that reuses Fast Downward, but it discards most of PSPR's
   structural advantage. Use it as a baseline and for small clusters.
@@ -1429,14 +1446,11 @@ should be capped.
    whose subtasks are all primitive and totally ordered; keep the original
    method as a fallback. Measure how many of the 12 `violated` cases become
    `satisfied`.
-4. **Approach D, total-order/single-method first.** Build recursive method
-   nodes for non-recursive methods and reuse `SgplanMerger`. Extend to
-   partially ordered methods once the interface representation is stable.
-5. **Approach B or F as a fallback.** Use progression or a small exact
-   encoding for method subtrees where the recursive merge fails. This closes
+4. **Approach B or F as a fallback.** Use progression or a small exact
+   encoding for method subtrees where the bounded refinement fails. This closes
    the completeness gap without making the default path expensive.
-6. **Approaches A and E as baselines.** Keep them behind feature flags and use
-   them to validate the recursive/refinement results on small instances.
+5. **Approaches A and E as baselines.** Keep them behind feature flags and use
+   them to validate the refinement results on small instances.
 
 ### 9.3 Open issues
 

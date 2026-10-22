@@ -97,8 +97,8 @@ mod verify;
 pub use clustering::EvaluationTree;
 pub use graph::{Atom, ConstraintNode, TaskConstraintGraph, TaskNode, build_task_constraint_graph};
 pub use hierarchical::{
-    Refinement, RefinementOptions, RefinementStep, refine_plan, refine_plan_with_mode,
-    solve_hierarchical, solve_recursive, validate_refinement,
+    Refinement, RefinementOptions, RefinementStep, refine_plan, solve_hierarchical,
+    validate_refinement,
 };
 pub use merge::{
     AdamOptions, MergeOutcome, MergeProblem, MergeRecord, MergeSolver, PartialSolution,
@@ -863,16 +863,15 @@ mod tests {
     }
 
     #[test]
-    fn recursive_refinement_solves_a_method_subproblem() {
+    fn linear_refinement_solves_a_method_subproblem() {
         let (domain, problem) = summarised_method_domain();
-        let refined = refine_plan_with_mode(
+        let refined = refine_plan(
             &domain,
             &problem,
             &["m_finish[finish(a)]".to_string()],
             &RefinementOptions::default(),
-            true,
         )
-        .expect("recursive refinement");
+        .expect("linear refinement");
         assert_eq!(refined.goal, GoalStatus::Satisfied);
         assert!(refined.plan.iter().any(|step| step == "do(a)"));
     }

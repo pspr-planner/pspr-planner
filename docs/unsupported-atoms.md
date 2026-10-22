@@ -5,7 +5,9 @@ solver now translates all deterministic constructors into the multi-valued
 planning tasks of each leaf; this document describes that translation and the
 remaining gaps. The filename is kept from the earlier gap list, when only the
 conjunctive fragment was supported. Method decomposition is a separate gap;
-[`compound-tasks.md`](compound-tasks.md) surveys approaches for it. The default\nsolver still keeps compound tasks opaque, while `--hierarchical`, `--recursive`\nand `--summary` enable the implemented refinement and summarising stages.
+[`compound-tasks.md`](compound-tasks.md) surveys approaches for it. The default
+solver still keeps compound tasks opaque, while `--hierarchical` (C+G) and
+`--summary` enable the implemented refinement and summarising stages.
 
 The translation lives in
 [`src/solver/evaluation_tree/formula.rs`](../src/solver/evaluation_tree/formula.rs)

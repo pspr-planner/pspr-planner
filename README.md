@@ -60,11 +60,8 @@ pspr path/to/domain.hddl path/to/problems/
 # A whole-program JSON export (domain + at most one problem)
 pspr path/to/program.json
 
-# Refine the abstract task-network plan into a complete HTN plan
+# Refine with stage C and primitive summaries (C+G)
 pspr path/to/domain.hddl path/to/p01.hddl --hierarchical
-
-# Recursive method-subproblem evaluation and primitive method summaries
-pspr path/to/domain.hddl path/to/p01.hddl --recursive --summary
 ```
 
 The parser executable is found from the first available source:
@@ -99,10 +96,9 @@ With `--hierarchical`, the same problem prints the complete primitive plan:
     solve BW-rand-5: plan length 21 (18 methods, goal Satisfied)
 ```
 
-`--recursive` uses the recursive method-subproblem path (falling back to the
-linear refinement when a subproblem needs compound effects). `--summary`
-enables primitive method-effect summaries; it is independent of the refinement
-mode and can also be used with the default abstract solver.
+`--hierarchical` refines the abstract plan with stage C and primitive method
+summaries enabled (C+G). `--summary` without `--hierarchical` enables
+primitive method-effect summaries for the abstract solver.
 
 ## Layout
 
@@ -117,13 +113,15 @@ mode and can also be used with the default abstract solver.
 | `src/solver/problem.rs` | `load_problem`: parser AST to solver-facing problem |
 | `src/solver/solve.rs` | `solve`: evaluation-tree entry point |
 | `src/solver/evaluation_tree/` | Incidence graph, clustering/tree, leaf solving, and merging |
-| `src/solver/evaluation_tree/hierarchical.rs` | Two-phase refinement, recursive evaluation, and strict refinement validation |
+| `src/solver/evaluation_tree/hierarchical.rs` | Two-phase refinement with summaries, and strict refinement validation |
 | `src/solver/evaluation_tree/leaf.rs` | Leaf encoding and optional primitive method summaries |
 | `src/solver/fast_downward/` | Multi-valued planning tasks, heuristics, and best-first search |
 | `src/solver/partition/` | Graph partitioning passes |
 | `src/solver/partition/agglomeration/` | Gilpin et al. merge-level ILP and evaluation scheduling |
 | `src/solver/partition/bisbm/` | Spectral clustering of bipartite task/constraint graphs |
 | `src/main.rs` | CLI pipeline |
+| `examples/bench_modes.rs` | Machine-readable benchmark for the four compound-task modes |
+| `scripts/compare_decomposition.sh` | PSPR-versus-pandaPI benchmark harness |
 
 ## Formula support
 
@@ -133,11 +131,11 @@ DNF and conditional-effect encoding, the supported constructors, and the
 remaining gaps (probabilistic formulas and the unused problem goal).
 
 Compound tasks are modelled as opaque operators by default. The implemented
-stages add two ways to go beyond that: `--hierarchical` refines the abstract
-plan into a complete HTN plan, and `--summary` summarises primitive, totally
-ordered methods into macro operators. The remaining approaches, with formal
-models, pseudo-code and citations, are surveyed in
-[`docs/compound-tasks.md`](docs/compound-tasks.md).
+stages go beyond that in two ways: `--hierarchical` refines the abstract plan
+into a complete HTN plan with primitive summaries (C+G), and `--summary`
+summarises primitive, totally ordered methods into macro operators.
+The remaining approaches, with formal models, pseudo-code and citations, are
+surveyed in [`docs/compound-tasks.md`](docs/compound-tasks.md).
 
 ## Validation
 
@@ -146,16 +144,21 @@ files used to validate the HDDL-Parser it links to.
 
 ## Empirical comparison with PANDA
 
-PSPR and PANDA do not solve the same problem. PSPR builds the evaluation tree
-for the *initial task network* and plans it with compound tasks as opaque
-operators; it does not decompose a compound task into primitive actions and it
-does not plan for the classical goal. PANDA grounds the complete HTN problem
-and searches for a primitive decomposition. The comparison below therefore
-measures PSPR's top-level task-network projection against a complete HTN
-planner. It is useful for locating where PSPR's partitioning saves work and
-for measuring how much of the HTN problem is left to a downstream
-decomposition step, but the plan lengths and the speed ratios are not
-like-for-like.
+PSPR can now solve the initial task network in three modes. They differ in how
+much of the hierarchy is executed, and only the refinement mode guarantees a
+primitive decomposition when the network contains compound tasks:
+
+| Mode | Technique | What it produces |
+| --- | --- | --- |
+| `abstract` | opaque compound tasks | a plan over the initial task network |
+| `summary` | primitive method summaries (stage G) | the same network plan, with macro operators |
+| `hierarchical` | two-phase refinement with summaries (C+G) | a complete primitive decomposition |
+
+`abstract` and `summary` measure PSPR's top-level projection: they execute the
+network but do not apply the effects of the methods that would decompose its
+compound tasks, so they are not complete HTN planners. `hierarchical` is the
+fair comparison to PANDA, because it refines the abstract plan into primitive
+actions, with primitive method summaries enabled, and checks the state goal.
 
 The baseline is the PANDA framework (`holler2021panda`) as implemented by the
 maintained `pandaPI` planner, using its grounding algorithm
@@ -171,17 +174,26 @@ not used: its HDDL front end rejects most of the IPC domains with
   total. They cover totally ordered and partially ordered networks, state
   goals, numeric fluents, learned HTN models, and domains whose initial
   networks contain compound tasks.
-- **PSPR.** `target/release/examples/bench` parses the HDDL files, runs the
-  evaluation-tree solver, and re-executes the result with the independent
-  validator. The reported time is the median of five end-to-end runs and
-  includes parsing, solving, and validation.
+- **PSPR.** `target/release/examples/bench_modes` parses the HDDL files, runs
+  the selected mode, and re-executes the result with the independent
+  validator (`validate_plan` for `abstract`/`summary`, `validate_refinement`
+  for `hierarchical`). The hierarchical mode enables
+  `method_summary=PrimitiveOnly` unconditionally (C+G). The grounding budget is
+  `PSPR_MAX_GROUNDINGS=4096` for the benchmark; the CLI default remains 256.
+  Each successful PSPR run is repeated three times and the median end-to-end
+  time is reported. A run that exceeds `PSPR_TIMEOUT=30` seconds is reported as
+  a timeout and is not repeated. All times include parsing, solving, and
+  validation.
 - **PANDA.** `pandaPIparser` (default options), `pandaPIgrounder -q`, and
   `pandaPIengine -t 60` (default progression search: A* with the RC2/FF
   heuristic). The reported total is one wall-clock run including parsing,
-  grounding, instance loading, and search. `PANDA search ms` is the engine's
-  own search counter and excludes parsing/grounding.
-- **Limits.** 60 seconds of PANDA search per instance; no PSPR timeout was
-  reached. Both planners ran single-threaded.
+  grounding, instance loading, and search. `PANDA actions` is the engine's
+  `Total costs of actions`, which counts primitive domain actions and is
+  comparable to PSPR's plan length. The engine's `Found solution of length`
+  also counts method and precondition operations, so it is deliberately not
+  used in the table.
+- **Limits.** 30 seconds of PSPR solving per instance and 60 seconds of PANDA
+  search per instance. Both planners ran single-threaded.
 - **Platform.** AMD Ryzen AI 7 350 (16 logical CPUs), 22 GiB RAM, Arch Linux
   7.2.11, `rustc` 1.100.0-nightly, GCC 16.2.1. pandaPI commits: parser
   `88c0995` (2024-06-10), grounder `b04ff7b` (2025-01-20), engine `810f043`
@@ -190,110 +202,143 @@ not used: its HDDL front end rejects most of the IPC domains with
 
 ### Results
 
-`PSPR goal` is the status produced by `validate_plan`: `absent` means the
-problem has no state goal, `satisfied` means the executed plan reaches it,
-`violated` means the task-network plan executes but leaves the goal false
-(because compound tasks are opaque), and `invalid` means the partial plan does
-not execute all grounded tasks. `PSPR steps` counts actions in the task-network
-plan; `PANDA actions` counts primitive actions after full decomposition.
+In the per-instance table, `S(n)` means solved with `n` primitive actions (or
+network steps for `Abstract` and `G`) and the state goal satisfied or absent;
+`V(n)` means the task network was solved but the state goal is violated
+(because compound tasks are opaque); `F` means the mode failed; `T` means the
+mode hit its time limit. For `Abstract` and `G`, `V` is expected and is not a
+complete HTN solution. PANDA's count is its primitive action cost.
 
-| Domain | Problem | PSPR solved | PSPR goal | PSPR steps | PSPR ms | PANDA status | PANDA actions | PANDA search ms | PANDA total ms |
-| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: |
-| Blocksworld-GTOHP | p01.hddl | true | violated | 3 | 9 | solved | 59 | 6 | 25 |
-| Blocksworld-GTOHP | p02.hddl | true | violated | 6 | 12 | solved | 101 | 7 | 29 |
-| Blocksworld-GTOHP | p03.hddl | true | violated | 5 | 11 | solved | 102 | 6 | 28 |
-| Blocksworld-GTOHP | p04.hddl | true | violated | 14 | 10 | solved | 170 | 14 | 37 |
-| Blocksworld-GTOHP | p05.hddl | true | violated | 12 | 12 | solved | 203 | 14 | 39 |
-| Depots | p01.hddl | true | violated | 2 | 11 | solved | 36 | 7 | 28 |
-| Depots | p02.hddl | true | violated | 4 | 20 | solved | 59 | 9 | 37 |
-| Depots | p03.hddl | true | violated | 6 | 23 | solved | 114 | 26 | 60 |
-| Satellite-GTOHP | p01.hddl | true | violated | 3 | 11 | solved | 32 | 3 | 22 |
-| Satellite-GTOHP | p02.hddl | true | violated | 5 | 22 | solved | 50 | 8 | 31 |
-| Satellite-GTOHP | p03.hddl | false | invalid | 3 | 23 | solved | 46 | 8 | 33 |
-| Transport | pfile01.hddl | true | absent | 2 | 11 | solved | 15 | 2 | 20 |
-| Transport | pfile02.hddl | true | absent | 3 | 11 | solved | 42 | 13 | 32 |
-| Transport | pfile03.hddl | true | absent | 3 | 11 | solved | 34 | 11 | 29 |
-| PO_Transport | pfile01.hddl | true | absent | 2 | 20 | solved | 15 | 5 | 22 |
-| PO_Satellite | 1obs-1sat-1mod.hddl | true | absent | 1 | 11 | solved | 8 | 1 | 18 |
-| Freecell-Learned-ECAI-16 | probfreecell-02-1.hddl | true | absent | 4 | 27 | timeout | - | 61780 | 63130 |
-| Logistics-Learned-ECAI-16 | probLOGISTICS-04-0.hddl | true | absent | 4 | 17 | solved | 280 | 16 | 45 |
-| Logistics-Learned-ECAI-16 | probLOGISTICS-04-1.hddl | true | absent | 4 | 17 | solved | 264 | 14 | 45 |
-| Logistics-Learned-ECAI-16 | probLOGISTICS-04-2.hddl | true | absent | 4 | 16 | solved | 172 | 12 | 43 |
-| AssemblyHierarchical | genericLinearProblem_depth01.hddl | true | violated | 1 | 10 | solved | 13 | 3 | 23 |
-| Barman-BDI | pfile01.hddl | true | absent | 1 | 11 | solved | 73 | 8 | 35 |
-| Barman-BDI | pfile02.hddl | true | absent | 2 | 11 | solved | 162 | 63 | 92 |
-| Robot | pfile_01_001.hddl | true | satisfied | 1 | 11 | solved | 3 | 0 | 17 |
-| Minecraft-Player | p-003-003-003-003.hddl | true | absent | 1 | 24 | solved | 230 | 660 | 6838 |
-| Monroe_PO_1 | pfile01-p-0014-fix-power-line-4.hddl | true | violated | 1 | 11 | solved | 22 | 554 | 5559 |
-| PCP_1 | p-pcp01.hddl | true | satisfied | 2 | 16 | solved | 35 | 12 | 30 |
+| Domain | Problem | Abstract | G | C+G | PANDA |
+| --- | --- | --- | --- | --- | --- |
+| Blocksworld-GTOHP | p01.hddl | V(3) | V(3) | S(21) | S(21) |
+| Blocksworld-GTOHP | p02.hddl | V(6) | V(6) | S(35) | S(35) |
+| Blocksworld-GTOHP | p03.hddl | V(5) | V(5) | S(39) | S(39) |
+| Blocksworld-GTOHP | p04.hddl | V(14) | V(14) | S(98) | S(62) |
+| Blocksworld-GTOHP | p05.hddl | V(12) | V(12) | S(71) | S(71) |
+| Depots | p01.hddl | V(2) | V(2) | S(15) | S(15) |
+| Depots | p02.hddl | V(4) | V(4) | S(24) | S(24) |
+| Depots | p03.hddl | V(6) | V(6) | S(44) | S(44) |
+| Satellite-GTOHP | p01.hddl | V(3) | V(3) | S(12) | S(12) |
+| Satellite-GTOHP | p02.hddl | V(5) | V(5) | S(26) | S(18) |
+| Satellite-GTOHP | p03.hddl | F | V(5) | S(16) | S(16) |
+| Transport | pfile01.hddl | S(2) | S(2) | S(8) | S(8) |
+| Transport | pfile02.hddl | S(3) | S(3) | S(19) | S(19) |
+| Transport | pfile03.hddl | S(3) | S(3) | S(15) | S(15) |
+| PO_Transport | pfile01.hddl | S(2) | S(2) | S(8) | S(8) |
+| PO_Satellite | 1obs-1sat-1mod.hddl | S(1) | S(1) | S(5) | S(5) |
+| Freecell-Learned-ECAI-16 | probfreecell-02-1.hddl | S(4) | S(4) | F | T |
+| Logistics-Learned-ECAI-16 | probLOGISTICS-04-0.hddl | S(4) | S(4) | S(63) | S(63) |
+| Logistics-Learned-ECAI-16 | probLOGISTICS-04-1.hddl | S(4) | S(4) | S(58) | S(58) |
+| Logistics-Learned-ECAI-16 | probLOGISTICS-04-2.hddl | S(4) | S(4) | S(40) | S(40) |
+| AssemblyHierarchical | genericLinearProblem_depth01.hddl | V(1) | V(1) | S(6) | S(4) |
+| Barman-BDI | pfile01.hddl | S(1) | S(1) | F | S(10) |
+| Barman-BDI | pfile02.hddl | S(2) | S(2) | F | S(25) |
+| Robot | pfile_01_001.hddl | S(1) | S(1) | S(0) | S(0) |
+| Minecraft-Player | p-003-003-003-003.hddl | S(1) | S(1) | F | S(35) |
+| Monroe_PO_1 | pfile01-p-0014-fix-power-line-4.hddl | V(1) | V(1) | F | S(11) |
+| PCP_1 | p-pcp01.hddl | S(2) | S(2) | F | S(26) |
+
+| Technique | Solved | State goal satisfied/absent | Complete HTN plans | Median ms | Mean ms | Total ms | Max ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Abstract | 26/27 | 14/27 | 0/27 | 11 | 15 | 393 | 25 |
+| G | 27/27 | 14/27 | 0/27 | 12 | 15 | 394 | 24 |
+| C+G | 21/27 | 21/27 | 21/27 | 26 | 2366 | 63882 | 30073 |
+| PANDA | 26/27 | 26/27 | 26/27 | 31 | 530 | 13772 | 6851 |
+
+`PANDA` times exclude the Freecell timeout (60 s) and its `Max ms` entry is
+its slowest solved instance. The PSPR means and totals are dominated by the
+two 30-second Minecraft and Monroe runs; the medians are not.
 
 ### Interpretation
 
-- **Coverage.** PSPR solved 26 of 27 task networks; the exception is
-  `Satellite-GTOHP/p03`, where two leaf tasks remain unsolved and the validator
-  rejects the partial plan. PANDA solved 26 of 27 complete HTN problems; its
-  exception is `Freecell`, where the 60-second search limit expired after
-  251,321 nodes. The timeout says nothing about solvability.
-- **What PSPR's solutions mean.** Of the 26 solved networks, 12 have no state
-  goal (`absent`), 2 satisfy a state goal (`Robot`, `PCP_1`), and 12 report
-  `violated` (the five Blocksworld, three Depots, two Satellite, Assembly, and
-  Monroe instances). Those 12 are exactly the domains with compound tasks in
-  the initial network: PSPR's plan executes the network but never applies the
-  effects of the methods that would decompose the compounds, so the state goal
-  stays false. The `absent` rows are no stronger evidence of a complete HTN
-  solution; they are simply unconstrained by a state goal. PANDA produces a
-  primitive decomposition in every solved case.
-- **Plan lengths.** PSPR's plans contain 1--14 network actions; PANDA's contain
-  3--280 primitive actions. The comparison shows how much decomposition work
-  PSPR leaves out, not that its plans are shorter in the same sense. In the
-  two goal-satisfying cases the gap is 1 vs. 3 actions (`Robot`) and 2 vs. 35
-  actions (`PCP_1`).
-- **Timing.** PSPR stayed in a narrow 9--27 ms band (median 11 ms) across all
-  27 instances because its work is local to the clusters. pandaPI ranged from
-  17 ms to 6.8 s on solved instances (median 32 ms), plus the 63 s Freecell
-  timeout. On the 25 instances solved by both, PSPR totalled 349 ms and
-  pandaPI 13.2 s (37.8x aggregate); the median per-instance ratio was 2.6x.
-  The aggregate is dominated by grounding and instance loading rather than
-  search: `Minecraft-Player` spent 5.9 s grounding a 230-action problem, and
-  `Monroe_PO_1` spent 1.3 s grounding and several seconds loading a 10 MB
-  SAS+ instance before its 0.55 s search. On the same instances PSPR took
-  24 ms and 11 ms. Conversely, pandaPI's search alone (median 9 ms) is often
-  as fast as PSPR's whole pipeline; the difference is that PSPR never grounds
-  the full problem.
-- **Reading the result.** The experiment supports the intended role of the
-  evaluation tree: it is a fast top-level projection that partitions and
-  orders the task network without committing to a full grounding, and it is
-  not a replacement for a complete HTN planner. On these benchmarks it
-  identifies network-level plans quickly, but for complete HTN solutions
-  PANDA remains the stronger system. The table is a baseline for future work
-  on feeding PSPR's partitions into a decomposition step, not a claim of
-  superiority.
+- **Projection versus completion.** The abstract projection still solves 26 of
+  27 task networks with a median of 12 ms, and method summaries solve all 27
+  task networks. But only 14 of the 27 instances reach a state goal or have no
+  state goal: the other 12 execute the network with opaque compound tasks and
+  leave the goal false. Those 12 are exactly the domains with compound tasks
+  in the initial network (five Blocksworld, three Depots, two Satellite,
+  Assembly, and Monroe), so the abstract and summary rows are measures of
+  network-level work, not complete HTN solutions.
+- **Coverage of complete plans.** C+G solves 21 of 27 HTN problems. PANDA
+  solves 26 of 27, its only miss being the Freecell search timeout. Recursive
+  evaluation was removed after the previous benchmark showed that it matched
+  C+G coverage while adding overhead.
+- **Summary operators.** G alone changes one task network from unsolved to
+  solved (`Satellite-GTOHP/p03`), but that plan still violates the state goal.
+  Combined with refinement, C+G solves `p03` completely. G has no effect on
+  most other domains because only methods with primitive, totally ordered,
+  unconditional subtasks are summarised. C+G was faster in the median than
+  the adaptive C-first path and at least as complete as C alone, which is why
+  hierarchical solving enables summaries directly.
+- **Plan quality.** On the 21 instances solved completely by both C+G and
+  PANDA, PSPR's primitive plan length equals PANDA's `Total costs of actions`
+  in 18 cases. The exceptions are `Blocksworld-GTOHP/p04` (98 vs. 62 actions),
+  `Satellite-GTOHP/p02` (26 vs. 18), and `AssemblyHierarchical/depth01`
+  (6 vs. 4). PSPR returns the first goal-reaching decomposition found by its
+  bounded search, not a cost-optimal one; PANDA's progression search optimises
+  its path cost. The 18 exact matches show that the refinement is producing
+  the expected decompositions, not merely any valid plan.
+- **Timing.** On the 21 instances solved completely by both planners, C+G took
+  3.72 s in total and PANDA 0.65 s. PANDA is therefore about 5.7 times faster
+  in aggregate on this common set. The per-instance median is closer: C+G is
+  26 ms and PANDA is 31 ms. PSPR pays a visible backtracking cost on a few
+  instances (`Blocksworld/p04` 0.93 s, `Blocksworld/p05` 0.82 s,
+  `Depots/p03` 0.55 s), while PANDA's aggregate is dominated by grounding and
+  instance loading (`Minecraft-Player` 6.3 s, `Monroe_PO_1` about 6 s).
+  PANDA's search alone has a median of 11 ms. The old abstract-only figure of
+  37.8x against PANDA measured the projection, not a complete HTN solution,
+  and is not comparable to the C+G row.
+- **Where refinement fails.** `Satellite-GTOHP/p03` is unsolved by the abstract
+  tree without summaries; C+G builds a different tree and solves it. The
+  learned Freecell model exceeds the 4,096-method grounding budget on
+  `ACHIEVE-HOME0(S2)`, and `Minecraft-Player` and `Monroe_PO_1` hit the
+  30-second refinement limit. Barman's level-dependent pouring methods and
+  PCP's recursive task network do not refine at all: their method choices
+  depend on primitive preconditions and level indices, which the current
+  bounded network search does not explore. These are the concrete cases that
+  motivate the progression and exact-encoding fallbacks in
+  [`docs/compound-tasks.md`](docs/compound-tasks.md).
+- **Implementation note.** Refinement now enumerates up to 2,048 alternative
+  partial refinements per level and backtracks when a decomposition leaves the
+  state goal false. This is what solves `Blocksworld-GTOHP/p02` and `p05`
+  (versus the earlier first-success search) and what keeps the
+  `Transport/pfile02` `get_to` methods from cycling. The search is bounded,
+  not exhaustive: the caps are the reason some hard instances fail or time out
+  rather than run forever.
 - **Scope.** These are 27 instances from one benchmark suite, run with one
   PANDA configuration and one random seed. The comparison measures
-  satisfiability and wall-clock time, not plan cost or decomposition quality;
-  a full evaluation would sweep the PANDA timeout, heuristic, and grounding
-  options as well. The table measures the default abstract projection; the
-  `--hierarchical`, `--recursive`, and `--summary` modes are exercised
-  separately and are not part of these timings.
+  satisfiability, primitive plan length, and wall-clock time, not decomposition
+  quality or plan cost optimality; a full evaluation would sweep the PANDA
+  timeout, heuristic, grounding options, and PSPR's grounding and refinement
+  budgets as well. The 60-second PANDA timeout for Freecell says nothing about
+  solvability, and the 30-second PSPR limit is a benchmark choice, not a
+  property of the refinement algorithm.
 
 ### Reproducing the benchmark
 
 ```bash
-cargo build --release --example bench
-scripts/compare_panda.sh
+cargo build --release --example bench_modes
+scripts/compare_decomposition.sh
 ```
 
-The script prints the table above and writes per-instance logs plus
-`results.csv` to `target/panda-comparison/`. It reads `IPC_DIR`,
-`PSPR_BIN`, `HDDL_PARSER`, `PANDA_PARSER`, `PANDA_GROUNDER`, `PANDA_ENGINE`,
-`TIME_LIMIT`, and `PSPR_REPEATS` from the environment. PSPR finds the bundled
-SCIP shared library automatically. Build pandaPI from the `panda-planner-dev`
-`pandaPIparser`, `pandaPIgrounder`, and `pandaPIengine` repositories; the
-grounder needs its `cpddl` submodule and `gengetopt`.
+The script prints the per-instance and per-technique tables and writes
+per-instance logs plus `results.csv` to `target/decomposition-comparison/`.
+It reads `IPC_DIR`, `PSPR_BIN`, `HDDL_PARSER`, `PANDA_PARSER`,
+`PANDA_GROUNDER`, `PANDA_ENGINE`, `TIME_LIMIT` (PANDA search seconds),
+`PSPR_TIMEOUT` (PSPR solving seconds), `PSPR_REPEATS`, `PSPR_MAX_GROUNDINGS`,
+`PSPR_MODES`, and `OUT_DIR` from the environment. The script sets
+`PSPR_MAX_GROUNDINGS=4096` by default for the benchmark, discovers the
+bundled SCIP shared library, and refuses to start if another run holds the
+output lock. Set `PSPR_MODES="hierarchical"` to run only one technique.
 
-Timing numbers vary between runs, especially for pandaPI's grounding and
-instance loading; the table records one representative run, and the script's
-median-of-five PSPR timings are stable to a few milliseconds.
+Build pandaPI from the `panda-planner-dev` `pandaPIparser`, `pandaPIgrounder`,
+and `pandaPIengine` repositories; the grounder needs its `cpddl` submodule and
+`gengetopt`. Timing numbers vary between runs, especially for pandaPI's
+grounding and instance loading; the table records one representative run, and
+the script's median-of-three PSPR timings are stable to a few milliseconds.
+The two 30-second Minecraft and Monroe timeouts per refinement mode dominate
+the means and totals, so use the medians when comparing typical behaviour.
 
 ## References
 

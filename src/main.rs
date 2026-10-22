@@ -11,9 +11,7 @@ use pspr::parsing::parser::{
 use pspr::solver::domain::{Domain, process_domain};
 use pspr::solver::evaluation_tree::{EvaluationOptions, MethodSummary};
 use pspr::solver::problem::{Problem, load_problem};
-use pspr::solver::solve::{
-    solve_hierarchical_with_options, solve_recursive_with_options, solve_with_options,
-};
+use pspr::solver::solve::{solve_hierarchical_with_options, solve_with_options};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -36,15 +34,13 @@ struct Options {
     #[arg(long, value_name = "PATH")]
     parser: Option<PathBuf>,
 
-    /// Refine the abstract plan into a complete HTN plan
-    #[arg(long, conflicts_with = "recursive")]
+    /// Refine the abstract plan into a complete HTN plan with primitive
+    /// method summaries (C+G)
+    #[arg(long)]
     hierarchical: bool,
 
-    /// Use recursive method subproblem evaluation when refining
-    #[arg(long)]
-    recursive: bool,
-
     /// Summarise primitive, totally ordered method effects into compound operators
+    /// (enabled automatically by --hierarchical)
     #[arg(long)]
     summary: bool,
 
@@ -175,7 +171,7 @@ fn handle_problem(
     );
 
     let evaluation_options = EvaluationOptions {
-        method_summary: if options.summary {
+        method_summary: if options.summary || options.hierarchical {
             MethodSummary::PrimitiveOnly
         } else {
             MethodSummary::Off
@@ -188,22 +184,13 @@ fn handle_problem(
         ..pspr::solver::evaluation_tree::RefinementOptions::default()
     };
 
-    if options.hierarchical || options.recursive {
-        let refinement = if options.recursive {
-            solve_recursive_with_options(
-                domain,
-                &problem,
-                &refinement_options,
-                &evaluation_options,
-            )?
-        } else {
-            solve_hierarchical_with_options(
-                domain,
-                &problem,
-                &refinement_options,
-                &evaluation_options,
-            )?
-        };
+    if options.hierarchical {
+        let refinement = solve_hierarchical_with_options(
+            domain,
+            &problem,
+            &refinement_options,
+            &evaluation_options,
+        )?;
         println!(
             "    solve {}: plan length {} ({} methods, goal {:?})",
             problem.name,

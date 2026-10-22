@@ -1,24 +1,22 @@
 //! Hierarchical refinement of PSPR's top-level task-network plan.
 //!
 //! The evaluation tree plans the initial task network with compound tasks as
-//! opaque operators. This module adds the two-phase refinement stage (C) and
-//! the recursive evaluation stage (D) from `docs/compound-tasks.md`: it takes
-//! the abstract top-level plan and recursively grounds methods and primitive
-//! actions, producing a complete HTN plan.
+//! opaque operators. This module adds the two-phase refinement stage (C) from
+//! `docs/compound-tasks.md`: it takes the abstract top-level plan and
+//! recursively grounds methods and primitive actions, producing a complete HTN
+//! plan.
 //!
 //! The refinement is intentionally conservative: it tries the method recorded
 //! in the abstract plan first, then every other method, and backtracks over
-//! partial-order subtasks. A recursive mode uses the existing evaluation tree
-//! on each method-local subproblem, so the partitioner is reused at every
-//! hierarchy level.
+//! partial-order subtasks. The default hierarchical solver enables primitive
+//! method summaries (stage G) unconditionally, because the comparison showed
+//! that C+G is both faster and at least as complete as C alone.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::{Result, bail, ensure};
 
-use crate::parsing::json::{
-    Constraint, Htn, InitialTaskNetwork, Predicate, Subtask, Symbol, TaskOrdering,
-};
+use crate::parsing::json::{Constraint, Htn, Subtask, TaskOrdering};
 use crate::solver::domain::Domain;
 use crate::solver::problem::Problem;
 
@@ -110,29 +108,18 @@ impl Refinement {
     }
 }
 
+#[derive(Clone)]
 struct RefinedTask {
     steps: Vec<RefinementStep>,
     state: BTreeSet<String>,
 }
 
-/// Refine an abstract plan with the linear (two-phase) strategy.
+/// Refine an abstract plan with the two-phase strategy (stage C).
 pub fn refine_plan(
     domain: &Domain,
     problem: &Problem,
     abstract_plan: &[String],
     options: &RefinementOptions,
-) -> Result<Refinement> {
-    refine_plan_with_mode(domain, problem, abstract_plan, options, false)
-}
-
-/// Refine an abstract plan, optionally using recursive evaluation for compound
-/// subtasks (the recursive-tree strategy).
-pub fn refine_plan_with_mode(
-    domain: &Domain,
-    problem: &Problem,
-    abstract_plan: &[String],
-    options: &RefinementOptions,
-    recursive: bool,
 ) -> Result<Refinement> {
     let universe = Universe::new(domain, problem);
     let state = initial_atoms(problem);
@@ -144,7 +131,6 @@ pub fn refine_plan_with_mode(
         state,
         options,
         options.max_depth,
-        recursive,
     )?;
     if candidates.is_empty() {
         bail!("the abstract plan could not be refined into a complete HTN plan");
@@ -172,7 +158,7 @@ pub fn refine_plan_with_mode(
     Ok(fallback.expect("at least one candidate was checked"))
 }
 
-/// Build and evaluate the initial abstract plan, then refine it.
+/// Build and evaluate the initial abstract plan, then refine it with stage C.
 pub fn solve_hierarchical(
     domain: &Domain,
     problem: &Problem,
@@ -193,40 +179,11 @@ pub fn solve_hierarchical(
     Ok(refinement)
 }
 
-/// Build the initial abstract plan and refine it with recursive evaluation of
-/// method-local subproblems.
-pub fn solve_recursive(
-    domain: &Domain,
-    problem: &Problem,
-    options: &RefinementOptions,
-    evaluation_options: &EvaluationOptions,
-) -> Result<Refinement> {
-    let mut merger = SgplanMerger::default();
-    let evaluation = evaluate(domain, problem, &mut merger, evaluation_options)?;
-    ensure!(
-        evaluation.solved,
-        "the evaluation tree did not solve the initial task network"
-    );
-
-    // The linear refinement is the safe path when a method's compound
-    // subtasks feed effects into later subtasks, because the flat evaluation
-    // of a method-local subproblem cannot see those effects. Use it first and
-    // reserve the recursive subproblem evaluation for cases where it fails.
-    if let Ok(refinement) = refine_plan(domain, problem, &evaluation.plan, options)
-        && (problem.goal.is_none() || refinement.goal != GoalStatus::Violated)
-    {
-        return Ok(refinement);
-    }
-
-    let refinement = refine_plan_with_mode(domain, problem, &evaluation.plan, options, true)?;
-    ensure!(
-        problem.goal.is_none() || refinement.goal != GoalStatus::Violated,
-        "the recursive refinement does not reach the problem goal"
-    );
-    Ok(refinement)
-}
-
-const MAX_REFINEMENTS: usize = 64;
+// Bounded breadth-first-style enumeration of refinement alternatives. The
+// limit is large enough for the larger Blocksworld-GTOHP instances (up to 14
+// tasks with several interchangeable `do_on_table` methods) and still keeps
+// the search finite on the harder learned domains.
+const MAX_REFINEMENTS: usize = 2048;
 
 fn cap(mut candidates: Vec<RefinedTask>) -> Vec<RefinedTask> {
     candidates.truncate(MAX_REFINEMENTS);
@@ -242,12 +199,12 @@ fn refine_plan_steps(
     state: BTreeSet<String>,
     options: &RefinementOptions,
     depth: usize,
-    recursive: bool,
 ) -> Result<Vec<RefinedTask>> {
     let mut candidates = vec![RefinedTask {
         steps: Vec::new(),
         state,
     }];
+    let mut visited = HashSet::new();
     for step in abstract_plan {
         let parsed = parse_step(step)?;
         let task = parsed.task().clone();
@@ -259,27 +216,38 @@ fn refine_plan_steps(
             bail!("the abstract plan contains an opaque compound step `{step}`");
         }
 
-        let candidate = candidates.pop().expect("one candidate before a step");
-        let alternatives = refine_task(
-            domain,
-            problem,
-            universe,
-            &task,
-            &candidate.state,
-            options,
-            depth,
-            preferred,
-            recursive,
-        )?;
-        let Some(refined) = alternatives.into_iter().next() else {
+        let mut step_candidates = Vec::new();
+        for candidate in candidates {
+            let alternatives = refine_task(
+                domain,
+                problem,
+                universe,
+                &task,
+                &candidate.state,
+                options,
+                depth,
+                preferred,
+                &mut visited,
+            )?;
+            for refined in alternatives {
+                let mut steps = candidate.steps.clone();
+                steps.extend(refined.steps);
+                step_candidates.push(RefinedTask {
+                    steps,
+                    state: refined.state,
+                });
+                if step_candidates.len() >= MAX_REFINEMENTS {
+                    break;
+                }
+            }
+            if step_candidates.len() >= MAX_REFINEMENTS {
+                break;
+            }
+        }
+        if step_candidates.is_empty() {
             return Ok(Vec::new());
-        };
-        let mut steps = candidate.steps;
-        steps.extend(refined.steps);
-        candidates = vec![RefinedTask {
-            steps,
-            state: refined.state,
-        }];
+        }
+        candidates = step_candidates;
     }
     Ok(candidates)
 }
@@ -294,7 +262,41 @@ fn refine_task(
     options: &RefinementOptions,
     depth: usize,
     preferred_method: Option<&str>,
-    recursive: bool,
+    visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+) -> Result<Vec<RefinedTask>> {
+    // A method may rediscover the same task in the same state. Such a branch
+    // cannot make progress, so prune it instead of letting cycles (for example
+    // `get_to` via an intermediate location) expand until the depth limit.
+    let key = (task.clone(), state.clone());
+    if !visited.insert(key.clone()) {
+        return Ok(Vec::new());
+    }
+    let result = refine_task_uncached(
+        domain,
+        problem,
+        universe,
+        task,
+        state,
+        options,
+        depth,
+        preferred_method,
+        visited,
+    );
+    visited.remove(&key);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_task_uncached(
+    domain: &Domain,
+    problem: &Problem,
+    universe: &Universe<'_>,
+    task: &TaskNode,
+    state: &BTreeSet<String>,
+    options: &RefinementOptions,
+    depth: usize,
+    preferred_method: Option<&str>,
+    visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
 ) -> Result<Vec<RefinedTask>> {
     if depth == 0 {
         return Ok(Vec::new());
@@ -322,6 +324,7 @@ fn refine_task(
             instance.method.tn.subtasks.len(),
         )
     });
+    let mut results = Vec::new();
     for instance in methods {
         if !holds_optional(
             instance.method.precondition.as_ref(),
@@ -333,108 +336,37 @@ fn refine_task(
             continue;
         }
 
-        let refined = if recursive {
-            refine_method_recursive(
-                domain,
-                problem,
-                instance.method,
-                &instance.bindings,
-                state,
-                options,
-                depth - 1,
-            )?
-        } else {
-            refine_network(
-                domain,
-                problem,
-                universe,
-                &instance.method.tn,
-                &instance.bindings,
-                state,
-                options,
-                depth - 1,
-            )?
-        };
-
-        let Some(refined) = refined.into_iter().next() else {
-            continue;
-        };
-        return Ok(vec![RefinedTask {
-            steps: vec![RefinementStep::Method {
-                task: task.clone(),
-                method: instance.method.name.name.clone(),
-                bindings: instance.bindings.clone(),
-                subtasks: refined.steps,
-            }],
-            state: refined.state,
-        }]);
-    }
-
-    Ok(Vec::new())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn refine_method_recursive(
-    domain: &Domain,
-    problem: &Problem,
-    method: &crate::parsing::json::Method,
-    bindings: &BTreeMap<String, String>,
-    state: &BTreeSet<String>,
-    options: &RefinementOptions,
-    depth: usize,
-) -> Result<Vec<RefinedTask>> {
-    let primitive_only = !method.tn.subtasks.is_empty()
-        && method.tn.subtasks.iter().all(|subtask| {
-            domain.actions_for(&subtask.task.name).next().is_some()
-                && domain.methods_for(&subtask.task.name).next().is_none()
-        });
-    if !primitive_only {
-        let universe = Universe::new(domain, problem);
-        let mut refined = refine_network(
-            domain, problem, &universe, &method.tn, bindings, state, options, depth,
-        )?;
-        refined.truncate(1);
-        return Ok(refined);
-    }
-
-    let subproblem = method_subproblem(problem, method, bindings, state);
-    let mut merger = SgplanMerger::default();
-    if let Ok(evaluation) = evaluate(
-        domain,
-        &subproblem,
-        &mut merger,
-        &EvaluationOptions {
-            max_groundings: options.max_groundings,
-            ..EvaluationOptions::default()
-        },
-    ) && evaluation.solved
-    {
-        let sub_universe = Universe::new(domain, &subproblem);
-        let refined = refine_plan_steps(
+        let alternatives = refine_network(
             domain,
-            &subproblem,
-            &sub_universe,
-            &evaluation.plan,
-            state.clone(),
+            problem,
+            universe,
+            &instance.method.tn,
+            &instance.bindings,
+            state,
             options,
-            depth,
-            true,
+            depth - 1,
+            visited,
         )?;
-        if !refined.is_empty() {
-            return Ok(refined);
+        for refined in alternatives {
+            results.push(RefinedTask {
+                steps: vec![RefinementStep::Method {
+                    task: task.clone(),
+                    method: instance.method.name.name.clone(),
+                    bindings: instance.bindings.clone(),
+                    subtasks: refined.steps,
+                }],
+                state: refined.state,
+            });
+            if results.len() >= MAX_REFINEMENTS {
+                break;
+            }
+        }
+        if results.len() >= MAX_REFINEMENTS {
+            break;
         }
     }
 
-    // Some method networks contain compound subtasks whose effects are needed
-    // by later subtasks. The flat evaluation of the subproblem cannot see
-    // those effects, so fall back to the linear recursive refinement for this
-    // method.
-    let universe = Universe::new(domain, problem);
-    let mut refined = refine_network(
-        domain, problem, &universe, &method.tn, bindings, state, options, depth,
-    )?;
-    refined.truncate(1);
-    Ok(refined)
+    Ok(results)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -447,6 +379,7 @@ fn refine_network(
     state: &BTreeSet<String>,
     options: &RefinementOptions,
     depth: usize,
+    visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
 ) -> Result<Vec<RefinedTask>> {
     let tasks: Vec<TaskNode> = network
         .subtasks
@@ -471,27 +404,38 @@ fn refine_network(
                 state: state.clone(),
             }];
             for task in &tasks {
-                let candidate = candidates.pop().expect("one candidate before a subtask");
-                let alternatives = refine_task(
-                    domain,
-                    problem,
-                    universe,
-                    task,
-                    &candidate.state,
-                    options,
-                    depth,
-                    None,
-                    false,
-                )?;
-                let Some(refined) = alternatives.into_iter().next() else {
+                let mut next_candidates = Vec::new();
+                for candidate in candidates {
+                    let alternatives = refine_task(
+                        domain,
+                        problem,
+                        universe,
+                        task,
+                        &candidate.state,
+                        options,
+                        depth,
+                        None,
+                        visited,
+                    )?;
+                    for refined in alternatives {
+                        let mut steps = candidate.steps.clone();
+                        steps.extend(refined.steps);
+                        next_candidates.push(RefinedTask {
+                            steps,
+                            state: refined.state,
+                        });
+                        if next_candidates.len() >= MAX_REFINEMENTS {
+                            break;
+                        }
+                    }
+                    if next_candidates.len() >= MAX_REFINEMENTS {
+                        break;
+                    }
+                }
+                if next_candidates.is_empty() {
                     return Ok(Vec::new());
-                };
-                let mut steps = candidate.steps;
-                steps.extend(refined.steps);
-                candidates = vec![RefinedTask {
-                    steps,
-                    state: refined.state,
-                }];
+                }
+                candidates = next_candidates;
             }
             Ok(candidates)
         }
@@ -520,6 +464,7 @@ fn refine_network(
                 state,
                 options,
                 depth,
+                visited,
             )
         }
     }
@@ -535,6 +480,7 @@ fn search_partial(
     state: &BTreeSet<String>,
     options: &RefinementOptions,
     depth: usize,
+    visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
 ) -> Result<Vec<RefinedTask>> {
     let mut remaining = vec![true; tasks.len()];
     let mut results = Vec::new();
@@ -549,6 +495,7 @@ fn search_partial(
         Vec::new(),
         options,
         depth,
+        visited,
         &mut results,
     )?;
     Ok(cap(results))
@@ -566,8 +513,12 @@ fn search_partial_inner(
     steps: Vec<RefinementStep>,
     options: &RefinementOptions,
     depth: usize,
+    visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
     results: &mut Vec<RefinedTask>,
 ) -> Result<()> {
+    if results.len() >= MAX_REFINEMENTS {
+        return Ok(());
+    }
     if !remaining.iter().any(|&present| present) {
         results.push(RefinedTask {
             steps,
@@ -592,7 +543,7 @@ fn search_partial_inner(
             options,
             depth,
             None,
-            false,
+            visited,
         )?;
         for refined in alternatives {
             remaining[index] = false;
@@ -609,87 +560,16 @@ fn search_partial_inner(
                 next_steps,
                 options,
                 depth,
+                visited,
                 results,
             )?;
             remaining[index] = true;
-            if !results.is_empty() {
+            if results.len() >= MAX_REFINEMENTS {
                 return Ok(());
             }
         }
     }
     Ok(())
-}
-
-fn method_subproblem(
-    problem: &Problem,
-    method: &crate::parsing::json::Method,
-    bindings: &BTreeMap<String, String>,
-    state: &BTreeSet<String>,
-) -> Problem {
-    let subtasks = method
-        .tn
-        .subtasks
-        .iter()
-        .map(|subtask| Subtask {
-            id: subtask.id.clone(),
-            task: subtask.task.clone(),
-            terms: subtask
-                .terms
-                .iter()
-                .map(|term| Symbol {
-                    name: bindings
-                        .get(&term.name)
-                        .cloned()
-                        .unwrap_or_else(|| term.name.clone()),
-                    symbol_type: term.symbol_type.clone(),
-                })
-                .collect(),
-        })
-        .collect();
-    Problem {
-        name: format!("{}::{}", problem.name, method.name.name),
-        domain_name: problem.domain_name.clone(),
-        objects: problem.objects.clone(),
-        init_state: state_to_predicates(state),
-        goal: None,
-        init_task_network: Some(InitialTaskNetwork {
-            parameters: None,
-            tn: Htn {
-                subtasks,
-                orderings: method.tn.orderings.clone(),
-                constraints: method.tn.constraints.clone(),
-            },
-        }),
-    }
-}
-
-fn state_to_predicates(state: &BTreeSet<String>) -> Vec<Predicate> {
-    state
-        .iter()
-        .map(|atom| {
-            if let Some(open) = atom.find('(') {
-                let name = atom[..open].to_string();
-                let terms = atom[open + 1..atom.len() - 1]
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|term| !term.is_empty())
-                    .map(|term| Symbol {
-                        name: term.to_string(),
-                        symbol_type: None,
-                    })
-                    .collect();
-                Predicate {
-                    name,
-                    variables: terms,
-                }
-            } else {
-                Predicate {
-                    name: atom.clone(),
-                    variables: Vec::new(),
-                }
-            }
-        })
-        .collect()
 }
 
 fn ground_subtask(subtask: &Subtask, bindings: &BTreeMap<String, String>) -> TaskNode {

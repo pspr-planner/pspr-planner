@@ -37,7 +37,7 @@ impl PenaltySpace {
     pub(super) fn value(self, violation: f64) -> f64 {
         match self {
             PenaltySpace::Linear => violation,
-            PenaltySpace::Quadratic => violation * violation,
+            PenaltySpace::Quadratic => violation * violation + violation,
             PenaltySpace::Exponential => {
                 (EXPONENTIAL_SCALE * violation).exp_m1() / EXPONENTIAL_SCALE
             }
@@ -48,7 +48,7 @@ impl PenaltySpace {
     pub(super) fn slope(self, violation: f64) -> f64 {
         match self {
             PenaltySpace::Linear => 1.0,
-            PenaltySpace::Quadratic => 2.0 * violation,
+            PenaltySpace::Quadratic => 2.0 * violation + 1.0,
             PenaltySpace::Exponential => (EXPONENTIAL_SCALE * violation).exp(),
         }
     }

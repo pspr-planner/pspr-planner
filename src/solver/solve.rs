@@ -1,6 +1,6 @@
 use crate::solver::domain::Domain;
 use crate::solver::evaluation_tree::{
-    self, EvaluationOptions, Refinement, RefinementOptions, SgplanMerger,
+    self, EvaluationOptions, MethodSummary, Refinement, RefinementOptions, SgplanMerger,
 };
 use crate::solver::problem::Problem;
 
@@ -41,14 +41,13 @@ pub fn solve_with_options(
 }
 
 /// Solve the initial task network and refine its abstract plan into a complete
-/// HTN plan (the two-phase strategy).
+/// HTN plan with primitive method summaries (C+G).
 pub fn solve_hierarchical(domain: &Domain, problem: &Problem) -> Result<Refinement, String> {
-    solve_hierarchical_with_options(
-        domain,
-        problem,
-        &RefinementOptions::default(),
-        &EvaluationOptions::default(),
-    )
+    let evaluation = EvaluationOptions {
+        method_summary: MethodSummary::PrimitiveOnly,
+        ..EvaluationOptions::default()
+    };
+    solve_hierarchical_with_options(domain, problem, &RefinementOptions::default(), &evaluation)
 }
 
 /// Hierarchical refinement with explicit options.
@@ -59,27 +58,5 @@ pub fn solve_hierarchical_with_options(
     evaluation: &EvaluationOptions,
 ) -> Result<Refinement, String> {
     evaluation_tree::solve_hierarchical(domain, problem, refinement, evaluation)
-        .map_err(|error| format!("{error:#}"))
-}
-
-/// Solve recursively, using the evaluation tree on every method-local
-/// subproblem.
-pub fn solve_recursive(domain: &Domain, problem: &Problem) -> Result<Refinement, String> {
-    solve_recursive_with_options(
-        domain,
-        problem,
-        &RefinementOptions::default(),
-        &EvaluationOptions::default(),
-    )
-}
-
-/// Recursive refinement with explicit options.
-pub fn solve_recursive_with_options(
-    domain: &Domain,
-    problem: &Problem,
-    refinement: &RefinementOptions,
-    evaluation: &EvaluationOptions,
-) -> Result<Refinement, String> {
-    evaluation_tree::solve_recursive(domain, problem, refinement, evaluation)
         .map_err(|error| format!("{error:#}"))
 }
