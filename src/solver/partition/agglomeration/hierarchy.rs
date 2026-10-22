@@ -124,16 +124,72 @@ impl Hierarchy {
         }
         score
     }
+
+    /// The sum of the merge levels at which the given shared constraints are
+    /// attached.
+    ///
+    /// A constraint that touches a group of instances is handled at the lowest
+    /// common ancestor of those instances, whose level is the highest merge
+    /// level over the pairs of the group. The cost therefore grows with the
+    /// height of the merge, which is exactly the number of evaluation levels a
+    /// constraint spans.
+    pub fn constraint_cost(&self, constraints: &[Vec<usize>]) -> f64 {
+        constraints
+            .iter()
+            .map(|group| {
+                let mut height = 0usize;
+                for (first, &a) in group.iter().enumerate() {
+                    assert!(a < self.instances, "instance {a} is out of range");
+                    for &b in &group[first + 1..] {
+                        assert!(b < self.instances, "instance {b} is out of range");
+                        if let Some(level) = self.merge_level(a, b) {
+                            height = height.max(level);
+                        }
+                    }
+                }
+                height as f64
+            })
+            .sum()
+    }
 }
 
-/// Solve the ILP of Gilpin et al. (Figure 2) for the given number of levels.
+/// Solve the ILP of Gilpin et al. (Figure 2) without a constraint-locality
+/// term.
 pub fn optimal_hierarchy(distance: &DistanceMatrix, levels: usize) -> Result<Hierarchy> {
+    optimal_hierarchy_with(distance, levels, &[], 0.0)
+}
+
+/// Solve the ILP of Gilpin et al. (Figure 2) with a penalty on shared
+/// constraints that end up high in the hierarchy.
+///
+/// `groups` lists, for every shared constraint, the instances that touch it.
+/// The merge level of a constraint is the highest level at which two of its
+/// members join, i.e. the level of its lowest common ancestor, and the
+/// objective subtracts `global_weight` times the sum of those levels. Raising
+/// the weight pushes shared constraints towards the bottom of the hierarchy,
+/// where small merges handle them, instead of the root merge.
+pub fn optimal_hierarchy_with(
+    distance: &DistanceMatrix,
+    levels: usize,
+    groups: &[Vec<usize>],
+    global_weight: f64,
+) -> Result<Hierarchy> {
     let n = distance.len();
     ensure!(levels >= 1, "at least one hierarchy level is required");
     ensure!(
         n >= 2,
         "hierarchical clustering needs at least two instances"
     );
+    ensure!(
+        global_weight >= 0.0,
+        "the global constraint weight must be non-negative"
+    );
+    for group in groups {
+        ensure!(
+            group.iter().all(|&instance| instance < n),
+            "a shared constraint refers to an instance outside the distance matrix"
+        );
+    }
 
     let mut variables = ProblemVariables::new();
     let mut merge: Vec<Vec<Option<Variable>>> = vec![vec![None; n]; n];
@@ -213,10 +269,45 @@ pub fn optimal_hierarchy(distance: &DistanceMatrix, levels: usize) -> Result<Hie
         constraints.push((z_ab + z_bc).geq(1.0));
     }
 
-    let objective: Expression = triples
+    struct HeightVariable {
+        members: Vec<usize>,
+        level: Variable,
+    }
+
+    let mut heights = Vec::new();
+    if global_weight > 0.0 {
+        for group in groups {
+            let mut members = group.clone();
+            members.sort_unstable();
+            members.dedup();
+            if members.len() < 2 {
+                continue;
+            }
+            let level = variables.add(variable().min(1.0).max(levels as f64));
+            heights.push(HeightVariable { members, level });
+        }
+    }
+
+    for height in &heights {
+        for (first, &a) in height.members.iter().enumerate() {
+            for &b in &height.members[first + 1..] {
+                let merge = Expression::from_other_affine(pair(a, b));
+                constraints.push(Expression::from_other_affine(height.level).geq(merge));
+            }
+        }
+    }
+
+    let mut objective: Expression = triples
         .iter()
         .map(|triple| triple.weight * Expression::from_other_affine(triple.o))
         .sum();
+    if !heights.is_empty() {
+        let penalty: Expression = heights
+            .iter()
+            .map(|height| Expression::from_other_affine(height.level))
+            .sum();
+        objective -= global_weight * penalty;
+    }
     let mut model = variables.maximise(objective).using(default_solver);
     for constraint in constraints {
         model.add_constraint(constraint);

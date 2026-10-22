@@ -1,6 +1,6 @@
 //! Spectral clustering of the incidence graph and the merge tree over clusters.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Result;
 use nalgebra::DMatrix;
@@ -136,17 +136,37 @@ pub(super) fn build_agglomeration(
     }
     let distance = DistanceMatrix::new(&rows)?;
     let levels = options.levels.unwrap_or(count - 1).max(1);
+    let constraints = constraint_groups(clusters);
     let settings = AgglomerationOptions {
         levels,
         lambda: options.lambda,
+        global_weight: options.global_weight,
         use_search: options.use_search,
         search_expansions: options.search_expansions,
     };
     Ok(Some(agglomeration::optimize(
         &distance,
         &EvaluationDag::default(),
+        &constraints,
         &settings,
     )?))
+}
+
+/// The clusters touched by every constraint that is shared by more than one
+/// cluster, in ascending constraint order.
+fn constraint_groups(clusters: &[Cluster]) -> Vec<Vec<usize>> {
+    let mut uses: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (index, cluster) in clusters.iter().enumerate() {
+        for &constraint in &cluster.n2s {
+            let members = uses.entry(constraint).or_default();
+            if members.last() != Some(&index) {
+                members.push(index);
+            }
+        }
+    }
+    uses.into_values()
+        .filter(|members| members.len() > 1)
+        .collect()
 }
 
 pub(super) fn attach_shared_constraints(

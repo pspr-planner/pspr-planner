@@ -11,15 +11,20 @@ use super::{Agglomeration, Options, finish};
 /// Search for a hierarchy with the planning-style best-first search.
 ///
 /// The state model, heuristic, and objective are described in the
-/// [module documentation](super).
+/// [module documentation](super). `constraints` lists, for every shared
+/// constraint, the instances that touch it; their merge levels are part of the
+/// objective.
 pub fn agglomerative_search(
     distance: &DistanceMatrix,
     dag: &EvaluationDag,
+    constraints: &[Vec<usize>],
     options: &Options,
 ) -> anyhow::Result<Agglomeration> {
     let search = MergeSearch {
         distance,
         levels: options.levels,
+        constraints,
+        global_weight: options.global_weight,
     };
     let search_options = SearchOptions {
         max_expansions: options.search_expansions,
@@ -31,7 +36,14 @@ pub fn agglomerative_search(
         anyhow::anyhow!("the search exhausted its node limit without finding a hierarchy")
     })?;
     let hierarchy = Hierarchy::from_merge(distance.len(), options.levels, outcome.state.merge);
-    finish(hierarchy, distance, dag, options.lambda)
+    finish(
+        hierarchy,
+        distance,
+        dag,
+        constraints,
+        options.lambda,
+        options.global_weight,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -44,6 +56,8 @@ struct MergeState {
 struct MergeSearch<'a> {
     distance: &'a DistanceMatrix,
     levels: usize,
+    constraints: &'a [Vec<usize>],
+    global_weight: f64,
 }
 
 impl MergeSearch<'_> {
@@ -142,10 +156,11 @@ impl SearchProblem for MergeSearch<'_> {
     fn evaluate(&self, state: &MergeState) -> Evaluation {
         // The number of internal evaluations is `n - 1` for every complete
         // binary hierarchy, so the scheduling term is nearly constant during
-        // search; the estimate therefore focuses on the clustering objective.
-        let estimate = -self
-            .complete_greedily(state)
-            .clustering_score(self.distance);
+        // search; the estimate therefore focuses on the clustering objective
+        // and on the merge levels of the shared constraints.
+        let completed = self.complete_greedily(state);
+        let estimate = -completed.clustering_score(self.distance)
+            + self.global_weight * completed.constraint_cost(self.constraints);
         Evaluation {
             estimates: vec![estimate],
             preferred: Vec::new(),

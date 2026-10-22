@@ -17,8 +17,11 @@
 //!    supplied through [`EvaluationOptions::groupings`].
 //! 3. **Evaluation tree.** The clusters are turned into a dendrogram with the
 //!    ILP of Gilpin et al. and the scheduling ILP of
-//!    [`crate::solver::partition::agglomeration`]. The leaves of the tree are
-//!    the clusters; the internal nodes are merges of subproblems.
+//!    [`crate::solver::partition::agglomeration`]. The objective also
+//!    penalizes shared constraints that would be attached high in the tree,
+//!    so every constraint is handled by the lowest merge that contains all of
+//!    its clusters instead of the root. The leaves of the tree are the
+//!    clusters; the internal nodes are merges of subproblems.
 //! 4. **Leaf evaluation.** Each cluster is encoded as a multi-valued planning
 //!    task containing only its *local* constraints (constraints adjacent to a
 //!    single cluster) and solved with Fast Downward
@@ -108,6 +111,10 @@ pub struct EvaluationOptions {
     pub levels: Option<usize>,
     /// Weight of the scheduling cost in the agglomeration objective.
     pub lambda: f64,
+    /// Weight of the height at which shared constraints are attached in the
+    /// agglomeration objective. A constraint handled at the root costs
+    /// `levels`, one handled by the first merge costs 1.
+    pub global_weight: f64,
     /// Also run the ILP-style merge search of the agglomeration module.
     pub use_search: bool,
     /// Expansion limit of that search.
@@ -125,6 +132,7 @@ impl Default for EvaluationOptions {
             groupings: Vec::new(),
             levels: None,
             lambda: 0.0,
+            global_weight: 1.0,
             use_search: false,
             search_expansions: 1_000,
             max_groundings: 256,

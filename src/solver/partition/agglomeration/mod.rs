@@ -104,19 +104,24 @@
 //!
 //! # Objective
 //!
-//! The search jointly considers clustering quality and evaluation cost. A
-//! representative objective is
+//! The search jointly considers clustering quality, evaluation cost and the
+//! height at which shared constraints are attached. A representative objective
+//! is
 //!
 //! \[
 //! \max_{A,\sigma}
-//! \quad Q(A)-\lambda C(A,\sigma),
+//! \quad Q(A)-\lambda C(A,\sigma)-\gamma G(A),
 //! \]
 //!
 //! subject to the dendrogram-validity constraints and precedence constraints
 //! (1)--(4). Here \(Q(A)\) measures clustering quality, \(C(A,\sigma)\)
 //! measures the cost of evaluating dendrogram \(A\) under schedule
-//! \(\sigma\), and \(\lambda\ge 0\) controls the trade-off between clustering
-//! quality and evaluation cost.
+//! \(\sigma\), and \(G(A)\) is the sum of the merge levels at which the
+//! shared constraints are attached: a constraint whose clusters meet at the
+//! root contributes \(L\), one handled by the first merge contributes 1.
+//! \(\gamma\) is [`Options::global_weight`]. Minimising \(G(A)\) keeps
+//! global constraints out of the merges high up the hierarchy, where each
+//! constraint would be re-evaluated against the largest subplans.
 //!
 //! Unless the search strategy and heuristic satisfy additional conditions, the
 //! method does not guarantee a globally optimal solution.
@@ -124,7 +129,9 @@
 //! # Implementation
 //!
 //! * `hierarchy`: the Gilpin et al. merge-level ILP (Figure 2), solved exactly
-//!   with `good_lp` over SCIP.
+//!   with `good_lp` over SCIP. Shared constraints add one height variable each,
+//!   lower-bounded by the merge level of every pair of its clusters, so the
+//!   objective rewards hierarchies in which constraints are attached low.
 //! * `dendrogram`: the rooted binary tree induced by the merge levels;
 //!   multi-way merges are binarised in ascending order.
 //! * `schedule`: the scheduling ILP (1)--(4) for a dendrogram and an additional
@@ -150,7 +157,7 @@ use anyhow::{Result, ensure};
 
 pub use dendrogram::Dendrogram;
 pub use distance::{DistanceMatrix, EvaluationDag};
-pub use hierarchy::{Hierarchy, optimal_hierarchy};
+pub use hierarchy::{Hierarchy, optimal_hierarchy, optimal_hierarchy_with};
 pub use schedule::{Schedule, optimal_schedule};
 pub use search::agglomerative_search;
 
@@ -161,6 +168,13 @@ pub struct Options {
     pub levels: usize,
     /// Weight of the scheduling cost in the joint objective.
     pub lambda: f64,
+    /// Weight of the shared-constraint height in the joint objective.
+    ///
+    /// Every shared constraint contributes its merge level (the level of the
+    /// lowest common ancestor of the clusters it touches), so a constraint
+    /// handled at the root costs `levels` and one handled by the first merge
+    /// costs 1.
+    pub global_weight: f64,
     /// Also run the planning-style search (otherwise only the ILP is solved).
     pub use_search: bool,
     /// Expansion limit of the planning-style search.
@@ -172,6 +186,7 @@ impl Default for Options {
         Options {
             levels: 4,
             lambda: 0.0,
+            global_weight: 1.0,
             use_search: false,
             search_expansions: 10_000,
         }
@@ -179,7 +194,8 @@ impl Default for Options {
 }
 
 /// A hierarchy together with its dendrogram, its optimal schedule and the
-/// value of the joint objective `Q(A) - lambda * C(A, sigma)`.
+/// value of the joint objective
+/// `Q(A) - lambda * C(A, sigma) - global_weight * G(A)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Agglomeration {
     pub hierarchy: Hierarchy,
@@ -187,6 +203,8 @@ pub struct Agglomeration {
     pub schedule: Schedule,
     pub clustering_score: f64,
     pub scheduling_cost: f64,
+    /// Sum of the merge levels at which the shared constraints are attached.
+    pub global_cost: f64,
     pub score: f64,
 }
 
@@ -194,19 +212,23 @@ pub(super) fn finish(
     hierarchy: Hierarchy,
     distance: &DistanceMatrix,
     dag: &EvaluationDag,
+    constraints: &[Vec<usize>],
     lambda: f64,
+    global_weight: f64,
 ) -> Result<Agglomeration> {
     let dendrogram = Dendrogram::build(&hierarchy)?;
     let schedule = optimal_schedule(&dendrogram, dag)?;
     let clustering_score = hierarchy.clustering_score(distance);
     let scheduling_cost = schedule.positions.iter().sum::<usize>() as f64;
+    let global_cost = hierarchy.constraint_cost(constraints);
     Ok(Agglomeration {
         hierarchy,
         dendrogram,
         schedule,
         clustering_score,
         scheduling_cost,
-        score: clustering_score - lambda * scheduling_cost,
+        global_cost,
+        score: clustering_score - lambda * scheduling_cost - global_weight * global_cost,
     })
 }
 
@@ -215,13 +237,26 @@ pub(super) fn finish(
 pub fn optimize(
     distance: &DistanceMatrix,
     dag: &EvaluationDag,
+    constraints: &[Vec<usize>],
     options: &Options,
 ) -> Result<Agglomeration> {
     ensure!(options.lambda >= 0.0, "lambda must be non-negative");
-    let hierarchy = optimal_hierarchy(distance, options.levels)?;
-    let mut best = finish(hierarchy, distance, dag, options.lambda)?;
+    ensure!(
+        options.global_weight >= 0.0,
+        "the global constraint weight must be non-negative"
+    );
+    let hierarchy =
+        optimal_hierarchy_with(distance, options.levels, constraints, options.global_weight)?;
+    let mut best = finish(
+        hierarchy,
+        distance,
+        dag,
+        constraints,
+        options.lambda,
+        options.global_weight,
+    )?;
     if options.use_search {
-        let candidate = agglomerative_search(distance, dag, options)?;
+        let candidate = agglomerative_search(distance, dag, constraints, options)?;
         if candidate.score > best.score {
             best = candidate;
         }
@@ -319,16 +354,24 @@ mod tests {
         let options = Options {
             levels: 2,
             lambda: 0.5,
+            global_weight: 0.5,
             use_search: false,
             search_expansions: 100,
         };
-        let result = optimize(&distance, &EvaluationDag::default(), &options).unwrap();
+        let constraints = vec![vec![0, 2]];
+        let result =
+            optimize(&distance, &EvaluationDag::default(), &constraints, &options).unwrap();
         assert_eq!(
             result.dendrogram.members[result.dendrogram.root],
             vec![0, 1, 2, 3]
         );
         assert!(
-            (result.score - (result.clustering_score - 0.5 * result.scheduling_cost)).abs() < 1e-9
+            (result.score
+                - (result.clustering_score
+                    - 0.5 * result.scheduling_cost
+                    - 0.5 * result.global_cost))
+                .abs()
+                < 1e-9
         );
         assert_eq!(result.schedule.positions.len(), 3);
     }
@@ -339,15 +382,68 @@ mod tests {
         let options = Options {
             levels: 2,
             lambda: 0.0,
+            global_weight: 0.0,
             use_search: true,
             search_expansions: 2_000,
         };
-        let result = agglomerative_search(&distance, &EvaluationDag::default(), &options).unwrap();
+        let result =
+            agglomerative_search(&distance, &EvaluationDag::default(), &[], &options).unwrap();
         assert!(result.hierarchy.is_complete());
         assert_eq!(
             result.dendrogram.members[result.dendrogram.root],
             vec![0, 1, 2, 3]
         );
         assert_eq!(result.schedule.positions.len(), 3);
+    }
+
+    #[test]
+    fn constraint_cost_counts_merge_levels() {
+        let distance = paired_points();
+        let hierarchy = optimal_hierarchy(&distance, 2).unwrap();
+        assert_eq!(
+            hierarchy.constraint_cost(&[vec![0, 1], vec![2, 3]]),
+            2.0,
+            "both constraints are handled by a first-level merge"
+        );
+        assert_eq!(
+            hierarchy.constraint_cost(&[vec![0, 2]]),
+            2.0,
+            "0 and 2 only meet at the root"
+        );
+    }
+
+    #[test]
+    fn global_constraints_are_pushed_down_the_hierarchy() {
+        let distance = paired_points();
+        let plain = optimal_hierarchy(&distance, 2).unwrap();
+        assert_eq!(plain.merge_level(0, 2), Some(2));
+
+        let groups = vec![vec![0, 2]];
+        let constrained = optimal_hierarchy_with(&distance, 2, &groups, 1_000.0).unwrap();
+        assert_eq!(
+            constrained.merge_level(0, 2),
+            Some(1),
+            "a heavy global constraint must be handled by a first-level merge"
+        );
+        assert_eq!(constrained.constraint_cost(&groups), 1.0);
+    }
+
+    #[test]
+    fn optimize_includes_the_global_constraint_cost() {
+        let distance = paired_points();
+        let options = Options {
+            levels: 2,
+            lambda: 0.0,
+            global_weight: 1_000.0,
+            use_search: false,
+            search_expansions: 100,
+        };
+        let groups = vec![vec![0, 2]];
+        let result = optimize(&distance, &EvaluationDag::default(), &groups, &options).unwrap();
+        assert_eq!(result.hierarchy.merge_level(0, 2), Some(1));
+        assert!((result.global_cost - 1.0).abs() < 1e-9);
+        assert!(
+            (result.score - (result.clustering_score - 1_000.0 * result.global_cost)).abs() < 1e-9
+        );
     }
 }
