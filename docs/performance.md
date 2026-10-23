@@ -316,3 +316,65 @@ the shape of the intended change.
    Interning them per solve would turn comparisons into integer compares and
    shrink every set of atoms; this is the single largest structural change
    available and would touch most modules.
+
+## Memory: why the decomposition trainer reached 180 GB
+
+The trainer is not leaking — nothing is unreachable. It retained three things
+that all scale with the *search* and with the *number of instances* instead of
+with `--max-samples`, and one of them is quadratic.
+
+### 1. Every refinement decision was recorded
+
+`refine_task_uncached` emitted a `MethodTrace` for every invocation, and each
+trace owns a `MethodRankingContext` that clones the whole solver state
+(`BTreeSet<String>`) plus a clone of the task and of every candidate's binding
+map. The search visits millions of dead ends, and most of those decisions have
+*zero* applicable methods: on `Depots/p05` a single instance produced
+**1 212 095 traces**, of which the median had 0 candidates. `TraceCollector`
+pushed all of them into a `Vec` and never trimmed it, so the traces of every
+problem in the corpus stayed alive until training started.
+
+### 2. The corpus was materialised twice
+
+`collect_traces` parsed and loaded **all** problems into one vector, evaluated
+all of them into a second vector, and then refined all of them into a third.
+None of that depends on `--max-samples`, so peak memory grew linearly with the
+number of instances in `--ipc-dir`.
+
+### 3. The graph encoding is dense and its node count is unbounded
+
+`DecompositionGraph::adjacency` is a dense `node_count x node_count` matrix,
+and for a method decision the node count is the number of grounded candidates
+plus two. `--max-groundings` defaults to 32 768 and the refiner samples up to
+four times that, so a single decision can carry thousands of candidates; at
+4 000 candidates one graph is 64 MB, and `prepare_example` keeps another copy
+while the Burn tensor is built. With the default `--max-samples 4096` that is
+hundreds of gigabytes even though only ~4 % of each matrix is non-zero.
+
+### What was changed
+
+* `hierarchical.rs` only emits a method trace for a real decision — at least two
+  applicable methods *and* at least one that actually refined — and only builds
+  the ranking context, the candidate list and the identity order for those. The
+  same "at least one successful branch" rule now applies to `SearchTrace`, which
+  already required two ready tasks. On `Depots/p05` this drops the recorded
+  traces from 1 212 095 to 37 184.
+* `TraceCollector` has a per-stream budget (`--max-samples`) and drops anything
+  beyond it.
+* `collect_traces` processes the corpus in chunks of `COLLECTION_CHUNK` problems
+  and stops as soon as the budgets are full, so domains, problems and traces of
+  one chunk are dropped before the next one is loaded. Peak memory no longer
+  depends on the number of instances.
+* `MAX_GRAPH_NODES = 256` bounds the node count of every encoded graph, and the
+  trainer's `select_candidates` keeps the candidates the refiner expanded first
+  when a decision has to be truncated. Labels are rebuild from the same
+  selection, so the supervised signal stays aligned.
+* `train` consumes the examples while it converts them to tensors, so the dense
+  graph and its tensor are never both alive for the whole training set.
+
+Measured on `Depots` with default grounding limits: before the change the
+collector had reached 637 MB after several minutes and was still growing; after
+the change the whole run peaks at 374 MB and finishes collecting in 10 s (a
+large part of the remainder is the `--jobs`-parallel refinement itself, whose
+grounding caches scale with `--max-groundings`).
+

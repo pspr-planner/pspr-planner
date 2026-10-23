@@ -336,10 +336,13 @@ fn ipc_assembly_hierarchical() {
     );
 }
 
+/// Barman applies deletes before adds, so `pour-shot-to-clean-shaker` keeps
+/// `shakerLevel(s, l)` when `next(l, l)` is a self-loop. Refinement must accept
+/// that instead of rejecting the action.
 #[test]
 fn ipc_barman_bdi() {
-    check_expected_refinement_failure("Barman-BDI", "pfile01.hddl");
-    check_expected_refinement_failure("Barman-BDI", "pfile02.hddl");
+    check("Barman-BDI", "pfile01.hddl", "p-1-2-2", 10, false);
+    check("Barman-BDI", "pfile02.hddl", "p-2-3-3", 20, false);
 }
 
 #[test]

@@ -85,6 +85,7 @@ fn solve_hierarchical_once(
                     .as_ref()
                     .map(|model| model as &dyn AbstractPlanPermuter),
                 trace: None,
+                diagnostics: None,
             };
             return evaluation_tree::solve_hierarchical_with_session(
                 domain,
@@ -104,6 +105,7 @@ fn solve_hierarchical_once(
                     .uses_permutation()
                     .then_some(&model as &dyn AbstractPlanPermuter),
                 trace: None,
+                diagnostics: None,
             };
             return evaluation_tree::solve_hierarchical_with_session(
                 domain,

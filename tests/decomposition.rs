@@ -119,6 +119,7 @@ fn unordered_fixture_records_method_and_frontier_traces() {
             &RefinementOptions {
                 max_groundings: 256,
                 max_depth: 32,
+                ..RefinementOptions::default()
             },
             &mut session,
         )
@@ -157,6 +158,7 @@ fn policy_can_reverse_the_frontier_order() {
             &RefinementOptions {
                 max_groundings: 256,
                 max_depth: 32,
+                ..RefinementOptions::default()
             },
             &mut session,
         )
@@ -210,6 +212,7 @@ fn neural_checkpoint_guides_the_unordered_fixture() {
         &RefinementOptions {
             max_groundings: 256,
             max_depth: 32,
+            ..RefinementOptions::default()
         },
         &mut session,
     )
@@ -238,6 +241,7 @@ fn malformed_ranker_output_falls_back_to_the_symbolic_order() {
             &RefinementOptions {
                 max_groundings: 256,
                 max_depth: 32,
+                ..RefinementOptions::default()
             },
             &mut session,
         )
@@ -265,6 +269,7 @@ fn permutation_retry_recovers_when_identity_order_fails() {
     let refinement_options = RefinementOptions {
         max_groundings: 256,
         max_depth: 32,
+        ..RefinementOptions::default()
     };
 
     // Baseline session (no permuter) should fail to refine this instance.

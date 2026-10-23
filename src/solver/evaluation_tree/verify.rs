@@ -30,7 +30,7 @@ use crate::solver::problem::Problem;
 use super::formula::Universe;
 use super::graph::{
     ConstraintNode, TaskNode, atom_key_into, bindings_from, build_task_constraint_graph,
-    ground_methods,
+    ground_methods, ground_methods_bounded,
 };
 use super::leaf::initial_atoms;
 
@@ -323,17 +323,10 @@ pub(super) fn apply_action(
         &mut deletes,
         &mut scratch,
     )?;
-    if !adds.is_disjoint(&deletes) {
-        let conflicts: Vec<&String> = adds.intersection(&deletes).collect();
-        bail!(
-            "the effects of `{task}` both add and delete {}",
-            conflicts
-                .iter()
-                .map(|atom| format!("`{atom}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    // PDDL applies the delete list before the add list, so an atom that appears
+    // in both sets is present afterwards. Domains rely on this whenever a
+    // parameter can stay unchanged: Barman's `pour-shot-to-clean-shaker` adds
+    // and deletes `shakerLevel(s, l)` with the same `l` when `next(l, l)` holds.
     let mut next = state.clone();
     for atom in &deletes {
         next.remove(atom);
@@ -428,6 +421,133 @@ fn holds_optional(
         Some(formula) => holds(formula, bindings, state, universe, budget),
         None => Ok(true),
     }
+}
+
+/// Report which precondition literals of the first action schema compatible
+/// with `task` do not hold in `state`.
+///
+/// Refinement diagnostics call this only on dead ends, so the extra work does
+/// not affect the solver's hot path. An empty result means either no schema
+/// matches the task or every visible literal holds (for example the failure is
+/// inside a quantifier that the budget could not expand).
+pub(super) fn unmet_action_preconditions(
+    domain: &Domain,
+    task: &TaskNode,
+    state: &BTreeSet<String>,
+    universe: &Universe<'_>,
+    budget: usize,
+) -> Vec<String> {
+    for action in domain.actions_for(&task.name) {
+        if action.parameters.len() != task.terms.len() {
+            continue;
+        }
+        if !action
+            .parameters
+            .iter()
+            .zip(&task.terms)
+            .all(|(parameter, term)| universe.compatible(parameter, term))
+        {
+            continue;
+        }
+        let bindings = bindings_from(&action.parameters, &task.terms);
+        let mut missing = Vec::new();
+        collect_unmet(
+            action.preconditions.as_ref(),
+            &bindings,
+            state,
+            universe,
+            budget,
+            &mut missing,
+        );
+        return missing;
+    }
+    Vec::new()
+}
+
+fn collect_unmet(
+    formula: Option<&Formula>,
+    bindings: &BTreeMap<String, String>,
+    state: &BTreeSet<String>,
+    universe: &Universe<'_>,
+    budget: usize,
+    missing: &mut Vec<String>,
+) {
+    let Some(formula) = formula else {
+        return;
+    };
+    match formula {
+        Formula::Empty => {}
+        Formula::And(items) => {
+            for item in items {
+                collect_unmet(Some(item), bindings, state, universe, budget, missing);
+            }
+        }
+        Formula::Atom(predicate) => {
+            let mut key = String::new();
+            atom_key_into(predicate, bindings, &mut key);
+            if !state.contains(key.as_str()) {
+                missing.push(key);
+            }
+        }
+        Formula::Not(inner) => match inner.as_ref() {
+            Formula::Atom(predicate) => {
+                let mut key = String::new();
+                atom_key_into(predicate, bindings, &mut key);
+                if state.contains(key.as_str()) {
+                    missing.push(format!("not {key}"));
+                }
+            }
+            _ => {
+                if matches!(
+                    holds(formula, bindings, state, universe, budget),
+                    Ok(false)
+                ) {
+                    missing.push(format!("{formula:?}"));
+                }
+            }
+        },
+        other => {
+            if matches!(holds(other, bindings, state, universe, budget), Ok(false)) {
+                missing.push(format!("{other:?}"));
+            }
+        }
+    }
+}
+
+/// Report, for up to `limit` grounded method instances of `task`, which
+/// precondition literals do not hold in `state`.
+///
+/// Like [`unmet_action_preconditions`], this only runs on refinement dead ends.
+pub(super) fn unmet_method_preconditions(
+    domain: &Domain,
+    universe: &Universe<'_>,
+    task: &TaskNode,
+    state: &BTreeSet<String>,
+    budget: usize,
+    limit: usize,
+) -> Vec<String> {
+    let mut samples = Vec::new();
+    for instance in ground_methods_bounded(domain, universe, task, budget).instances {
+        if samples.len() >= limit {
+            break;
+        }
+        let mut missing = Vec::new();
+        collect_unmet(
+            instance.method.precondition.as_ref(),
+            &instance.bindings,
+            state,
+            universe,
+            budget,
+            &mut missing,
+        );
+        samples.push(format!(
+            "{}{:?} missing [{}]",
+            instance.method.name.name,
+            instance.bindings,
+            missing.join(", ")
+        ));
+    }
+    samples
 }
 
 pub(super) fn holds(

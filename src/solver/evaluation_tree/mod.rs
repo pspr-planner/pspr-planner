@@ -111,8 +111,10 @@ pub use decomposition::{
 };
 pub use graph::{Atom, ConstraintNode, TaskConstraintGraph, TaskNode, build_task_constraint_graph};
 pub use hierarchical::{
-    Refinement, RefinementOptions, RefinementStep, refine_plan, refine_plan_with_session,
-    solve_hierarchical, solve_hierarchical_with_session, validate_refinement,
+    CyclePruning, Refinement, RefinementDiagnostics, RefinementOptions, RefinementStep,
+    refine_plan, refine_plan_interleaved, refine_plan_interleaved_with_diagnostics,
+    refine_plan_with_session, solve_hierarchical, solve_hierarchical_with_session,
+    validate_refinement,
 };
 pub use liftability::{
     ConsumerKind, GapKind, LiftabilityGap, LiftabilityOptions, LiftabilityReport,

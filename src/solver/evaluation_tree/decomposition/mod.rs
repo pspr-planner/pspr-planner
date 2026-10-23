@@ -14,6 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::graph::TaskNode;
+use super::hierarchical::RefinementDiagnostics;
 
 #[cfg(feature = "neural-base")]
 use burn::module::Module;
@@ -203,6 +204,7 @@ pub struct DecompositionSession<'a> {
     pub search_policy: Option<&'a dyn SearchPolicy>,
     pub plan_permuter: Option<&'a dyn AbstractPlanPermuter>,
     pub trace: Option<&'a mut dyn DecompositionTraceSink>,
+    pub diagnostics: Option<&'a mut RefinementDiagnostics>,
 }
 
 /// A graph consumed by the unified decomposition model.

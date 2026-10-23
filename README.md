@@ -227,6 +227,26 @@ scripts/run_ipc_vs_panda.sh
 CASE_FILTER='Blocksworld|Depots' scripts/run_ipc_vs_panda.sh
 ```
 
+The runner rebuilds `examples/bench_modes` when the solver sources are newer
+than the binary, so results never come from a stale build.
+
+Refinement failures can be classified with the counters in
+[`docs/refinement-diagnostics.md`](docs/refinement-diagnostics.md). Two
+environment variables drive the diagnostic switches:
+
+| Variable | Effect |
+| --- | --- |
+| `PSPR_CYCLE_KEY` | `task-state` (default) prunes a task that recurs in the same state on the current path; `off` disables the visited set |
+| `PSPR_INTERLEAVED_NODES` | node bound of the interleaved frontier fallback (default 20 000, 2 000 in debug builds) |
+| `PSPR_INTERLEAVED_MS` | wall-clock bound of the interleaved frontier fallback (default 3 000 ms) |
+
+`examples/diagnose_refine_modes.rs` prints those counters, the per-task dead
+ends and the unmet precondition literals for one instance:
+
+```bash
+cargo run --example diagnose_refine_modes -- domain.hddl problem.hddl
+```
+
 `scripts/compare_decomposition.sh` is the older full sweep that also reports
 PANDA parse/ground/search splits for every mode of the planner.
 

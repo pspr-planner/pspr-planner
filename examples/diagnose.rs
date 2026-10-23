@@ -6,8 +6,8 @@ use pspr::parsing::parser::{ParserConfig, parse_program};
 use pspr::solver::domain::process_domain;
 use pspr::solver::evaluation_tree::{
     DecompositionSession, DecompositionTraceSink, EvaluationOptions, MethodSummary, MethodTrace,
-    RefinementOptions, SearchTrace, SgplanMerger, build_evaluation_tree, evaluate,
-    refine_plan_with_session,
+    RefinementDiagnostics, RefinementOptions, SearchTrace, SgplanMerger, build_evaluation_tree,
+    evaluate, refine_plan_with_session,
 };
 use pspr::solver::problem::load_problem;
 
@@ -102,11 +102,13 @@ fn main() {
     }
 
     let mut printer = Printer;
+    let mut diagnostics = RefinementDiagnostics::default();
     let mut session = DecompositionSession {
         method_ranker: None,
         search_policy: None,
         plan_permuter: None,
         trace: Some(&mut printer),
+        diagnostics: Some(&mut diagnostics),
     };
     let refinement = refine_plan_with_session(
         &domain,
@@ -122,5 +124,39 @@ fn main() {
             refinement.goal
         ),
         Err(error) => println!("REFINE error: {error:#}"),
+    }
+    println!(
+        "REFINE stats: time_budget={} expansion_budget={} depth={} cycle={} no_applicable={} constraint_reject={} ready_empty={} abstract_step_failed={}",
+        diagnostics.budget_time_exhausted,
+        diagnostics.budget_expansions_exhausted,
+        diagnostics.depth_exhausted,
+        diagnostics.cycle_pruned,
+        diagnostics.no_applicable_method,
+        diagnostics.network_constraint_rejected,
+        diagnostics.partial_ready_empty,
+        diagnostics.abstract_step_failed,
+    );
+    let mut dead_ends: Vec<(&String, &u64)> = diagnostics.no_applicable_tasks.iter().collect();
+    dead_ends.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+    let summary: Vec<String> = dead_ends
+        .iter()
+        .take(6)
+        .map(|(task, count)| format!("{task}={count}"))
+        .collect();
+    if !summary.is_empty() {
+        println!("REFINE dead-end tasks: {}", summary.join(" "));
+    }
+    for sample in &diagnostics.dead_end_samples {
+        println!("REFINE dead-end sample: {sample}");
+    }
+    if !diagnostics.no_instance_tasks.is_empty() {
+        let mut items: Vec<(&String, &u64)> = diagnostics.no_instance_tasks.iter().collect();
+        items.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+        let text: Vec<String> = items
+            .iter()
+            .take(6)
+            .map(|(task, count)| format!("{task}={count}"))
+            .collect();
+        println!("REFINE no-instance tasks: {}", text.join(" "));
     }
 }

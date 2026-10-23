@@ -29,6 +29,8 @@
 
 set -uo pipefail
 
+cargo b --example bench_modes --release
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IPC_DIR=${IPC_DIR:-"$repo_root/../hddl/test_data/ipc"}
 HDDL_PARSER=${HDDL_PARSER:-"$HOME/.cargo/bin/hddl_analyzer"}
@@ -93,7 +95,20 @@ for path in "$IPC_DIR" "$HDDL_PARSER" "$PANDA_PARSER" "$PANDA_GROUNDER" "$PANDA_
     fi
 done
 
+rebuild_pspr=false
 if [[ ! -x $PSPR_BIN ]]; then
+    rebuild_pspr=true
+elif find \
+    "$repo_root/src" \
+    "$repo_root/examples/bench_modes.rs" \
+    "$repo_root/Cargo.toml" \
+    "$repo_root/Cargo.lock" \
+    -type f -newer "$PSPR_BIN" \
+    | grep -q .; then
+    rebuild_pspr=true
+fi
+
+if [[ $rebuild_pspr == true ]]; then
     echo "building $PSPR_BIN" >&2
     (cd "$repo_root" && HDDL_PARSER="$HDDL_PARSER" cargo build --release --example bench_modes) || exit 2
 fi

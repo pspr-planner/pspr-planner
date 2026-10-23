@@ -29,8 +29,95 @@ use super::decomposition::{
 use super::formula::{self, Universe};
 use super::graph::{TaskNode, ground_methods_bounded, ground_task_network_edges};
 use super::leaf::initial_atoms;
-use super::verify::{GoalStatus, Step, apply_action, holds, parse_step};
+use super::verify::{
+    GoalStatus, Step, apply_action, holds, parse_step, unmet_action_preconditions,
+    unmet_method_preconditions,
+};
 use super::{EvaluationOptions, SgplanMerger, evaluate};
+
+/// Counters describing why refinement branches were pruned or failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefinementDiagnostics {
+    /// Number of branches pruned because the global refinement time budget ran out.
+    pub budget_time_exhausted: u64,
+    /// Number of branches pruned because the global expansion budget was exhausted.
+    pub budget_expansions_exhausted: u64,
+    /// Number of branches pruned at recursion depth 0.
+    pub depth_exhausted: u64,
+    /// Number of recursive calls pruned by the `(task, state)` visited set.
+    pub cycle_pruned: u64,
+    /// Number of tasks with no applicable grounded methods in the current state.
+    pub no_applicable_method: u64,
+    /// Number of no-applicable dead ends per task name.
+    pub no_applicable_tasks: BTreeMap<String, u64>,
+    /// Number of tasks whose name matched no grounded method instance at all.
+    pub no_instance_tasks: BTreeMap<String, u64>,
+    /// Bounded sample of dead ends with the unmet precondition literals.
+    pub dead_end_samples: Vec<String>,
+    /// Number of grounded methods rejected by network equality constraints.
+    pub network_constraint_rejected: u64,
+    /// Number of partial-order subnetworks that reached a dead end (no ready task).
+    pub partial_ready_empty: u64,
+    /// Number of abstract steps that produced no refinement candidates.
+    pub abstract_step_failed: u64,
+}
+
+impl RefinementDiagnostics {
+    fn merge_from(&mut self, other: &Self) {
+        self.budget_time_exhausted += other.budget_time_exhausted;
+        self.budget_expansions_exhausted += other.budget_expansions_exhausted;
+        self.depth_exhausted += other.depth_exhausted;
+        self.cycle_pruned += other.cycle_pruned;
+        self.no_applicable_method += other.no_applicable_method;
+        for (task, count) in &other.no_applicable_tasks {
+            *self.no_applicable_tasks.entry(task.clone()).or_default() += count;
+        }
+        for (task, count) in &other.no_instance_tasks {
+            *self.no_instance_tasks.entry(task.clone()).or_default() += count;
+        }
+        for sample in &other.dead_end_samples {
+            if self.dead_end_samples.len() >= DEAD_END_SAMPLE_LIMIT {
+                break;
+            }
+            if !self.dead_end_samples.contains(sample) {
+                self.dead_end_samples.push(sample.clone());
+            }
+        }
+        self.network_constraint_rejected += other.network_constraint_rejected;
+        self.partial_ready_empty += other.partial_ready_empty;
+        self.abstract_step_failed += other.abstract_step_failed;
+    }
+}
+
+/// How `refine_task` recognises recursive branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CyclePruning {
+    /// Prune a task that recurs in the same state on the current path. This is
+    /// the default: such a branch cannot make progress.
+    #[default]
+    TaskState,
+    /// Do not prune recurrences. Useful to test whether the visited set rejects
+    /// a refinement that would otherwise succeed, for example in domains whose
+    /// recursion legitimately revisits a state with a different remainder.
+    Off,
+}
+
+impl CyclePruning {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "task-state" => Some(Self::TaskState),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TaskState => "task-state",
+            Self::Off => "off",
+        }
+    }
+}
 
 /// Options for hierarchical refinement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +126,8 @@ pub struct RefinementOptions {
     pub max_groundings: usize,
     /// Maximum recursion depth through methods.
     pub max_depth: usize,
+    /// How recursive branches are pruned.
+    pub cycle_pruning: CyclePruning,
 }
 
 impl Default for RefinementOptions {
@@ -47,6 +136,10 @@ impl Default for RefinementOptions {
         RefinementOptions {
             max_groundings: evaluation.max_groundings,
             max_depth: 32,
+            cycle_pruning: std::env::var("PSPR_CYCLE_KEY")
+                .ok()
+                .and_then(|value| CyclePruning::parse(&value))
+                .unwrap_or_default(),
         }
     }
 }
@@ -256,6 +349,7 @@ pub fn refine_plan_with_session(
 ) -> Result<Refinement> {
     let universe = Universe::new(domain, problem);
     let state: State = Arc::new(initial_atoms(problem));
+    let mut diagnostics = RefinementDiagnostics::default();
     let candidates = refine_plan_steps(
         domain,
         problem,
@@ -264,8 +358,12 @@ pub fn refine_plan_with_session(
         state,
         options,
         options.max_depth,
+        &mut diagnostics,
         session,
     )?;
+    if let Some(session_diagnostics) = session.diagnostics.as_deref_mut() {
+        session_diagnostics.merge_from(&diagnostics);
+    }
     if candidates.is_empty() {
         bail!("the abstract plan could not be refined into a complete HTN plan");
     }
@@ -308,13 +406,36 @@ pub fn solve_hierarchical(
     );
     let mut last_error = None;
     let mut refinement = None;
+    let precedence = abstract_plan_precedence(
+        domain,
+        problem,
+        &evaluation.plan,
+        evaluation_options.max_groundings,
+    );
     for attempt in 0..REFINEMENT_RETRY_ATTEMPTS {
         let retry = refined_retry_options(options, attempt);
-        match refine_plan(domain, problem, &evaluation.plan, &retry) {
-            Ok(candidate) => {
-                refinement = Some(candidate);
-                break;
+        let plans = fallback_permutation_candidates(&evaluation.plan, &precedence, attempt);
+        for plan in plans {
+            match refine_plan(domain, problem, &plan, &retry) {
+                Ok(candidate) => {
+                    refinement = Some(candidate);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
             }
+        }
+        if refinement.is_some() {
+            break;
+        }
+    }
+    if refinement.is_none() {
+        // Every sequential order failed. Retry once with the interleaved
+        // frontier search, which can mix subtasks of different top-level tasks.
+        // The search has its own node bound, so it runs a single attempt
+        // instead of the escalating retries above.
+        match refine_plan_interleaved(domain, problem, options) {
+            Ok(Some(candidate)) => refinement = Some(candidate),
+            Ok(None) => {}
             Err(error) => last_error = Some(error),
         }
     }
@@ -327,11 +448,426 @@ pub fn solve_hierarchical(
     Ok(refinement)
 }
 
+/// Default upper bound on the nodes the interleaved frontier search may visit.
+///
+/// The search is a completeness fallback, so it gets a budget that keeps the
+/// worst case in the hundreds of milliseconds in release builds. Debug builds
+/// are roughly two orders of magnitude slower per node, so they use a much
+/// smaller bound to keep the test suite responsive.
+/// `PSPR_INTERLEAVED_NODES` overrides both.
+const INTERLEAVED_NODE_LIMIT: usize = 20_000;
+const INTERLEAVED_NODE_LIMIT_DEBUG: usize = 2_000;
+/// Wall-clock bound of the interleaved fallback, in milliseconds.
+const INTERLEAVED_TIME_LIMIT_MS: u64 = 3_000;
+
+fn interleaved_node_limit() -> usize {
+    std::env::var("PSPR_INTERLEAVED_NODES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(if cfg!(debug_assertions) {
+            INTERLEAVED_NODE_LIMIT_DEBUG
+        } else {
+            INTERLEAVED_NODE_LIMIT
+        })
+}
+
+fn interleaved_deadline() -> Instant {
+    let millis = std::env::var("PSPR_INTERLEAVED_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(INTERLEAVED_TIME_LIMIT_MS);
+    Instant::now() + Duration::from_millis(millis)
+}
+
+/// One task slot of the interleaved frontier, including its partial plan tree.
+#[derive(Clone)]
+struct FrontierTree {
+    task: TaskNode,
+    /// Recursion budget left for this task's own refinement.
+    depth: usize,
+    method: Option<(String, BTreeMap<String, String>)>,
+    action: Option<String>,
+    children: Vec<usize>,
+}
+
+/// A frontier node: the shared state plus every open task.
+#[derive(Clone)]
+struct Frontier {
+    state: State,
+    tree: Vec<FrontierTree>,
+    /// Slots that still have to be expanded.
+    pending: Vec<usize>,
+    /// `(before, after)` pairs over slot ids.
+    edges: Vec<(usize, usize)>,
+    roots: Vec<usize>,
+}
+
+impl Frontier {
+    fn is_ready(&self, slot: usize) -> bool {
+        self.pending.contains(&slot)
+            && !self
+                .edges
+                .iter()
+                .any(|(before, after)| *after == slot && self.pending.contains(before))
+    }
+}
+
+/// Refine the initial task network with a global interleaved frontier search.
+///
+/// [`refine_plan_steps`] refines every abstract step to completion before it
+/// starts the next one. That is complete for a totally ordered top-level
+/// network, but it rejects plans that interleave subtasks of different
+/// top-level tasks. Partial-order benchmarks need that: in PCP `t1G1` leaves
+/// `turnB`, so the recursive `SG1` subtask can only continue after an `SG2`
+/// action switched the turn back.
+///
+/// This search keeps every open task in one frontier and expands whichever
+/// ready task the current state allows, so such plans become reachable. It
+/// returns `Ok(None)` when no interleaving was found within the node limit.
+pub fn refine_plan_interleaved(
+    domain: &Domain,
+    problem: &Problem,
+    options: &RefinementOptions,
+) -> Result<Option<Refinement>> {
+    let mut diagnostics = RefinementDiagnostics::default();
+    refine_plan_interleaved_with_diagnostics(domain, problem, options, &mut diagnostics)
+}
+
+/// [`refine_plan_interleaved`] with an explicit diagnostics sink.
+pub fn refine_plan_interleaved_with_diagnostics(
+    domain: &Domain,
+    problem: &Problem,
+    options: &RefinementOptions,
+    diagnostics: &mut RefinementDiagnostics,
+) -> Result<Option<Refinement>> {
+    let universe = Universe::new(domain, problem);
+    let grounded = ground_task_network_edges(domain, problem, options.max_groundings)?;
+    if grounded.tasks.is_empty() {
+        return Ok(None);
+    }
+    let mut tree = Vec::with_capacity(grounded.tasks.len());
+    let mut pending = Vec::with_capacity(grounded.tasks.len());
+    let mut roots = Vec::with_capacity(grounded.tasks.len());
+    for task in &grounded.tasks {
+        tree.push(FrontierTree {
+            task: task.clone(),
+            depth: options.max_depth,
+            method: None,
+            action: None,
+            children: Vec::new(),
+        });
+        let slot = tree.len() - 1;
+        pending.push(slot);
+        roots.push(slot);
+    }
+    let start = Frontier {
+        state: Arc::new(initial_atoms(problem)),
+        tree,
+        pending,
+        edges: grounded.edges,
+        roots,
+    };
+
+    let mut cache = MethodApplicabilityCache::default();
+    let mut budget = RefinementBudget::new(grounded.tasks.len(), options);
+    let mut nodes_left = interleaved_node_limit();
+    let deadline = interleaved_deadline();
+    let Some(done) = interleaved_search(
+        domain,
+        problem,
+        &universe,
+        options,
+        start,
+        &mut cache,
+        &mut budget,
+        diagnostics,
+        deadline,
+        &mut nodes_left,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let steps: Vec<RefinementStep> = done
+        .roots
+        .iter()
+        .map(|slot| frontier_step(&done.tree, *slot))
+        .collect();
+    let mut plan = Vec::new();
+    for step in &steps {
+        step.collect_actions(&mut plan);
+    }
+    let goal = goal_status(problem, &universe, done.state.as_ref(), options.max_groundings)?;
+    Ok(Some(Refinement {
+        abstract_plan: grounded.tasks.iter().map(TaskNode::to_string).collect(),
+        plan,
+        steps,
+        final_state: (*done.state).clone(),
+        goal,
+    }))
+}
+
+/// Rebuild the decomposition tree of one slot.
+fn frontier_step(tree: &[FrontierTree], slot: usize) -> RefinementStep {
+    let node = &tree[slot];
+    if let Some(action) = &node.action {
+        return RefinementStep::Action {
+            task: node.task.clone(),
+            step: action.clone(),
+        };
+    }
+    match &node.method {
+        Some((method, bindings)) => RefinementStep::Method {
+            task: node.task.clone(),
+            method: method.clone(),
+            bindings: bindings.clone(),
+            subtasks: node
+                .children
+                .iter()
+                .map(|child| frontier_step(tree, *child))
+                .collect(),
+        },
+        // Unreachable for a complete frontier: every slot is either an action
+        // or a method instance once the search succeeds.
+        None => RefinementStep::Action {
+            task: node.task.clone(),
+            step: node.task.to_string(),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interleaved_search(
+    domain: &Domain,
+    problem: &Problem,
+    universe: &Universe<'_>,
+    options: &RefinementOptions,
+    node: Frontier,
+    cache: &mut MethodApplicabilityCache,
+    budget: &mut RefinementBudget,
+    diagnostics: &mut RefinementDiagnostics,
+    deadline: Instant,
+    nodes_left: &mut usize,
+) -> Result<Option<Frontier>> {
+    if *nodes_left == 0 || Instant::now() >= deadline {
+        diagnostics.budget_expansions_exhausted += 1;
+        return Ok(None);
+    }
+    *nodes_left -= 1;
+    if !budget.has_time() {
+        diagnostics.budget_time_exhausted += 1;
+        return Ok(None);
+    }
+    if node.pending.is_empty() {
+        return Ok(Some(node));
+    }
+    let ready: Vec<usize> = node
+        .pending
+        .iter()
+        .copied()
+        .filter(|slot| node.is_ready(*slot))
+        .collect();
+    if ready.is_empty() {
+        diagnostics.partial_ready_empty += 1;
+        return Ok(None);
+    }
+
+    // Execute first, decompose second. A ready task that is already a
+    // primitive action in an applicable state commits the search to that
+    // action instead of also branching into method decompositions, which keeps
+    // the branching factor of alternating domains like PCP manageable. Only
+    // when no ready action can execute does the search decompose compounds.
+    let (action_slots, compound_slots): (Vec<usize>, Vec<usize>) = ready
+        .into_iter()
+        .partition(|slot| domain.actions_for(&node.tree[*slot].task.name).next().is_some());
+
+    for pass in 0..2 {
+        let slots = if pass == 0 {
+            &action_slots
+        } else {
+            &compound_slots
+        };
+        let mut produced = false;
+        for slot in slots.iter().copied() {
+            let expansions = interleaved_expansions(
+                domain,
+                universe,
+                options,
+                &node,
+                slot,
+                cache,
+                budget,
+                diagnostics,
+            )?;
+            if !expansions.is_empty() {
+                produced = true;
+            }
+            for next in expansions {
+                if let Some(done) = interleaved_search(
+                    domain,
+                    problem,
+                    universe,
+                    options,
+                    next,
+                    cache,
+                    budget,
+                    diagnostics,
+                    deadline,
+                    nodes_left,
+                )? {
+                    return Ok(Some(done));
+                }
+                if *nodes_left == 0 || Instant::now() >= deadline {
+                    return Ok(None);
+                }
+            }
+        }
+        if produced {
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
+/// Every way `slot` can be advanced by one decomposition or action step.
+#[allow(clippy::too_many_arguments)]
+fn interleaved_expansions(
+    domain: &Domain,
+    universe: &Universe<'_>,
+    options: &RefinementOptions,
+    node: &Frontier,
+    slot: usize,
+    cache: &mut MethodApplicabilityCache,
+    budget: &mut RefinementBudget,
+    diagnostics: &mut RefinementDiagnostics,
+) -> Result<Vec<Frontier>> {
+    let task = node.tree[slot].task.clone();
+    let depth = node.tree[slot].depth;
+    let mut expansions = Vec::new();
+    if depth == 0 {
+        diagnostics.depth_exhausted += 1;
+        return Ok(expansions);
+    }
+    if !budget.consume() {
+        diagnostics.budget_expansions_exhausted += 1;
+        return Ok(expansions);
+    }
+
+    if domain.actions_for(&task.name).next().is_some()
+        && let Ok(next) = apply_action(
+            domain,
+            &task,
+            node.state.as_ref(),
+            universe,
+            options.max_groundings,
+        )
+    {
+        let mut expanded = node.clone();
+        expanded.state = Arc::new(next);
+        expanded.pending.retain(|pending| *pending != slot);
+        expanded.tree[slot].action = Some(task.to_string());
+        expansions.push(expanded);
+    }
+
+    let (instances, applicable) =
+        cache.lookup(domain, universe, &task, &node.state, options.max_groundings)?;
+    if applicable.is_empty() && expansions.is_empty() {
+        diagnostics.no_applicable_method += 1;
+        *diagnostics
+            .no_applicable_tasks
+            .entry(task.to_string())
+            .or_default() += 1;
+        if instances.is_empty() {
+            *diagnostics
+                .no_instance_tasks
+                .entry(task.to_string())
+                .or_default() += 1;
+        }
+    }
+    // Prefer decompositions whose first subtask can execute right now: in
+    // alternating domains such as PCP the state only unlocks one family at a
+    // time, so leading with an executable subtask keeps the depth-first search
+    // on the productive branch. Shorter decompositions break ties, which keeps
+    // the search from descending into a recursive variant before its base case.
+    let mut ordered: Vec<(bool, usize, u32)> = applicable
+        .iter()
+        .map(|index| {
+            let instance = &instances[*index as usize];
+            let lead_ready = instance.tasks.first().is_some_and(|first| {
+                domain.actions_for(&first.name).next().is_some()
+                    && apply_action(
+                        domain,
+                        first,
+                        node.state.as_ref(),
+                        universe,
+                        options.max_groundings,
+                    )
+                    .is_ok()
+            });
+            (!lead_ready, instance.subtasks, *index)
+        })
+        .collect();
+    ordered.sort_unstable();
+    for (_, _, index) in ordered.iter() {
+        let instance = &instances[*index as usize];
+        if !constraints_hold(instance.network.constraints.as_deref(), &instance.bindings) {
+            diagnostics.network_constraint_rejected += 1;
+            continue;
+        }
+        let mut expanded = node.clone();
+        expanded.pending.retain(|pending| *pending != slot);
+        expanded.tree[slot].method = Some((instance.method.clone(), instance.bindings.clone()));
+        let mut children = Vec::with_capacity(instance.tasks.len());
+        for subtask in instance.tasks.iter() {
+            expanded.tree.push(FrontierTree {
+                task: subtask.clone(),
+                depth: depth - 1,
+                method: None,
+                action: None,
+                children: Vec::new(),
+            });
+            let child = expanded.tree.len() - 1;
+            children.push(child);
+            expanded.pending.push(child);
+        }
+        expanded.tree[slot].children = children.clone();
+        match &instance.network.orderings {
+            TaskOrdering::Total => {
+                for pair in children.windows(2) {
+                    expanded.edges.push((pair[0], pair[1]));
+                }
+            }
+            TaskOrdering::Partial(edges) => {
+                for (before, after) in edges {
+                    let before = instance
+                        .ids
+                        .iter()
+                        .position(|id| id == before)
+                        .expect("ordering ids come from the method network");
+                    let after = instance
+                        .ids
+                        .iter()
+                        .position(|id| id == after)
+                        .expect("ordering ids come from the method network");
+                    if before != after {
+                        expanded.edges.push((children[before], children[after]));
+                    }
+                }
+            }
+        }
+        expansions.push(expanded);
+    }
+    Ok(expansions)
+}
+
+
 // Bounded breadth-first-style enumeration of refinement alternatives. The
 // limit is large enough for the larger Blocksworld-GTOHP instances (up to 14
 // tasks with several interchangeable `do_on_table` methods) and still keeps
 // the search finite on the harder learned domains.
-const MAX_REFINEMENTS: usize = 2048;
+const MAX_REFINEMENTS: usize = 16384;
+/// Upper bound on the retained dead-end samples in [`RefinementDiagnostics`].
+const DEAD_END_SAMPLE_LIMIT: usize = 8;
 const REFINEMENT_METHOD_SAMPLING_FACTOR: usize = 4;
 const REFINEMENT_RETRY_ATTEMPTS: usize = 3;
 const REFINEMENT_MIN_BUDGET_MS: u64 = 2500;
@@ -344,6 +880,7 @@ fn refined_retry_options(base: &RefinementOptions, attempt: usize) -> Refinement
     RefinementOptions {
         max_groundings: base.max_groundings.saturating_mul(scale),
         max_depth: base.max_depth.saturating_add(8 * attempt),
+        cycle_pruning: base.cycle_pruning,
     }
 }
 
@@ -395,6 +932,17 @@ fn cap(mut candidates: Vec<RefinedTask>) -> Vec<RefinedTask> {
     candidates
 }
 
+fn push_unique_candidate(
+    candidates: &mut Vec<RefinedTask>,
+    seen_states: &mut HashSet<State>,
+    candidate: RefinedTask,
+) -> bool {
+    if seen_states.insert(Arc::clone(&candidate.state)) {
+        candidates.push(candidate);
+    }
+    candidates.len() >= MAX_REFINEMENTS
+}
+
 fn rank_order(scores: Vec<f64>) -> Option<Vec<usize>> {
     if scores.is_empty() || scores.iter().any(|score| !score.is_finite()) {
         return None;
@@ -406,6 +954,32 @@ fn rank_order(scores: Vec<f64>) -> Option<Vec<usize>> {
             .then(left.cmp(right))
     });
     Some(order)
+}
+
+fn preferred_method_order(
+    preferred_method: Option<&str>,
+    instances: &[GroundedInstance],
+    applicable: &[u32],
+) -> Vec<usize> {
+    let Some(preferred) = preferred_method else {
+        return (0..applicable.len()).collect();
+    };
+    let mut preferred_slots = Vec::new();
+    let mut fallback_slots = Vec::new();
+    for slot in 0..applicable.len() {
+        let index = applicable[slot] as usize;
+        if instances[index].method == preferred {
+            preferred_slots.push(slot);
+        } else {
+            fallback_slots.push(slot);
+        }
+    }
+    if preferred_slots.is_empty() {
+        (0..applicable.len()).collect()
+    } else {
+        preferred_slots.extend(fallback_slots);
+        preferred_slots
+    }
 }
 
 /// Hierarchical solving with an optional neural decomposition session.
@@ -546,12 +1120,25 @@ fn permutation_candidates(
     session: &mut DecompositionSession<'_>,
 ) -> Vec<Vec<String>> {
     let mut candidates = vec![abstract_plan.to_vec()];
-    let Some(permuter) = session.plan_permuter else {
-        return candidates;
-    };
     if abstract_plan.len() <= 1 {
         return candidates;
     }
+    let add_candidate = |order: Vec<usize>, candidates: &mut Vec<Vec<String>>| {
+        if !valid_plan_permutation(&order, abstract_plan.len(), precedence) {
+            return;
+        }
+        let plan: Vec<String> = order
+            .into_iter()
+            .map(|index| abstract_plan[index].clone())
+            .collect();
+        if !candidates.iter().any(|existing| existing == &plan) {
+            candidates.push(plan);
+        }
+    };
+
+    let Some(permuter) = session.plan_permuter else {
+        return candidates;
+    };
     let context = AbstractPlanContext {
         steps: abstract_plan.to_vec(),
         precedence: precedence.to_vec(),
@@ -571,11 +1158,23 @@ fn permutation_candidates(
         if !proposal.score.is_finite() {
             continue;
         }
-        if !valid_plan_permutation(&proposal.order, abstract_plan.len(), precedence) {
-            continue;
-        }
-        let plan: Vec<String> = proposal
-            .order
+        add_candidate(proposal.order, &mut candidates);
+    }
+    candidates
+}
+
+fn fallback_permutation_candidates(
+    abstract_plan: &[String],
+    precedence: &[(usize, usize)],
+    attempt: usize,
+) -> Vec<Vec<String>> {
+    let mut candidates = vec![abstract_plan.to_vec()];
+    if attempt == 0 || abstract_plan.len() <= 1 {
+        return candidates;
+    }
+    let reversed: Vec<usize> = (0..abstract_plan.len()).rev().collect();
+    if valid_plan_permutation(&reversed, abstract_plan.len(), precedence) {
+        let plan: Vec<String> = reversed
             .into_iter()
             .map(|index| abstract_plan[index].clone())
             .collect();
@@ -607,6 +1206,7 @@ fn refine_plan_steps(
     state: State,
     options: &RefinementOptions,
     depth: usize,
+    diagnostics: &mut RefinementDiagnostics,
     session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
     let mut candidates = vec![RefinedTask {
@@ -628,6 +1228,7 @@ fn refine_plan_steps(
         }
 
         let mut step_candidates = Vec::new();
+        let mut seen_step_states = HashSet::new();
         for candidate in candidates {
             let alternatives = refine_task(
                 domain,
@@ -638,6 +1239,7 @@ fn refine_plan_steps(
                 options,
                 depth,
                 preferred,
+                diagnostics,
                 &mut visited,
                 &mut applicability_cache,
                 &mut budget,
@@ -646,11 +1248,14 @@ fn refine_plan_steps(
             for refined in alternatives {
                 let mut steps = candidate.steps.clone();
                 steps.extend(refined.steps);
-                step_candidates.push(RefinedTask {
-                    steps,
-                    state: refined.state,
-                });
-                if step_candidates.len() >= MAX_REFINEMENTS {
+                if push_unique_candidate(
+                    &mut step_candidates,
+                    &mut seen_step_states,
+                    RefinedTask {
+                        steps,
+                        state: refined.state,
+                    },
+                ) {
                     break;
                 }
             }
@@ -659,6 +1264,7 @@ fn refine_plan_steps(
             }
         }
         if step_candidates.is_empty() {
+            diagnostics.abstract_step_failed += 1;
             return Ok(Vec::new());
         }
         candidates = step_candidates;
@@ -676,20 +1282,24 @@ fn refine_task(
     options: &RefinementOptions,
     depth: usize,
     preferred_method: Option<&str>,
+    diagnostics: &mut RefinementDiagnostics,
     visited: &mut HashSet<(TaskNode, State)>,
     applicability_cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
     if !budget.has_time() {
+        diagnostics.budget_time_exhausted += 1;
         return Ok(Vec::new());
     }
     // A method may rediscover the same task in the same state. Such a branch
     // cannot make progress, so prune it instead of letting cycles (for example
     // `get_to` via an intermediate location) expand until the depth limit.
     // The state is reference-counted, so the visited key does not copy it.
+    // `CyclePruning::Off` disables the check for experiments.
     let key = (task.clone(), Arc::clone(state));
-    if !visited.insert(key.clone()) {
+    if options.cycle_pruning == CyclePruning::TaskState && !visited.insert(key.clone()) {
+        diagnostics.cycle_pruned += 1;
         return Ok(Vec::new());
     }
     let result = refine_task_uncached(
@@ -701,12 +1311,15 @@ fn refine_task(
         options,
         depth,
         preferred_method,
+        diagnostics,
         visited,
         applicability_cache,
         budget,
         session,
     );
-    visited.remove(&key);
+    if options.cycle_pruning == CyclePruning::TaskState {
+        visited.remove(&key);
+    }
     result
 }
 
@@ -720,12 +1333,22 @@ fn refine_task_uncached(
     options: &RefinementOptions,
     depth: usize,
     preferred_method: Option<&str>,
+    diagnostics: &mut RefinementDiagnostics,
     visited: &mut HashSet<(TaskNode, State)>,
     applicability_cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
-    if depth == 0 || !budget.has_time() || !budget.consume() {
+    if depth == 0 {
+        diagnostics.depth_exhausted += 1;
+        return Ok(Vec::new());
+    }
+    if !budget.has_time() {
+        diagnostics.budget_time_exhausted += 1;
+        return Ok(Vec::new());
+    }
+    if !budget.consume() {
+        diagnostics.budget_expansions_exhausted += 1;
         return Ok(Vec::new());
     }
 
@@ -752,6 +1375,51 @@ fn refine_task_uncached(
 
     let (instances, applicable) =
         applicability_cache.lookup(domain, universe, task, state, options.max_groundings)?;
+    if applicable.is_empty() {
+        diagnostics.no_applicable_method += 1;
+        *diagnostics
+            .no_applicable_tasks
+            .entry(task.to_string())
+            .or_default() += 1;
+        if instances.is_empty() {
+            *diagnostics
+                .no_instance_tasks
+                .entry(task.to_string())
+                .or_default() += 1;
+        } else if diagnostics.dead_end_samples.len() < DEAD_END_SAMPLE_LIMIT {
+            for sample in unmet_method_preconditions(
+                domain,
+                universe,
+                task,
+                state.as_ref(),
+                options.max_groundings,
+                2,
+            ) {
+                if diagnostics.dead_end_samples.len() >= DEAD_END_SAMPLE_LIMIT {
+                    break;
+                }
+                let entry = format!("{task}: {sample}");
+                if !diagnostics.dead_end_samples.contains(&entry) {
+                    diagnostics.dead_end_samples.push(entry);
+                }
+            }
+        }
+        if diagnostics.dead_end_samples.len() < DEAD_END_SAMPLE_LIMIT {
+            let missing = unmet_action_preconditions(
+                domain,
+                task,
+                state.as_ref(),
+                universe,
+                options.max_groundings,
+            );
+            if !missing.is_empty() {
+                diagnostics
+                    .dead_end_samples
+                    .push(format!("{task} missing [{}]", missing.join(", ")));
+            }
+        }
+        return Ok(Vec::new());
+    }
 
     // A ranking decision needs alternatives: with fewer than two applicable
     // methods there is nothing to rank, and a decision in which no candidate
@@ -798,24 +1466,28 @@ fn refine_task_uncached(
             .filter(|order| valid_method_order(order, candidates.len())),
         _ => None,
     };
+    let method_order = ranked_order.clone().unwrap_or_else(|| {
+        preferred_method_order(preferred_method, instances.as_ref(), applicable.as_ref())
+    });
 
     let mut results = Vec::new();
-    let mut successful = if tracing {
+    let mut seen_result_states = HashSet::new();
+    // Only a ranked decision needs the per-candidate outcome vector; the
+    // default path neither ranks nor records, and this runs for every visited
+    // state.
+    let mut successful = if ranked {
         vec![false; applicable.len()]
     } else {
         Vec::new()
     };
-    for slot in 0..applicable.len() {
+    for candidate_slot in method_order.iter().copied() {
         if !budget.has_time() {
             break;
         }
-        let candidate_slot = match &ranked_order {
-            Some(order) => order[slot],
-            None => slot,
-        };
         let grounded_index = applicable[candidate_slot] as usize;
         let instance = &instances[grounded_index];
         let before = results.len();
+        let mut produced = false;
         let alternatives = refine_network(
             domain,
             problem,
@@ -824,27 +1496,32 @@ fn refine_task_uncached(
             state,
             options,
             depth - 1,
+            diagnostics,
             visited,
             applicability_cache,
             budget,
             session,
         )?;
         for refined in alternatives {
-            results.push(RefinedTask {
-                steps: vec![RefinementStep::Method {
-                    task: task.clone(),
-                    method: instance.method.clone(),
-                    bindings: instance.bindings.clone(),
-                    subtasks: refined.steps,
-                }],
-                state: refined.state,
-            });
-            if results.len() >= MAX_REFINEMENTS {
+            produced = true;
+            if push_unique_candidate(
+                &mut results,
+                &mut seen_result_states,
+                RefinedTask {
+                    steps: vec![RefinementStep::Method {
+                        task: task.clone(),
+                        method: instance.method.clone(),
+                        bindings: instance.bindings.clone(),
+                        subtasks: refined.steps,
+                    }],
+                    state: refined.state,
+                },
+            ) {
                 break;
             }
         }
-        if tracing {
-            successful[candidate_slot] = results.len() > before;
+        if ranked {
+            successful[candidate_slot] = produced || results.len() > before;
         }
         if results.len() >= MAX_REFINEMENTS {
             break;
@@ -856,7 +1533,7 @@ fn refine_task_uncached(
         && successful.iter().any(|successful| *successful)
     {
         let context = context.expect("a trace sink implies a ranking context");
-        let order = ranked_order.unwrap_or_else(|| (0..candidates.len()).collect());
+        let order = method_order;
         trace.method_trace(MethodTrace {
             context,
             candidates,
@@ -877,12 +1554,14 @@ fn refine_network(
     state: &State,
     options: &RefinementOptions,
     depth: usize,
+    diagnostics: &mut RefinementDiagnostics,
     visited: &mut HashSet<(TaskNode, State)>,
     applicability_cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
     if !constraints_hold(instance.network.constraints.as_deref(), &instance.bindings) {
+        diagnostics.network_constraint_rejected += 1;
         return Ok(Vec::new());
     }
 
@@ -897,6 +1576,7 @@ fn refine_network(
                     return Ok(Vec::new());
                 }
                 let mut next_candidates = Vec::new();
+                let mut seen_next_states = HashSet::new();
                 for candidate in candidates {
                     let alternatives = refine_task(
                         domain,
@@ -907,6 +1587,7 @@ fn refine_network(
                         options,
                         depth,
                         None,
+                        diagnostics,
                         visited,
                         applicability_cache,
                         budget,
@@ -915,11 +1596,14 @@ fn refine_network(
                     for refined in alternatives {
                         let mut steps = candidate.steps.clone();
                         steps.extend(refined.steps);
-                        next_candidates.push(RefinedTask {
-                            steps,
-                            state: refined.state,
-                        });
-                        if next_candidates.len() >= MAX_REFINEMENTS {
+                        if push_unique_candidate(
+                            &mut next_candidates,
+                            &mut seen_next_states,
+                            RefinedTask {
+                                steps,
+                                state: refined.state,
+                            },
+                        ) {
                             break;
                         }
                     }
@@ -961,6 +1645,7 @@ fn refine_network(
                 state,
                 options,
                 depth,
+                diagnostics,
                 visited,
                 applicability_cache,
                 budget,
@@ -980,6 +1665,7 @@ fn search_partial(
     state: &State,
     options: &RefinementOptions,
     depth: usize,
+    diagnostics: &mut RefinementDiagnostics,
     visited: &mut HashSet<(TaskNode, State)>,
     applicability_cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
@@ -987,6 +1673,7 @@ fn search_partial(
 ) -> Result<Vec<RefinedTask>> {
     let mut remaining = vec![true; tasks.len()];
     let mut results = Vec::new();
+    let mut seen_results = HashSet::new();
     search_partial_inner(
         domain,
         problem,
@@ -998,10 +1685,12 @@ fn search_partial(
         Vec::new(),
         options,
         depth,
+        diagnostics,
         visited,
         applicability_cache,
         budget,
         &mut results,
+        &mut seen_results,
         session,
     )?;
     Ok(cap(results))
@@ -1019,20 +1708,26 @@ fn search_partial_inner(
     steps: Vec<RefinementStep>,
     options: &RefinementOptions,
     depth: usize,
+    diagnostics: &mut RefinementDiagnostics,
     visited: &mut HashSet<(TaskNode, State)>,
     applicability_cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     results: &mut Vec<RefinedTask>,
+    seen_results: &mut HashSet<State>,
     session: &mut DecompositionSession<'_>,
 ) -> Result<()> {
     if results.len() >= MAX_REFINEMENTS || !budget.has_time() {
         return Ok(());
     }
     if !remaining.iter().any(|&present| present) {
-        results.push(RefinedTask {
-            steps,
-            state: Arc::clone(state),
-        });
+        push_unique_candidate(
+            results,
+            seen_results,
+            RefinedTask {
+                steps,
+                state: Arc::clone(state),
+            },
+        );
         return Ok(());
     }
 
@@ -1042,6 +1737,7 @@ fn search_partial_inner(
         })
         .collect();
     if ready.is_empty() {
+        diagnostics.partial_ready_empty += 1;
         return Ok(());
     }
     // The search context clones the task list, the remaining mask, the
@@ -1083,6 +1779,7 @@ fn search_partial_inner(
             options,
             depth,
             None,
+            diagnostics,
             visited,
             applicability_cache,
             budget,
@@ -1103,10 +1800,12 @@ fn search_partial_inner(
                 next_steps,
                 options,
                 depth,
+                diagnostics,
                 visited,
                 applicability_cache,
                 budget,
                 results,
+                seen_results,
                 session,
             )?;
             remaining[index] = true;
