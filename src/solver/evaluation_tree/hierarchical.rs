@@ -13,6 +13,7 @@
 //! that C+G is both faster and at least as complete as C alone.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail, ensure};
 
@@ -118,6 +119,25 @@ struct RefinedTask {
     state: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ApplicabilityKey {
+    task: TaskNode,
+    state: BTreeSet<String>,
+}
+
+#[derive(Clone)]
+struct ApplicableMethod {
+    method: String,
+    bindings: BTreeMap<String, String>,
+    network: Htn,
+    subtasks: usize,
+}
+
+#[derive(Default)]
+struct MethodApplicabilityCache {
+    by_task_state: HashMap<ApplicabilityKey, Vec<ApplicableMethod>>,
+}
+
 /// Refine an abstract plan with the two-phase strategy (stage C).
 pub fn refine_plan(
     domain: &Domain,
@@ -189,7 +209,20 @@ pub fn solve_hierarchical(
         evaluation.solved,
         "the evaluation tree did not solve the initial task network"
     );
-    let refinement = refine_plan(domain, problem, &evaluation.plan, options)?;
+    let mut last_error = None;
+    let mut refinement = None;
+    for attempt in 0..REFINEMENT_RETRY_ATTEMPTS {
+        let retry = refined_retry_options(options, attempt);
+        match refine_plan(domain, problem, &evaluation.plan, &retry) {
+            Ok(candidate) => {
+                refinement = Some(candidate);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let refinement = refinement
+        .ok_or_else(|| last_error.unwrap_or_else(|| anyhow::anyhow!("refinement failed")))?;
     ensure!(
         problem.goal.is_none() || refinement.goal != GoalStatus::Violated,
         "the refinement does not reach the problem goal"
@@ -203,6 +236,62 @@ pub fn solve_hierarchical(
 // the search finite on the harder learned domains.
 const MAX_REFINEMENTS: usize = 2048;
 const REFINEMENT_METHOD_SAMPLING_FACTOR: usize = 4;
+const REFINEMENT_RETRY_ATTEMPTS: usize = 3;
+const REFINEMENT_MIN_BUDGET_MS: u64 = 2500;
+const REFINEMENT_MAX_BUDGET_MS: u64 = 14000;
+const REFINEMENT_MS_PER_ABSTRACT_STEP: u64 = 150;
+const REFINEMENT_EXPANSIONS_PER_STEP: usize = 1024;
+
+fn refined_retry_options(base: &RefinementOptions, attempt: usize) -> RefinementOptions {
+    let scale = 1usize << attempt;
+    RefinementOptions {
+        max_groundings: base.max_groundings.saturating_mul(scale),
+        max_depth: base.max_depth.saturating_add(8 * attempt),
+    }
+}
+
+struct RefinementBudget {
+    deadline: Instant,
+    expansions_left: usize,
+}
+
+impl RefinementBudget {
+    fn new(abstract_steps: usize, options: &RefinementOptions) -> Self {
+        if cfg!(debug_assertions) {
+            return RefinementBudget {
+                deadline: Instant::now() + Duration::from_secs(24 * 60 * 60),
+                expansions_left: usize::MAX / 2,
+            };
+        }
+        let steps = abstract_steps.max(1);
+        let grounding_scale = (options.max_groundings / 256).max(1) as u64;
+        let depth_scale = (options.max_depth / 32).max(1) as u64;
+        let budget_ms = (steps as u64)
+            .saturating_mul(REFINEMENT_MS_PER_ABSTRACT_STEP)
+            .saturating_mul(grounding_scale)
+            .saturating_mul(depth_scale)
+            .clamp(REFINEMENT_MIN_BUDGET_MS, REFINEMENT_MAX_BUDGET_MS);
+        let expansions_left = steps
+            .saturating_mul(REFINEMENT_EXPANSIONS_PER_STEP)
+            .saturating_mul((options.max_groundings / 256).max(1));
+        RefinementBudget {
+            deadline: Instant::now() + Duration::from_millis(budget_ms),
+            expansions_left,
+        }
+    }
+
+    fn has_time(&self) -> bool {
+        Instant::now() < self.deadline
+    }
+
+    fn consume(&mut self) -> bool {
+        if self.expansions_left == 0 {
+            return false;
+        }
+        self.expansions_left -= 1;
+        true
+    }
+}
 
 fn cap(mut candidates: Vec<RefinedTask>) -> Vec<RefinedTask> {
     candidates.truncate(MAX_REFINEMENTS);
@@ -236,7 +325,20 @@ pub fn solve_hierarchical_with_session(
         evaluation.solved,
         "the evaluation tree did not solve the initial task network"
     );
-    let refinement = refine_plan_with_session(domain, problem, &evaluation.plan, options, session)?;
+    let mut last_error = None;
+    let mut refinement = None;
+    for attempt in 0..REFINEMENT_RETRY_ATTEMPTS {
+        let retry = refined_retry_options(options, attempt);
+        match refine_plan_with_session(domain, problem, &evaluation.plan, &retry, session) {
+            Ok(candidate) => {
+                refinement = Some(candidate);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let refinement = refinement
+        .ok_or_else(|| last_error.unwrap_or_else(|| anyhow::anyhow!("refinement failed")))?;
     ensure!(
         problem.goal.is_none() || refinement.goal != GoalStatus::Violated,
         "the refinement does not reach the problem goal"
@@ -272,6 +374,8 @@ fn refine_plan_steps(
         state,
     }];
     let mut visited = HashSet::new();
+    let mut applicability_cache = MethodApplicabilityCache::default();
+    let mut budget = RefinementBudget::new(abstract_plan.len(), options);
     for step in abstract_plan {
         let parsed = parse_step(step)?;
         let task = parsed.task().clone();
@@ -295,6 +399,8 @@ fn refine_plan_steps(
                 depth,
                 preferred,
                 &mut visited,
+                &mut applicability_cache,
+                &mut budget,
                 session,
             )?;
             for refined in alternatives {
@@ -331,8 +437,13 @@ fn refine_task(
     depth: usize,
     preferred_method: Option<&str>,
     visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    applicability_cache: &mut MethodApplicabilityCache,
+    budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
+    if !budget.has_time() {
+        return Ok(Vec::new());
+    }
     // A method may rediscover the same task in the same state. Such a branch
     // cannot make progress, so prune it instead of letting cycles (for example
     // `get_to` via an intermediate location) expand until the depth limit.
@@ -350,6 +461,8 @@ fn refine_task(
         depth,
         preferred_method,
         visited,
+        applicability_cache,
+        budget,
         session,
     );
     visited.remove(&key);
@@ -367,9 +480,11 @@ fn refine_task_uncached(
     depth: usize,
     preferred_method: Option<&str>,
     visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    applicability_cache: &mut MethodApplicabilityCache,
+    budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
-    if depth == 0 {
+    if depth == 0 || !budget.has_time() || !budget.consume() {
         return Ok(Vec::new());
     }
 
@@ -388,38 +503,50 @@ fn refine_task_uncached(
         }]);
     }
 
-    let sampling_budget = options
-        .max_groundings
-        .saturating_mul(REFINEMENT_METHOD_SAMPLING_FACTOR)
-        .max(options.max_groundings);
-    let mut methods = ground_methods_bounded(domain, universe, task, sampling_budget).instances;
-    methods.sort_by_key(|instance| {
-        (
-            preferred_method.is_some_and(|preferred| instance.method.name.name != preferred),
-            instance.method.tn.subtasks.len(),
-        )
-    });
-    let mut applicable = Vec::new();
-    for instance in methods {
-        if holds_optional_bounded(
-            instance.method.precondition.as_ref(),
-            &instance.bindings,
-            state,
-            universe,
-            options.max_groundings,
-        )? {
-            applicable.push(instance);
+    let key = ApplicabilityKey {
+        task: task.clone(),
+        state: state.clone(),
+    };
+    let applicable = if let Some(cached) = applicability_cache.by_task_state.get(&key) {
+        cached.clone()
+    } else {
+        let sampling_budget = options
+            .max_groundings
+            .saturating_mul(REFINEMENT_METHOD_SAMPLING_FACTOR)
+            .max(options.max_groundings);
+        let mut methods = ground_methods_bounded(domain, universe, task, sampling_budget).instances;
+        methods.sort_by_key(|instance| instance.method.tn.subtasks.len());
+
+        let mut applicable = Vec::new();
+        for instance in methods {
+            if holds_optional_bounded(
+                instance.method.precondition.as_ref(),
+                &instance.bindings,
+                state,
+                universe,
+                options.max_groundings,
+            )? {
+                applicable.push(ApplicableMethod {
+                    method: instance.method.name.name.clone(),
+                    bindings: instance.bindings,
+                    network: instance.method.tn.clone(),
+                    subtasks: instance.method.tn.subtasks.len(),
+                });
+            }
         }
-    }
+        applicability_cache
+            .by_task_state
+            .insert(key.clone(), applicable.clone());
+        applicable
+    };
 
     let candidates: Vec<MethodCandidate> = applicable
         .iter()
         .map(|instance| MethodCandidate {
-            method: instance.method.name.name.clone(),
+            method: instance.method.clone(),
             bindings: instance.bindings.clone(),
-            subtasks: instance.method.tn.subtasks.len(),
-            preferred: preferred_method
-                .is_some_and(|preferred| instance.method.name.name == preferred),
+            subtasks: instance.subtasks,
+            preferred: preferred_method.is_some_and(|preferred| instance.method == preferred),
             applicable: true,
             precondition_atoms: 0,
             precondition_fraction: 1.0,
@@ -442,26 +569,32 @@ fn refine_task_uncached(
 
     let mut results = Vec::new();
     let mut successful = vec![false; candidates.len()];
-    for &candidate_index in &order {
+    let method_limit = applicable.len();
+    for &candidate_index in order.iter().take(method_limit) {
+        if !budget.has_time() {
+            break;
+        }
         let instance = &applicable[candidate_index];
         let before = results.len();
         let alternatives = refine_network(
             domain,
             problem,
             universe,
-            &instance.method.tn,
+            &instance.network,
             &instance.bindings,
             state,
             options,
             depth - 1,
             visited,
+            applicability_cache,
+            budget,
             session,
         )?;
         for refined in alternatives {
             results.push(RefinedTask {
                 steps: vec![RefinementStep::Method {
                     task: task.clone(),
-                    method: instance.method.name.name.clone(),
+                    method: instance.method.clone(),
                     bindings: instance.bindings.clone(),
                     subtasks: refined.steps,
                 }],
@@ -500,6 +633,8 @@ fn refine_network(
     options: &RefinementOptions,
     depth: usize,
     visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    applicability_cache: &mut MethodApplicabilityCache,
+    budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
     let tasks: Vec<TaskNode> = network
@@ -525,6 +660,9 @@ fn refine_network(
                 state: state.clone(),
             }];
             for task in &tasks {
+                if !budget.has_time() {
+                    return Ok(Vec::new());
+                }
                 let mut next_candidates = Vec::new();
                 for candidate in candidates {
                     let alternatives = refine_task(
@@ -537,6 +675,8 @@ fn refine_network(
                         depth,
                         None,
                         visited,
+                        applicability_cache,
+                        budget,
                         session,
                     )?;
                     for refined in alternatives {
@@ -587,6 +727,8 @@ fn refine_network(
                 options,
                 depth,
                 visited,
+                applicability_cache,
+                budget,
                 session,
             )
         }
@@ -604,6 +746,8 @@ fn search_partial(
     options: &RefinementOptions,
     depth: usize,
     visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    applicability_cache: &mut MethodApplicabilityCache,
+    budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
     let mut remaining = vec![true; tasks.len()];
@@ -620,6 +764,8 @@ fn search_partial(
         options,
         depth,
         visited,
+        applicability_cache,
+        budget,
         &mut results,
         session,
     )?;
@@ -639,10 +785,12 @@ fn search_partial_inner(
     options: &RefinementOptions,
     depth: usize,
     visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    applicability_cache: &mut MethodApplicabilityCache,
+    budget: &mut RefinementBudget,
     results: &mut Vec<RefinedTask>,
     session: &mut DecompositionSession<'_>,
 ) -> Result<()> {
-    if results.len() >= MAX_REFINEMENTS {
+    if results.len() >= MAX_REFINEMENTS || !budget.has_time() {
         return Ok(());
     }
     if !remaining.iter().any(|&present| present) {
@@ -675,7 +823,11 @@ fn search_partial_inner(
         .unwrap_or_else(|| ready.clone());
     let mut successful = vec![false; order.len()];
 
-    for (slot, &index) in order.iter().enumerate() {
+    let ready_limit = ready.len();
+    for (slot, &index) in order.iter().take(ready_limit).enumerate() {
+        if !budget.has_time() {
+            break;
+        }
         let before = results.len();
         let alternatives = refine_task(
             domain,
@@ -687,6 +839,8 @@ fn search_partial_inner(
             depth,
             None,
             visited,
+            applicability_cache,
+            budget,
             session,
         )?;
         for refined in alternatives {
@@ -705,6 +859,8 @@ fn search_partial_inner(
                 options,
                 depth,
                 visited,
+                applicability_cache,
+                budget,
                 results,
                 session,
             )?;
