@@ -468,12 +468,25 @@ fn analyse(
     let consumers: Vec<Vec<Consumer>> =
         tasks.iter().map(|task| expansion.consumers(task)).collect();
 
+    // Every producer is paired with every other producer later; materialize its
+    // literals once here instead of cloning them inside the pair loop.
+    let producer_literals: Vec<Vec<Vec<ProducedLiteral>>> = producers
+        .iter()
+        .map(|producers| {
+            producers
+                .iter()
+                .map(|producer| producer.effects.literals(&initial))
+                .collect()
+        })
+        .collect();
+
     let mut gaps = Vec::new();
     for (before, after) in pairs {
-        for producer in &producers[before] {
-            for (atom, witness, produced_positive) in producer.effects.literals() {
+        for (producer, literals) in producers[before].iter().zip(&producer_literals[before]) {
+            for literal in literals {
+                let atom = &literal.atom;
                 for consumer in &consumers[after] {
-                    let Some(usage) = consumer.uses.get(&atom) else {
+                    let Some(usage) = consumer.uses.get(atom) else {
                         continue;
                     };
                     for required_positive in [true, false] {
@@ -489,18 +502,17 @@ fn analyse(
                             before_method: producer.method.clone(),
                             after_method: consumer.name.clone(),
                             consumer: consumer.kind,
-                            kind: if produced_positive == required_positive {
+                            kind: if literal.produced_positive == required_positive {
                                 GapKind::HiddenSatisfier
                             } else {
                                 GapKind::HiddenFalsifier
                             },
                             atom: atom.clone(),
-                            produced_positive,
+                            produced_positive: literal.produced_positive,
                             required_positive,
-                            witness: witness.clone(),
+                            witness: literal.witness.clone(),
                             required_everywhere: occurrences >= consumer.clauses,
-                            literal_initially_true: initial.contains(&atom.to_string())
-                                == required_positive,
+                            literal_initially_true: literal.initially_true == required_positive,
                             visible_producer: visible
                                 .get(&(atom.clone(), required_positive))
                                 .is_some_and(|writers| {
@@ -623,17 +635,36 @@ impl Effects {
         self.add.is_empty() && self.del.is_empty()
     }
 
-    fn literals(&self) -> Vec<(Atom, TaskNode, bool)> {
-        self.add
-            .iter()
-            .map(|(atom, witness)| (atom.clone(), witness.clone(), true))
-            .chain(
-                self.del
-                    .iter()
-                    .map(|(atom, witness)| (atom.clone(), witness.clone(), false)),
-            )
-            .collect()
+    fn literals(&self, initial: &BTreeSet<String>) -> Vec<ProducedLiteral> {
+        let mut literals = Vec::with_capacity(self.add.len() + self.del.len());
+        for (atom, witness) in &self.add {
+            literals.push(ProducedLiteral {
+                atom: atom.clone(),
+                witness: witness.clone(),
+                produced_positive: true,
+                initially_true: initial.contains(&atom.to_string()),
+            });
+        }
+        for (atom, witness) in &self.del {
+            literals.push(ProducedLiteral {
+                atom: atom.clone(),
+                witness: witness.clone(),
+                produced_positive: false,
+                initially_true: initial.contains(&atom.to_string()),
+            });
+        }
+        literals
     }
+}
+
+/// One may-write literal of a producer, with its witness and the static
+/// initial-state lookup hoisted out of the gap loop.
+#[derive(Debug, Clone)]
+struct ProducedLiteral {
+    atom: Atom,
+    witness: TaskNode,
+    produced_positive: bool,
+    initially_true: bool,
 }
 
 /// One grounded method instance of a top-level task and its may-write sets.

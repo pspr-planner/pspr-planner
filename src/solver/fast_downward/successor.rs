@@ -31,8 +31,17 @@ impl SuccessorGenerator {
     /// All operators whose preconditions hold in the extended state `state`.
     pub fn applicable(&self, state: &State) -> Vec<usize> {
         let mut result = Vec::new();
-        collect_applicable(&self.root, state, &mut result);
+        self.for_each_applicable(state, |operator| result.push(operator));
         result
+    }
+
+    /// Visit every operator whose preconditions hold in `state`.
+    ///
+    /// This is the allocation-free form of [`SuccessorGenerator::applicable`]:
+    /// callers that immediately apply the operators can push successors
+    /// directly instead of materializing an intermediate index vector.
+    pub fn for_each_applicable(&self, state: &State, mut visit: impl FnMut(usize)) {
+        collect_applicable(&self.root, state, &mut visit);
     }
 }
 
@@ -82,19 +91,23 @@ fn build_generator(task: &Task, operators: Vec<usize>, variables: &[usize]) -> G
     }
 }
 
-fn collect_applicable(node: &GeneratorNode, state: &State, result: &mut Vec<usize>) {
+fn collect_applicable(node: &GeneratorNode, state: &State, visit: &mut impl FnMut(usize)) {
     match node {
-        GeneratorNode::Generator(operators) => result.extend_from_slice(operators),
+        GeneratorNode::Generator(operators) => {
+            for &operator in operators {
+                visit(operator);
+            }
+        }
         GeneratorNode::Selector {
             variable,
             children,
             dont_care,
         } => {
             if let Some(child) = &children[state[*variable]] {
-                collect_applicable(child, state, result);
+                collect_applicable(child, state, visit);
             }
             if let Some(child) = dont_care {
-                collect_applicable(child, state, result);
+                collect_applicable(child, state, visit);
             }
         }
     }

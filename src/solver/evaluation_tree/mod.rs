@@ -105,7 +105,9 @@ pub use decomposition::{
     SearchPolicy, SearchTrace,
 };
 #[cfg(feature = "neural-base")]
-pub use decomposition::{DECOMPOSITION_HIDDEN, DecompositionModel, NeuralDecompositionModel};
+pub use decomposition::{
+    DECOMPOSITION_HIDDEN, DecompositionModel, GraphTensors, NeuralDecompositionModel,
+};
 pub use graph::{Atom, ConstraintNode, TaskConstraintGraph, TaskNode, build_task_constraint_graph};
 pub use hierarchical::{
     Refinement, RefinementOptions, RefinementStep, refine_plan, refine_plan_with_session,

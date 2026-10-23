@@ -51,6 +51,15 @@ order branches, not to prune them unsoundly.
 
 See [Design 2](02-frontier-gnn-policy-value.md).
 
+### 2.3 Abstract-plan permutation during refinement
+
+The current implementation guides method and frontier ordering inside
+refinement, but keeps the top-level abstract plan order fixed. A third design
+note proposes AI-guided permutation of the abstract plan when refinement fails
+or when a better abstract order could reduce search.
+
+See [Design 3](03-abstract-plan-permutation-controller.md).
+
 ## 3. Method-ranking longlist
 
 All scores are 1–5. “Integration” is inverted so 5 means the smallest change
@@ -257,8 +266,8 @@ trains the shared graph encoder with listwise cross-entropy:
 - `--task both`: both losses interleaved in one Adam step stream.
 
 ```bash
-cargo run --features neural-base --bin train_decomposition_model -- \
-  --task both \
+cargo run --release --features neural-gpu --bin train_decomposition_model -- \
+  --task both --jobs 16 \
   --domain ../hddl/test_data/ipc/Blocksworld-GTOHP/domain.hddl \
   --problem ../hddl/test_data/ipc/Blocksworld-GTOHP/p01.hddl \
   --problem ../hddl/test_data/ipc/Blocksworld-GTOHP/p02.hddl \
@@ -271,6 +280,14 @@ The trainer writes the Burn checkpoint and a `.json` sidecar recording the
 trained head(s), hidden width, and feature width. The sidecar is read at
 inference time, so a method-only checkpoint never enables the untrained
 policy head (and vice versa).
+
+Trace parsing/loading, evaluation, and refinement are independent per problem
+and run through Rayon. Each problem creates its own SCIP model; if a downstream
+SCIP build is not thread-safe, use `--jobs 1` or `RAYON_NUM_THREADS=1`. Graph
+construction is parallelized in bounded chunks. Use `--jobs N` to limit the
+worker pool; with `--jobs 0` Rayon uses its default or `RAYON_NUM_THREADS`. The
+GPU loop also prebuilds graph, index, and target tensors once per example
+instead of rebuilding them on every optimizer step.
 
 Policy examples require a genuinely unordered method network. Many IPC
 domains encode partial orderings as chains, so `--task policy` may report no
@@ -290,7 +307,7 @@ cargo run --features neural-base --bin train_decomposition_model -- \
 ```bash
 PSPR_METHOD_RANKER=target/decomposition-method.burnpack \
 PSPR_SEARCH_POLICY=target/decomposition-policy.burnpack \
-target/debug/pspr --hierarchical --max-groundings 4096 \
+target/debug/pspr --max-groundings 4096 \
   ../hddl/test_data/ipc/Blocksworld-GTOHP/domain.hddl \
   ../hddl/test_data/ipc/Blocksworld-GTOHP/p01.hddl
 ```

@@ -1,12 +1,15 @@
-//! The evaluation-scheduling ILP (constraints 1-4).
+//! Evaluation scheduling of the dendrogram (constraints 1-4).
+//!
+//! The scheduling problem is a feasibility problem, not an optimization one:
+//! every internal node occupies exactly one position and every position is
+//! taken, so the objective "sum of the evaluation positions" is
+//! `1 + 2 + ... + n` for *every* linear extension of the precedences. The
+//! minimum is therefore reached by any topological order, which is what this
+//! module computes.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, VecDeque};
 
 use anyhow::{Result, ensure};
-use good_lp::{
-    Constraint, Expression, ProblemVariables, Solution, SolverModel, Variable, default_solver,
-    variable,
-};
 
 use super::dendrogram::Dendrogram;
 use super::distance::EvaluationDag;
@@ -20,8 +23,11 @@ pub struct Schedule {
     pub positions: Vec<usize>,
 }
 
-/// Solve the scheduling ILP (1)-(4) for a dendrogram and additional DAG
-/// precedences, minimising the sum of the evaluation positions.
+/// Schedule the internal dendrogram nodes subject to the tree and DAG
+/// precedences.
+///
+/// Ties are broken towards the lowest node id, which keeps the schedule
+/// deterministic.
 pub fn optimal_schedule(dendrogram: &Dendrogram, dag: &EvaluationDag) -> Result<Schedule> {
     let n = dendrogram.internal_count();
     let mut precedences: BTreeSet<(usize, usize)> =
@@ -48,74 +54,37 @@ pub fn optimal_schedule(dendrogram: &Dendrogram, dag: &EvaluationDag) -> Result<
         });
     }
 
-    let mut variables = ProblemVariables::new();
-    let mut x: Vec<Vec<Variable>> = Vec::with_capacity(n);
-    for _ in 0..n {
-        x.push((0..n).map(|_| variables.add(variable().binary())).collect());
-    }
-    let position = |variable_row: &[Variable]| -> Expression {
-        variable_row
-            .iter()
-            .enumerate()
-            .map(|(time, &variable)| (time + 1) as f64 * variable)
-            .sum()
-    };
-
-    let mut constraints: Vec<Constraint> = Vec::new();
-    // (1) Every internal node is evaluated exactly once.
-    for row in &x {
-        constraints.push(
-            row.iter()
-                .map(|&variable| Expression::from_other_affine(variable))
-                .sum::<Expression>()
-                .eq(1.0),
-        );
-    }
-    // (2) Exactly one evaluation operation per time step.
-    for time in 0..n {
-        constraints.push(
-            x.iter()
-                .map(|row| Expression::from_other_affine(row[time]))
-                .sum::<Expression>()
-                .eq(1.0),
-        );
-    }
-    // (3) and (4) Precedences from the tree and the DAG.
+    let mut indegree = vec![0usize; n];
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
     for &(before, after) in &precedences {
-        constraints.push((position(&x[before]) - position(&x[after])).leq(-1.0));
+        successors[before].push(after);
+        indegree[after] += 1;
     }
+    // A min-heap over the ready nodes yields the smallest available id first.
+    let mut ready: BinaryHeap<std::cmp::Reverse<usize>> = (0..n)
+        .filter(|&node| indegree[node] == 0)
+        .map(std::cmp::Reverse)
+        .collect();
 
-    let objective: Expression = x.iter().map(|row| position(row)).sum();
-    let mut model = variables.minimise(objective).using(default_solver);
-    for constraint in constraints {
-        model.add_constraint(constraint);
-    }
-    let solution = model
-        .solve()
-        .map_err(|error| anyhow::anyhow!("the scheduling ILP failed: {error}"))?;
-
-    let mut positions = vec![0usize; n];
-    for (node, row) in x.iter().enumerate() {
-        let mut position = 0usize;
-        for (time, &variable) in row.iter().enumerate() {
-            if solution.value(variable) > 0.5 {
-                position = time + 1;
+    let mut order = Vec::with_capacity(n);
+    while let Some(std::cmp::Reverse(node)) = ready.pop() {
+        order.push(node);
+        for &successor in &successors[node] {
+            indegree[successor] -= 1;
+            if indegree[successor] == 0 {
+                ready.push(std::cmp::Reverse(successor));
             }
         }
-        ensure!(
-            position != 0,
-            "the solver did not schedule internal node {node}"
-        );
-        positions[node] = position;
     }
-    for &(before, after) in &precedences {
-        ensure!(
-            positions[before] < positions[after],
-            "the solver violated the precedence ({before}, {after})"
-        );
+    ensure!(
+        order.len() == n,
+        "the precedence constraints contain a cycle"
+    );
+
+    let mut positions = vec![0usize; n];
+    for (index, &node) in order.iter().enumerate() {
+        positions[node] = index + 1;
     }
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by_key(|&node| (positions[node], node));
     Ok(Schedule { order, positions })
 }
 

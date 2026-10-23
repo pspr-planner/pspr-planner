@@ -268,6 +268,35 @@ pub(super) fn ground_atom(predicate: &Predicate, bindings: &BTreeMap<String, Str
     )
 }
 
+/// Format the ground atom of `predicate` into `out`, reusing its capacity.
+///
+/// This is the allocation-free counterpart of `ground_atom(..).to_string()`,
+/// which the state-membership and effect loops call once per literal.
+pub(super) fn atom_key_into(
+    predicate: &Predicate,
+    bindings: &BTreeMap<String, String>,
+    out: &mut String,
+) {
+    out.clear();
+    out.push_str(&predicate.name);
+    if predicate.variables.is_empty() {
+        return;
+    }
+    out.push('(');
+    for (index, symbol) in predicate.variables.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(
+            bindings
+                .get(&symbol.name)
+                .map(String::as_str)
+                .unwrap_or(&symbol.name),
+        );
+    }
+    out.push(')');
+}
+
 /// Ground the free parameters of the initial task network over the constants
 /// and objects of the problem.
 fn ground_task_network(

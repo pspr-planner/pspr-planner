@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 #
-# Compare PSPR's compound-task techniques with pandaPI.
-#
-# Modes:
-#   abstract              PSPR's historical top-level projection
-#   summary               primitive method summaries (G)
-#   hierarchical          two-phase refinement with primitive summaries (C+G)
+# Compare PSPR's hierarchical refinement (C+G) with pandaPI.
 #
 # pandaPI solves the full HTN problem and is the reference for complete plans.
 #
@@ -15,7 +10,7 @@
 #   scripts/compare_decomposition.sh
 #
 # The script writes target/decomposition-comparison/results.csv and prints a
-# per-instance status table plus a per-technique summary.
+# per-instance status table plus a compact summary.
 
 set -uo pipefail
 
@@ -34,7 +29,6 @@ PSPR_TIMEOUT=${PSPR_TIMEOUT:-30}
 PSPR_REPEATS=${PSPR_REPEATS:-3}
 PSPR_MAX_GROUNDINGS=${PSPR_MAX_GROUNDINGS:-4096}
 OUT_DIR=${OUT_DIR:-$repo_root/target/decomposition-comparison}
-PSPR_MODES=${PSPR_MODES:-"abstract summary hierarchical"}
 
 lock=$OUT_DIR/.lock
 mkdir -p "$OUT_DIR"
@@ -119,8 +113,8 @@ field() {
     sed -n "s/.*\b${key}=\([^ ]*\).*/\1/p" <<<"$line"
 }
 
-printf '| Domain | Problem | Abstract | G | C+G | PANDA |\n'
-printf '| --- | --- | --- | --- | --- | --- |\n'
+printf '| Domain | Problem | PSPR (C+G) | PANDA |\n'
+printf '| --- | --- | --- | --- |\n'
 
 for case in "${CASES[@]}"; do
     domain=${case%%|*}
@@ -174,50 +168,47 @@ for case in "${CASES[@]}"; do
         panda_status=parse-error
     fi
 
-    # ---------- PSPR modes ----------
-    for mode in $PSPR_MODES; do
-        status=timeout
-        goal=-
-        actions=0
-        methods=0
-        abstract_steps=0
-        tasks=0
-        times=()
-        for ((i = 0; i < PSPR_REPEATS; i++)); do
-            log="$raw/$tag.$mode.$i.log"
-            start=$(now_ms)
-            timeout "$PSPR_TIMEOUT" "$PSPR_BIN" "$mode" "$domain_file" "$problem_file" >"$log" 2>&1
-            stop=$(now_ms)
-            times+=($((stop - start)))
-            line=$(grep -a 'mode=' "$log" | tail -1)
-            if [[ -n $line ]]; then
-                status=$(field solved "$line")
-                goal=$(field goal "$line")
-                actions=$(field actions "$line")
-                methods=$(field methods "$line")
-                abstract_steps=$(field abstract_steps "$line")
-                tasks=$(field tasks "$line")
-            fi
-            if [[ $status == timeout ]]; then
-                break
-            fi
-        done
-        ms=$(printf '%s\n' "${times[@]}" | median)
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-            "$domain" "$problem" "$mode" "$status" "$goal" "$actions" "$methods" \
-            "$abstract_steps" "$tasks" "$ms" "$panda_status" "$panda_actions" \
-            "$parse_ms" "$ground_ms" "$search_ms" "$total_ms" >>"$csv"
+    # ---------- PSPR hierarchical ----------
+    mode=hierarchical
+    status=timeout
+    goal=-
+    actions=0
+    methods=0
+    abstract_steps=0
+    tasks=0
+    times=()
+    for ((i = 0; i < PSPR_REPEATS; i++)); do
+        log="$raw/$tag.$mode.$i.log"
+        start=$(now_ms)
+        timeout "$PSPR_TIMEOUT" "$PSPR_BIN" "$domain_file" "$problem_file" >"$log" 2>&1
+        stop=$(now_ms)
+        times+=($((stop - start)))
+        line=$(grep -a 'mode=' "$log" | tail -1)
+        if [[ -n $line ]]; then
+            status=$(field solved "$line")
+            goal=$(field goal "$line")
+            actions=$(field actions "$line")
+            methods=$(field methods "$line")
+            abstract_steps=$(field abstract_steps "$line")
+            tasks=$(field tasks "$line")
+        fi
+        if [[ $status == timeout ]]; then
+            break
+        fi
     done
+    ms=$(printf '%s\n' "${times[@]}" | median)
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$domain" "$problem" "$mode" "$status" "$goal" "$actions" "$methods" \
+        "$abstract_steps" "$tasks" "$ms" "$panda_status" "$panda_actions" \
+        "$parse_ms" "$ground_ms" "$search_ms" "$total_ms" >>"$csv"
 
     # ---------- compact Markdown row ----------
     row="| $domain | $problem"
-    for mode in abstract summary hierarchical; do
-        line=$(awk -F, -v d="$domain" -v p="$problem" -v m="$mode" \
-            'NR > 1 && $1 == d && $2 == p && $3 == m { print; exit }' "$csv")
-        if [[ -z $line ]]; then
-            row+=" | -"
-            continue
-        fi
+    line=$(awk -F, -v d="$domain" -v p="$problem" \
+        'NR > 1 && $1 == d && $2 == p && $3 == "hierarchical" { print; exit }' "$csv")
+    if [[ -z $line ]]; then
+        row+=" | -"
+    else
         IFS=, read -r _ _ _ status goal actions _ _ _ _ _ <<<"$line"
         if [[ $status == true ]]; then
             if [[ $goal == violated ]]; then
@@ -228,7 +219,7 @@ for case in "${CASES[@]}"; do
         else
             row+=" | F"
         fi
-    done
+    fi
     if [[ $panda_status == solved ]]; then
         row+=" | S($panda_actions)"
     elif [[ $panda_status == timeout ]]; then
@@ -240,7 +231,7 @@ for case in "${CASES[@]}"; do
     echo "$row"
 done
 
-printf '\nS = solved and (for PSPR) goal satisfied or absent; V = task-network solved but goal violated; F = failed; T = timeout. Actions are network steps for Abstract/G and primitive actions for C+G/PANDA.\n'
+printf '\nS = solved and goal satisfied or absent; V = solved but goal violated; F = failed; T = timeout. Actions are primitive actions for PSPR/PANDA.\n'
 
 # ---------- summary ----------
 python3 - "$csv" <<'PY'
@@ -249,29 +240,18 @@ import statistics
 import sys
 
 rows = list(csv.DictReader(open(sys.argv[1])))
-modes = [
-    ("abstract", "Abstract"),
-    ("summary", "G"),
-    ("hierarchical", "C+G"),
-]
 print()
-print("| Technique | Solved | Goal satisfied/absent | Full HTN plans | Median ms | Mean ms |")
+print("| Technique | Solved | Goal satisfied/absent | Median ms | Mean ms |")
 print("| --- | ---: | ---: | ---: | ---: | ---: |")
-for key, label in modes:
-    selected = [row for row in rows if row["mode"] == key]
-    solved = sum(row["pspr_status"] == "true" for row in selected)
-    goal = sum(row["pspr_goal"] in ("satisfied", "absent") for row in selected)
-    full = sum(
-        row["pspr_status"] == "true" and row["pspr_goal"] in ("satisfied", "absent")
-        for row in selected
-    ) if key == "hierarchical" else 0
-    times = [int(row["pspr_ms"]) for row in selected]
-    print(
-        f"| {label} | {solved}/{len(selected)} | {goal}/{len(selected)} | "
-        f"{full}/{len(selected)} | {statistics.median(times):.0f} | "
-        f"{statistics.mean(times):.0f} |"
-    )
-panda = [row for row in rows if row["mode"] == "abstract"]
+selected = [row for row in rows if row["mode"] == "hierarchical"]
+solved = sum(row["pspr_status"] == "true" for row in selected)
+goal = sum(row["pspr_goal"] in ("satisfied", "absent") for row in selected)
+times = [int(row["pspr_ms"]) for row in selected]
+print(
+    f"| C+G | {solved}/{len(selected)} | {goal}/{len(selected)} | "
+    f"{statistics.median(times):.0f} | {statistics.mean(times):.0f} |"
+)
+panda = rows
 print()
 print("PANDA reference (one run per instance):")
 print("| Status | Count |")

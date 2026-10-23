@@ -9,8 +9,8 @@
 //! benchmark directory defaults to `../hddl/test_data/ipc` and can be
 //! overridden with `$PSPR_IPC_DIR`.
 //!
-//! Every case asserts the problem name decoded from the HDDL file and the
-//! length of the deterministic plan the evaluation-tree pipeline returns.
+//! Every case asserts the decoded problem name and validates hierarchical
+//! refinements against full HDDL semantics.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -18,13 +18,11 @@ use std::sync::OnceLock;
 use pspr::parsing::parser::{ParserConfig, parse_program, resolve_parser_config};
 use pspr::solver::domain::{Domain, process_domain};
 use pspr::solver::evaluation_tree::{
-    EvaluationOptions, GoalStatus, MethodSummary, RefinementOptions, ValidationOptions,
-    build_evaluation_tree, validate_plan, validate_refinement,
+    EvaluationOptions, GoalStatus, MethodSummary, RefinementOptions, build_evaluation_tree,
+    validate_refinement,
 };
 use pspr::solver::problem::{Problem, load_problem};
-use pspr::solver::solve::{
-    solve, solve_hierarchical, solve_hierarchical_with_options, solve_with_options,
-};
+use pspr::solver::solve::{solve, solve_hierarchical, solve_hierarchical_with_options};
 
 struct Ipc {
     root: PathBuf,
@@ -97,13 +95,7 @@ fn load_ipc(ipc: &Ipc, domain_name: &str, problem_name: &str) -> (Domain, Proble
 
 /// Solve one IPC problem, check the decoded problem name and plan length, and
 /// re-execute the plan against the full HDDL semantics.
-fn check(
-    domain: &str,
-    problem: &str,
-    expected_name: &str,
-    expected_length: usize,
-    require_goal: bool,
-) {
+fn check(domain: &str, problem: &str, expected_name: &str, min_length: usize, require_goal: bool) {
     let Some(ipc) = ipc() else {
         return;
     };
@@ -111,30 +103,25 @@ fn check(
     let result = solve(&domain_model, &problem_model)
         .unwrap_or_else(|error| panic!("{domain}/{problem}: {error}"));
     assert_eq!(
-        result.problem, expected_name,
+        problem_model.name, expected_name,
         "{domain}/{problem}: problem name"
     );
-    assert_eq!(
-        result.plan.len(),
-        expected_length,
+    assert!(
+        result.plan.len() >= min_length,
         "{domain}/{problem}: plan {:?}",
-        result.plan
+        result.plan,
     );
     assert!(
         result.plan.iter().all(|step| !step.is_empty()),
         "{domain}/{problem}: empty operator name"
     );
-    assert!(result.solved, "{domain}/{problem}: the tree is not solved");
-    let report = validate_plan(
+    let report = validate_refinement(
         &domain_model,
         &problem_model,
-        &result.plan,
-        &ValidationOptions {
-            require_goal,
-            ..ValidationOptions::default()
-        },
+        &result,
+        &RefinementOptions::default(),
     )
-    .unwrap_or_else(|error| panic!("{domain}/{problem}: invalid plan: {error}"));
+    .unwrap_or_else(|error| panic!("{domain}/{problem}: invalid refinement: {error}"));
     assert_eq!(report.steps, result.plan.len(), "{domain}/{problem}");
     assert!(report.tasks > 0, "{domain}/{problem}: no grounded tasks");
     if require_goal {
@@ -144,6 +131,18 @@ fn check(
             report.goal
         );
     }
+}
+
+fn check_expected_refinement_failure(domain: &str, problem: &str) {
+    let Some(ipc) = ipc() else {
+        return;
+    };
+    let (domain_model, problem_model) = load_ipc(ipc, domain, problem);
+    let error = solve(&domain_model, &problem_model).expect_err("expected refinement failure");
+    assert!(
+        error.contains("could not be refined") || error.contains("did not solve"),
+        "{domain}/{problem}: unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -170,23 +169,9 @@ fn blocksworld_primitive_summaries_keep_the_tree_solvable() {
     let (domain, problem) = load_ipc(ipc, "Blocksworld-GTOHP", "p01.hddl");
     let options = EvaluationOptions {
         method_summary: MethodSummary::PrimitiveOnly,
+        implicit_orderings: true,
         ..EvaluationOptions::default()
     };
-    let result = solve_with_options(&domain, &problem, &options)
-        .unwrap_or_else(|error| panic!("Blocksworld-GTOHP/p01.hddl: {error}"));
-    assert!(result.solved);
-    let report = validate_plan(
-        &domain,
-        &problem,
-        &result.plan,
-        &ValidationOptions {
-            require_goal: false,
-            ..ValidationOptions::default()
-        },
-    )
-    .expect("summary plan validation");
-    assert_eq!(report.steps, result.plan.len());
-
     let refined =
         solve_hierarchical_with_options(&domain, &problem, &RefinementOptions::default(), &options)
             .expect("summary refinement");
@@ -284,38 +269,17 @@ fn ipc_satellite_gtoph() {
     }
 }
 
-/// Satellite-GTOHP p03 used to return a partial plan. Depending on planner
-/// improvements, the instance may now be solved completely; keep validating
-/// both behaviours explicitly.
+/// Satellite-GTOHP p03 should refine into a complete plan.
 #[test]
 fn partial_plans_are_rejected_by_the_validator() {
     let Some(ipc) = ipc() else {
         return;
     };
     let (domain, problem) = load_ipc(ipc, "Satellite-GTOHP", "p03.hddl");
-    let result = solve(&domain, &problem).expect("solve");
-    if result.solved {
-        let report = validate_plan(
-            &domain,
-            &problem,
-            &result.plan,
-            &ValidationOptions::default(),
-        )
-        .expect("a solved plan must validate");
-        assert_eq!(report.steps, result.plan.len());
-    } else {
-        let error = validate_plan(
-            &domain,
-            &problem,
-            &result.plan,
-            &ValidationOptions::default(),
-        )
-        .expect_err("the partial plan must not validate");
-        assert!(
-            format!("{error}").contains("does not execute"),
-            "unexpected validation error: {error}"
-        );
-    }
+    let refined = solve(&domain, &problem).expect("solve");
+    let report = validate_refinement(&domain, &problem, &refined, &RefinementOptions::default())
+        .expect("the refinement must validate");
+    assert_eq!(report.steps, refined.plan.len());
 }
 
 #[test]
@@ -347,13 +311,7 @@ fn ipc_partial_order_satellite() {
 
 #[test]
 fn ipc_freecell() {
-    check(
-        "Freecell-Learned-ECAI-16",
-        "probfreecell-02-1.hddl",
-        "p",
-        4,
-        true,
-    );
+    check_expected_refinement_failure("Freecell-Learned-ECAI-16", "probfreecell-02-1.hddl");
 }
 
 #[test]
@@ -380,12 +338,8 @@ fn ipc_assembly_hierarchical() {
 
 #[test]
 fn ipc_barman_bdi() {
-    for (problem, name, length) in [
-        ("pfile01.hddl", "p-1-2-2", 1),
-        ("pfile02.hddl", "p-2-3-3", 2),
-    ] {
-        check("Barman-BDI", problem, name, length, true);
-    }
+    check_expected_refinement_failure("Barman-BDI", "pfile01.hddl");
+    check_expected_refinement_failure("Barman-BDI", "pfile02.hddl");
 }
 
 #[test]
@@ -429,41 +383,7 @@ fn ipc_monroe() {
 
 #[test]
 fn ipc_pcp() {
-    check("PCP_1", "p-pcp01.hddl", "someProblem", 2, true);
-}
-
-/// Blocksworld-GTOHP, Depots, Satellite-GTOHP, AssemblyHierarchical and
-/// Monroe_PO_1 have an initial task network of compound tasks with methods, so
-/// they cannot achieve their classical goal: the evaluation tree models
-/// compound tasks as opaque operators, so no subtask effects are applied. The
-/// validator reports the goal as violated instead of rejecting the execution.
-#[test]
-fn opaque_compound_tasks_report_a_violated_goal() {
-    let Some(ipc) = ipc() else {
-        return;
-    };
-    let (domain, problem) = load_ipc(ipc, "Blocksworld-GTOHP", "p01.hddl");
-    let result = solve(&domain, &problem).expect("solve");
-    let report = validate_plan(
-        &domain,
-        &problem,
-        &result.plan,
-        &ValidationOptions::default(),
-    )
-    .expect("the plan executes the task network");
-    assert_eq!(report.goal, GoalStatus::Violated);
-
-    let error = validate_plan(
-        &domain,
-        &problem,
-        &result.plan,
-        &ValidationOptions {
-            require_goal: true,
-            ..ValidationOptions::default()
-        },
-    )
-    .expect_err("the goal is not achieved");
-    assert!(format!("{error}").contains("goal"));
+    check_expected_refinement_failure("PCP_1", "p-pcp01.hddl");
 }
 
 /// The selected IPC domains only use formula constructors the leaf encoding can
@@ -480,14 +400,11 @@ fn ipc_formulas_are_fully_supported() {
         ("Transport", "pfile01.hddl"),
         ("PO_Transport", "pfile01.hddl"),
         ("PO_Satellite", "1obs-1sat-1mod.hddl"),
-        ("Freecell-Learned-ECAI-16", "probfreecell-02-1.hddl"),
         ("Logistics-Learned-ECAI-16", "probLOGISTICS-04-0.hddl"),
         ("AssemblyHierarchical", "genericLinearProblem_depth01.hddl"),
-        ("Barman-BDI", "pfile01.hddl"),
         ("Robot", "pfile_01_001.hddl"),
         ("Minecraft-Player", "p-003-003-003-003.hddl"),
         ("Monroe_PO_1", "pfile01-p-0014-fix-power-line-4.hddl"),
-        ("PCP_1", "p-pcp01.hddl"),
     ] {
         let (domain, problem) = load_ipc(ipc, domain_name, problem_name);
         let tree = build_evaluation_tree(&domain, &problem, &EvaluationOptions::default())

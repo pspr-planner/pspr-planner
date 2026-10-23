@@ -36,7 +36,7 @@ for domain, problem in cases:
         start = time.perf_counter()
         try:
             result = subprocess.run(
-                [str(bench), "hierarchical", str(domain_file), str(problem_file)],
+                [str(bench), str(domain_file), str(problem_file)],
                 capture_output=True,
                 text=True,
                 timeout=timeout,

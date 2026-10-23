@@ -13,11 +13,12 @@
 //! that C+G is both faster and at least as complete as C alone.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail, ensure};
 
-use crate::parsing::json::{Constraint, Htn, Subtask, TaskOrdering};
+use crate::parsing::json::{Constraint, Formula, Htn, Subtask, TaskOrdering};
 use crate::solver::domain::Domain;
 use crate::solver::problem::Problem;
 
@@ -113,29 +114,124 @@ impl Refinement {
     }
 }
 
+/// A solver state shared by every refinement branch that starts from it.
+///
+/// `apply_action` produces a fresh `BTreeSet`; wrapping it in an `Arc` makes
+/// the many copies taken for visited-set keys, applicability-cache keys and
+/// refined candidates cheap reference-count bumps instead of deep tree clones.
+type State = Arc<BTreeSet<String>>;
+
 #[derive(Clone)]
 struct RefinedTask {
     steps: Vec<RefinementStep>,
-    state: BTreeSet<String>,
+    state: State,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ApplicabilityKey {
     task: TaskNode,
-    state: BTreeSet<String>,
+    state: State,
 }
 
+/// One method instance that can decompose a task, prepared once per task.
+///
+/// Grounding and subtask grounding depend only on the task, not on the solver
+/// state, so they are cached per task and reused across the states the
+/// refinement explores. Only the precondition check is state-dependent.
 #[derive(Clone)]
-struct ApplicableMethod {
+struct GroundedInstance {
     method: String,
+    precondition: Option<Formula>,
     bindings: BTreeMap<String, String>,
-    network: Htn,
+    network: Arc<Htn>,
+    tasks: Arc<[TaskNode]>,
+    ids: Arc<[String]>,
     subtasks: usize,
 }
 
+/// Caches groundings per task and applicable instances per `(task, state)`.
 #[derive(Default)]
 struct MethodApplicabilityCache {
-    by_task_state: HashMap<ApplicabilityKey, Vec<ApplicableMethod>>,
+    grounded: HashMap<TaskNode, Arc<[GroundedInstance]>>,
+    applicable: HashMap<ApplicabilityKey, Arc<[u32]>>,
+}
+
+impl MethodApplicabilityCache {
+    #[allow(clippy::type_complexity)]
+    fn lookup(
+        &mut self,
+        domain: &Domain,
+        universe: &Universe<'_>,
+        task: &TaskNode,
+        state: &State,
+        max_groundings: usize,
+    ) -> Result<(Arc<[GroundedInstance]>, Arc<[u32]>)> {
+        let instances = match self.grounded.get(task) {
+            Some(instances) => Arc::clone(instances),
+            None => {
+                let sampling_budget = max_groundings
+                    .saturating_mul(REFINEMENT_METHOD_SAMPLING_FACTOR)
+                    .max(max_groundings);
+                let methods =
+                    ground_methods_bounded(domain, universe, task, sampling_budget).instances;
+                let instances: Vec<GroundedInstance> = methods
+                    .into_iter()
+                    .map(|instance| {
+                        let tasks: Vec<TaskNode> = instance
+                            .method
+                            .tn
+                            .subtasks
+                            .iter()
+                            .map(|subtask| ground_subtask(subtask, &instance.bindings))
+                            .collect();
+                        let ids: Vec<String> = instance
+                            .method
+                            .tn
+                            .subtasks
+                            .iter()
+                            .enumerate()
+                            .map(|(index, subtask)| subtask_id(subtask, index))
+                            .collect();
+                        GroundedInstance {
+                            subtasks: tasks.len(),
+                            method: instance.method.name.name.clone(),
+                            precondition: instance.method.precondition.clone(),
+                            bindings: instance.bindings,
+                            network: Arc::new(instance.method.tn.clone()),
+                            tasks: tasks.into(),
+                            ids: ids.into(),
+                        }
+                    })
+                    .collect();
+                let instances: Arc<[GroundedInstance]> = instances.into();
+                self.grounded.insert(task.clone(), Arc::clone(&instances));
+                instances
+            }
+        };
+
+        let key = ApplicabilityKey {
+            task: task.clone(),
+            state: Arc::clone(state),
+        };
+        if let Some(applicable) = self.applicable.get(&key) {
+            return Ok((instances, Arc::clone(applicable)));
+        }
+        let mut applicable = Vec::new();
+        for (index, instance) in instances.iter().enumerate() {
+            if holds_optional_bounded(
+                instance.precondition.as_ref(),
+                &instance.bindings,
+                state.as_ref(),
+                universe,
+                max_groundings,
+            )? {
+                applicable.push(index as u32);
+            }
+        }
+        let applicable: Arc<[u32]> = applicable.into();
+        self.applicable.insert(key, Arc::clone(&applicable));
+        Ok((instances, applicable))
+    }
 }
 
 /// Refine an abstract plan with the two-phase strategy (stage C).
@@ -159,7 +255,7 @@ pub fn refine_plan_with_session(
     session: &mut DecompositionSession<'_>,
 ) -> Result<Refinement> {
     let universe = Universe::new(domain, problem);
-    let state = initial_atoms(problem);
+    let state: State = Arc::new(initial_atoms(problem));
     let candidates = refine_plan_steps(
         domain,
         problem,
@@ -176,16 +272,17 @@ pub fn refine_plan_with_session(
 
     let mut fallback = None;
     for refined in candidates {
+        let RefinedTask { steps, state } = refined;
         let mut plan = Vec::new();
-        for step in &refined.steps {
+        for step in &steps {
             step.collect_actions(&mut plan);
         }
-        let goal = goal_status(domain, problem, &refined.state, options.max_groundings)?;
+        let goal = goal_status(problem, &universe, state.as_ref(), options.max_groundings)?;
         let refinement = Refinement {
             abstract_plan: abstract_plan.to_vec(),
             plan,
-            steps: refined.steps,
-            final_state: refined.state,
+            steps,
+            final_state: (*state).clone(),
             goal,
         };
         if goal != GoalStatus::Violated {
@@ -364,7 +461,7 @@ fn refine_plan_steps(
     problem: &Problem,
     universe: &Universe<'_>,
     abstract_plan: &[String],
-    state: BTreeSet<String>,
+    state: State,
     options: &RefinementOptions,
     depth: usize,
     session: &mut DecompositionSession<'_>,
@@ -432,11 +529,11 @@ fn refine_task(
     problem: &Problem,
     universe: &Universe<'_>,
     task: &TaskNode,
-    state: &BTreeSet<String>,
+    state: &State,
     options: &RefinementOptions,
     depth: usize,
     preferred_method: Option<&str>,
-    visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    visited: &mut HashSet<(TaskNode, State)>,
     applicability_cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
@@ -447,7 +544,8 @@ fn refine_task(
     // A method may rediscover the same task in the same state. Such a branch
     // cannot make progress, so prune it instead of letting cycles (for example
     // `get_to` via an intermediate location) expand until the depth limit.
-    let key = (task.clone(), state.clone());
+    // The state is reference-counted, so the visited key does not copy it.
+    let key = (task.clone(), Arc::clone(state));
     if !visited.insert(key.clone()) {
         return Ok(Vec::new());
     }
@@ -475,11 +573,11 @@ fn refine_task_uncached(
     problem: &Problem,
     universe: &Universe<'_>,
     task: &TaskNode,
-    state: &BTreeSet<String>,
+    state: &State,
     options: &RefinementOptions,
     depth: usize,
     preferred_method: Option<&str>,
-    visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    visited: &mut HashSet<(TaskNode, State)>,
     applicability_cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
@@ -492,96 +590,87 @@ fn refine_task_uncached(
     // domains use the same symbol for a task and an action; the method branch
     // below remains available if the action is not applicable.
     if domain.actions_for(&task.name).next().is_some()
-        && let Ok(next) = apply_action(domain, task, state, universe, options.max_groundings)
+        && let Ok(next) = apply_action(
+            domain,
+            task,
+            state.as_ref(),
+            universe,
+            options.max_groundings,
+        )
     {
         return Ok(vec![RefinedTask {
             steps: vec![RefinementStep::Action {
                 task: task.clone(),
                 step: task.to_string(),
             }],
-            state: next,
+            state: Arc::new(next),
         }]);
     }
 
-    let key = ApplicabilityKey {
-        task: task.clone(),
-        state: state.clone(),
-    };
-    let applicable = if let Some(cached) = applicability_cache.by_task_state.get(&key) {
-        cached.clone()
-    } else {
-        let sampling_budget = options
-            .max_groundings
-            .saturating_mul(REFINEMENT_METHOD_SAMPLING_FACTOR)
-            .max(options.max_groundings);
-        let mut methods = ground_methods_bounded(domain, universe, task, sampling_budget).instances;
-        methods.sort_by_key(|instance| instance.method.tn.subtasks.len());
+    let (instances, applicable) =
+        applicability_cache.lookup(domain, universe, task, state, options.max_groundings)?;
 
-        let mut applicable = Vec::new();
-        for instance in methods {
-            if holds_optional_bounded(
-                instance.method.precondition.as_ref(),
-                &instance.bindings,
-                state,
-                universe,
-                options.max_groundings,
-            )? {
-                applicable.push(ApplicableMethod {
-                    method: instance.method.name.name.clone(),
-                    bindings: instance.bindings,
-                    network: instance.method.tn.clone(),
-                    subtasks: instance.method.tn.subtasks.len(),
-                });
-            }
-        }
-        applicability_cache
-            .by_task_state
-            .insert(key.clone(), applicable.clone());
+    // Ranking candidates clone method names and bindings and clone the state.
+    // The symbolic default path never needs them, so build them only when a
+    // ranker or a trace sink is attached.
+    let tracing = session.trace.is_some();
+    let ranked = session.method_ranker.is_some() || tracing;
+    let candidates: Vec<MethodCandidate> = if ranked {
         applicable
+            .iter()
+            .map(|&index| {
+                let instance = &instances[index as usize];
+                MethodCandidate {
+                    method: instance.method.clone(),
+                    bindings: instance.bindings.clone(),
+                    subtasks: instance.subtasks,
+                    preferred: preferred_method
+                        .is_some_and(|preferred| instance.method == preferred),
+                    applicable: true,
+                    precondition_atoms: 0,
+                    precondition_fraction: 1.0,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
     };
-
-    let candidates: Vec<MethodCandidate> = applicable
-        .iter()
-        .map(|instance| MethodCandidate {
-            method: instance.method.clone(),
-            bindings: instance.bindings.clone(),
-            subtasks: instance.subtasks,
-            preferred: preferred_method.is_some_and(|preferred| instance.method == preferred),
-            applicable: true,
-            precondition_atoms: 0,
-            precondition_fraction: 1.0,
-        })
-        .collect();
-    let context = MethodRankingContext {
+    let context = ranked.then(|| MethodRankingContext {
         task: task.clone(),
-        state: state.clone(),
+        state: state.as_ref().clone(),
         depth,
         max_depth: options.max_depth,
+    });
+    let baseline: Vec<usize> = (0..applicable.len()).collect();
+    let order = match (session.method_ranker, context.as_ref()) {
+        (Some(ranker), Some(context)) => ranker
+            .rank(context, &candidates)
+            .filter(|scores| scores.len() == candidates.len())
+            .and_then(rank_order)
+            .filter(|order| valid_method_order(order, candidates.len()))
+            .unwrap_or(baseline),
+        _ => baseline,
     };
-    let baseline: Vec<usize> = (0..candidates.len()).collect();
-    let order = session
-        .method_ranker
-        .and_then(|ranker| ranker.rank(&context, &candidates))
-        .filter(|scores| scores.len() == candidates.len())
-        .and_then(rank_order)
-        .filter(|order| valid_method_order(order, candidates.len()))
-        .unwrap_or(baseline);
 
     let mut results = Vec::new();
-    let mut successful = vec![false; candidates.len()];
+    let mut successful = if tracing {
+        vec![false; applicable.len()]
+    } else {
+        Vec::new()
+    };
     let method_limit = applicable.len();
-    for &candidate_index in order.iter().take(method_limit) {
+    for &candidate_slot in order.iter().take(method_limit) {
         if !budget.has_time() {
             break;
         }
-        let instance = &applicable[candidate_index];
+        let grounded_index = applicable[candidate_slot] as usize;
+        let instance = &instances[grounded_index];
         let before = results.len();
         let alternatives = refine_network(
             domain,
             problem,
             universe,
-            &instance.network,
-            &instance.bindings,
+            instance,
             state,
             options,
             depth - 1,
@@ -604,13 +693,16 @@ fn refine_task_uncached(
                 break;
             }
         }
-        successful[candidate_index] = results.len() > before;
+        if tracing {
+            successful[candidate_slot] = results.len() > before;
+        }
         if results.len() >= MAX_REFINEMENTS {
             break;
         }
     }
 
     if let Some(trace) = session.trace.as_deref_mut() {
+        let context = context.expect("a trace sink implies a ranking context");
         trace.method_trace(MethodTrace {
             context,
             candidates,
@@ -627,39 +719,26 @@ fn refine_network(
     domain: &Domain,
     problem: &Problem,
     universe: &Universe<'_>,
-    network: &Htn,
-    bindings: &BTreeMap<String, String>,
-    state: &BTreeSet<String>,
+    instance: &GroundedInstance,
+    state: &State,
     options: &RefinementOptions,
     depth: usize,
-    visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    visited: &mut HashSet<(TaskNode, State)>,
     applicability_cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
-    let tasks: Vec<TaskNode> = network
-        .subtasks
-        .iter()
-        .map(|subtask| ground_subtask(subtask, bindings))
-        .collect();
-    let ids: Vec<String> = network
-        .subtasks
-        .iter()
-        .enumerate()
-        .map(|(index, subtask)| subtask_id(subtask, index))
-        .collect();
-
-    if !constraints_hold(network.constraints.as_deref(), bindings) {
+    if !constraints_hold(instance.network.constraints.as_deref(), &instance.bindings) {
         return Ok(Vec::new());
     }
 
-    match &network.orderings {
+    match &instance.network.orderings {
         TaskOrdering::Total => {
             let mut candidates = vec![RefinedTask {
                 steps: Vec::new(),
-                state: state.clone(),
+                state: Arc::clone(state),
             }];
-            for task in &tasks {
+            for task in instance.tasks.iter() {
                 if !budget.has_time() {
                     return Ok(Vec::new());
                 }
@@ -702,6 +781,8 @@ fn refine_network(
             Ok(candidates)
         }
         TaskOrdering::Partial(edges) => {
+            let tasks = instance.tasks.as_ref();
+            let ids = instance.ids.as_ref();
             let mut predecessors = vec![HashSet::new(); tasks.len()];
             let index: HashMap<&str, usize> = ids
                 .iter()
@@ -721,7 +802,7 @@ fn refine_network(
                 domain,
                 problem,
                 universe,
-                &tasks,
+                tasks,
                 &predecessors,
                 state,
                 options,
@@ -742,10 +823,10 @@ fn search_partial(
     universe: &Universe<'_>,
     tasks: &[TaskNode],
     predecessors: &[HashSet<usize>],
-    state: &BTreeSet<String>,
+    state: &State,
     options: &RefinementOptions,
     depth: usize,
-    visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    visited: &mut HashSet<(TaskNode, State)>,
     applicability_cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     session: &mut DecompositionSession<'_>,
@@ -780,11 +861,11 @@ fn search_partial_inner(
     tasks: &[TaskNode],
     predecessors: &[HashSet<usize>],
     remaining: &mut [bool],
-    state: &BTreeSet<String>,
+    state: &State,
     steps: Vec<RefinementStep>,
     options: &RefinementOptions,
     depth: usize,
-    visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    visited: &mut HashSet<(TaskNode, State)>,
     applicability_cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     results: &mut Vec<RefinedTask>,
@@ -796,7 +877,7 @@ fn search_partial_inner(
     if !remaining.iter().any(|&present| present) {
         results.push(RefinedTask {
             steps,
-            state: state.clone(),
+            state: Arc::clone(state),
         });
         return Ok(());
     }
@@ -809,19 +890,29 @@ fn search_partial_inner(
     if ready.is_empty() {
         return Ok(());
     }
-    let context = SearchContext {
+    // The search context clones the task list, the remaining mask, the
+    // predecessor sets and the state. Without a policy or a trace sink nobody
+    // reads it, so do not build it on the symbolic default path.
+    let tracing = session.trace.is_some();
+    let context = (session.search_policy.is_some() || tracing).then(|| SearchContext {
         tasks: tasks.to_vec(),
         remaining: remaining.to_vec(),
         predecessors: predecessors.to_vec(),
-        state: state.clone(),
+        state: state.as_ref().clone(),
         depth,
+    });
+    let order = match (session.search_policy, context.as_ref()) {
+        (Some(policy), Some(context)) => policy
+            .order_ready(context)
+            .filter(|order| valid_search_order(order, &ready))
+            .unwrap_or_else(|| ready.clone()),
+        _ => ready.clone(),
     };
-    let order = session
-        .search_policy
-        .and_then(|policy| policy.order_ready(&context))
-        .filter(|order| valid_search_order(order, &ready))
-        .unwrap_or_else(|| ready.clone());
-    let mut successful = vec![false; order.len()];
+    let mut successful = if tracing {
+        vec![false; order.len()]
+    } else {
+        Vec::new()
+    };
 
     let ready_limit = ready.len();
     for (slot, &index) in order.iter().take(ready_limit).enumerate() {
@@ -869,7 +960,9 @@ fn search_partial_inner(
                 break;
             }
         }
-        successful[slot] = results.len() > before;
+        if tracing {
+            successful[slot] = results.len() > before;
+        }
         if results.len() >= MAX_REFINEMENTS {
             break;
         }
@@ -878,6 +971,7 @@ fn search_partial_inner(
     if ready.len() > 1
         && let Some(trace) = session.trace.as_deref_mut()
     {
+        let context = context.expect("a trace sink implies a search context");
         trace.search_trace(SearchTrace {
             context,
             ready,
@@ -957,15 +1051,14 @@ fn holds_optional_bounded(
 }
 
 fn goal_status(
-    domain: &Domain,
     problem: &Problem,
+    universe: &Universe<'_>,
     state: &BTreeSet<String>,
     budget: usize,
 ) -> Result<GoalStatus> {
-    let universe = Universe::new(domain, problem);
     match &problem.goal {
         None => Ok(GoalStatus::Absent),
-        Some(goal) => match holds(goal, &BTreeMap::new(), state, &universe, budget) {
+        Some(goal) => match holds(goal, &BTreeMap::new(), state, universe, budget) {
             Ok(true) => Ok(GoalStatus::Satisfied),
             Ok(false) => Ok(GoalStatus::Violated),
             Err(error) if formula::is_quantifier_overflow(&error) => Ok(GoalStatus::Violated),
@@ -1006,7 +1099,7 @@ pub fn validate_refinement(
         plan == refinement.plan,
         "the refinement's plan does not match its steps"
     );
-    let goal = goal_status(domain, problem, &final_state, options.max_groundings)?;
+    let goal = goal_status(problem, &universe, &final_state, options.max_groundings)?;
     ensure!(
         goal == refinement.goal,
         "the refinement's goal status does not match its execution"

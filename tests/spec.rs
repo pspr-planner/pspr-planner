@@ -10,7 +10,7 @@ use pspr::parsing::json::{
 use pspr::parsing::parser::{ParserConfig, parse_program};
 use pspr::solver::domain::process_domain;
 use pspr::solver::problem::{Problem, load_problem};
-use pspr::solver::solve::{SolveResult, solve};
+use pspr::solver::solve::solve;
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -131,12 +131,11 @@ fn domain_problem_solve() {
     let problem: Problem = load_problem(&domain, problem_ast).expect("loadProblem");
     assert_eq!(problem.name, "p1");
 
-    let result: SolveResult = solve(&domain, &problem).expect("solve");
-    // The only task is `deliver(depot)` and its method requires
-    // `road(depot, depot)`, which no operator can establish; the evaluation
-    // tree therefore reports the problem as unsolvable and returns no plan.
-    assert!(result.plan.is_empty(), "unsolvable fixture");
-    assert!(!result.solved, "unsolvable fixture");
+    let error = solve(&domain, &problem).expect_err("unsolvable fixture should fail");
+    assert!(
+        error.contains("could not be refined") || error.contains("did not solve"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

@@ -1,10 +1,7 @@
-//! Machine-readable benchmark of PSPR's compound-task techniques.
+//! Machine-readable benchmark of PSPR's hierarchical solver.
 //!
 //! Usage:
-//!     bench_modes [mode] <domain.hddl> <problem.hddl>
-//!
-//! Modes are `abstract` (default), `summary`, and `hierarchical`. The
-//! hierarchical mode refines with primitive method summaries enabled (C+G).
+//!     bench_modes <domain.hddl> <problem.hddl>
 //!
 //! The output is a single line of `key=value` pairs:
 //! `mode`, `solved`, `goal`, `actions`, `methods`, `abstract_steps`, `tasks`
@@ -20,11 +17,10 @@ use std::path::PathBuf;
 use pspr::parsing::parser::{ParserConfig, parse_program};
 use pspr::solver::domain::process_domain;
 use pspr::solver::evaluation_tree::{
-    EvaluationOptions, GoalStatus, MethodSummary, RefinementOptions, ValidationOptions,
-    validate_plan, validate_refinement,
+    EvaluationOptions, GoalStatus, MethodSummary, RefinementOptions, validate_refinement,
 };
 use pspr::solver::problem::load_problem;
-use pspr::solver::solve::{solve_hierarchical_with_options, solve_with_options};
+use pspr::solver::solve::solve_hierarchical_with_options;
 
 fn goal_name(status: GoalStatus) -> &'static str {
     match status {
@@ -59,10 +55,9 @@ fn fail(mode: &str, error: &str) {
 fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
     let (mode, domain_path, problem_path) = match arguments.as_slice() {
-        [domain, problem] => ("abstract", domain, problem),
-        [mode, domain, problem] => (mode.as_str(), domain, problem),
+        [domain, problem] => ("hierarchical", domain, problem),
         _ => {
-            eprintln!("usage: bench_modes [mode] <domain.hddl> <problem.hddl>");
+            eprintln!("usage: bench_modes <domain.hddl> <problem.hddl>");
             std::process::exit(2);
         }
     };
@@ -107,11 +102,7 @@ fn main() {
     };
 
     let evaluation_options = EvaluationOptions {
-        method_summary: if mode == "summary" || mode == "hierarchical" {
-            MethodSummary::PrimitiveOnly
-        } else {
-            MethodSummary::Off
-        },
+        method_summary: MethodSummary::PrimitiveOnly,
         max_groundings,
         implicit_orderings: true,
         ..EvaluationOptions::default()
@@ -121,74 +112,36 @@ fn main() {
         ..RefinementOptions::default()
     };
 
-    match mode {
-        "abstract" | "summary" => {
-            let result = match solve_with_options(&domain, &problem, &evaluation_options) {
-                Ok(result) => result,
-                Err(error) => {
-                    fail(mode, &error);
-                    std::process::exit(1);
-                }
-            };
-            let report = match validate_plan(
-                &domain,
-                &problem,
-                &result.plan,
-                &ValidationOptions::default(),
-            ) {
-                Ok(report) => report,
-                Err(error) => {
-                    fail(mode, &format!("{error:#}"));
-                    std::process::exit(1);
-                }
-            };
-            report_line(
-                mode,
-                result.solved,
-                report.goal,
-                result.plan.len(),
-                0,
-                result.plan.len(),
-                report.tasks,
-            );
+    let refinement = solve_hierarchical_with_options(
+        &domain,
+        &problem,
+        &refinement_options,
+        &evaluation_options,
+    );
+    let refinement = match refinement {
+        Ok(refinement) => refinement,
+        Err(error) => {
+            fail(mode, &error);
+            std::process::exit(1);
         }
-        "hierarchical" => {
-            let refinement = solve_hierarchical_with_options(
-                &domain,
-                &problem,
-                &refinement_options,
-                &evaluation_options,
-            );
-            let refinement = match refinement {
-                Ok(refinement) => refinement,
-                Err(error) => {
-                    fail(mode, &error);
-                    std::process::exit(1);
-                }
-            };
-            let validation =
-                match validate_refinement(&domain, &problem, &refinement, &refinement_options) {
-                    Ok(validation) => validation,
-                    Err(error) => {
-                        fail(mode, &format!("{error:#}"));
-                        std::process::exit(1);
-                    }
-                };
-            report_line(
-                mode,
-                true,
-                refinement.goal,
-                refinement.plan.len(),
-                refinement.method_count(),
-                refinement.abstract_plan.len(),
-                validation.tasks,
-            );
+    };
+    let validation = match validate_refinement(&domain, &problem, &refinement, &refinement_options)
+    {
+        Ok(validation) => validation,
+        Err(error) => {
+            fail(mode, &format!("{error:#}"));
+            std::process::exit(1);
         }
-        other => {
-            fail(other, "unknown mode");
-            std::process::exit(2);
-        }
-    }
+    };
+    report_line(
+        mode,
+        true,
+        refinement.goal,
+        refinement.plan.len(),
+        refinement.method_count(),
+        refinement.abstract_plan.len(),
+        validation.tasks,
+    );
 }
 
 fn report_line(

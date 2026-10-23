@@ -13,7 +13,7 @@ use pspr::solver::evaluation_tree::{
     EvaluationOptions, LiftabilityOptions, MethodSummary, detect_liftability_gaps,
 };
 use pspr::solver::problem::{Problem, load_problem};
-use pspr::solver::solve::{solve_hierarchical_with_options, solve_with_options};
+use pspr::solver::solve::solve_hierarchical_with_options;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,16 +35,6 @@ struct Options {
     /// Path to the hddl_analyzer executable (default: $HDDL_PARSER or hddl_analyzer on PATH)
     #[arg(long, value_name = "PATH")]
     parser: Option<PathBuf>,
-
-    /// Refine the abstract plan into a complete HTN plan with primitive
-    /// method summaries (C+G)
-    #[arg(long)]
-    hierarchical: bool,
-
-    /// Summarise primitive, totally ordered method effects into compound operators
-    /// (enabled automatically by --hierarchical)
-    #[arg(long)]
-    summary: bool,
 
     /// Report top-level task pairs whose subtask effects satisfy or falsify a
     /// later method or action precondition (the liftability gap of the projection)
@@ -183,11 +173,7 @@ fn handle_problem(
     );
 
     let evaluation_options = EvaluationOptions {
-        method_summary: if options.summary || options.hierarchical {
-            MethodSummary::PrimitiveOnly
-        } else {
-            MethodSummary::Off
-        },
+        method_summary: MethodSummary::PrimitiveOnly,
         max_groundings: options.max_groundings,
         implicit_orderings: options.repair_orderings,
         ..EvaluationOptions::default()
@@ -210,36 +196,19 @@ fn handle_problem(
         print!("    liftability: {report}");
     }
 
-    if options.hierarchical {
-        let refinement = solve_hierarchical_with_options(
-            domain,
-            &problem,
-            &refinement_options,
-            &evaluation_options,
-        )?;
-        println!(
-            "    solve {}: plan length {} ({} methods, goal {:?})",
-            problem.name,
-            refinement.plan.len(),
-            refinement.method_count(),
-            refinement.goal
-        );
-    } else {
-        let result = solve_with_options(domain, &problem, &evaluation_options)?;
-        if result.solved {
-            println!(
-                "    solve {}: plan length {}",
-                result.problem,
-                result.plan.len()
-            );
-        } else {
-            println!(
-                "    solve {}: unsolved ({} steps found)",
-                result.problem,
-                result.plan.len()
-            );
-        }
-    }
+    let refinement = solve_hierarchical_with_options(
+        domain,
+        &problem,
+        &refinement_options,
+        &evaluation_options,
+    )?;
+    println!(
+        "    solve {}: plan length {} ({} methods, goal {:?})",
+        problem.name,
+        refinement.plan.len(),
+        refinement.method_count(),
+        refinement.goal
+    );
     Ok(())
 }
 

@@ -12,6 +12,9 @@ use std::fmt;
 use super::adam::{Adam, AdamOptions};
 
 /// A function returning the objective and gradient at a candidate point.
+///
+/// The merge only calls it from the line search of the quasi-Newton methods;
+/// the Adam inner loop evaluates the objective directly into a reused buffer.
 type Evaluate<'a> = dyn FnMut(&[f64]) -> (f64, Vec<f64>) + 'a;
 
 /// A selectable optimization algorithm.

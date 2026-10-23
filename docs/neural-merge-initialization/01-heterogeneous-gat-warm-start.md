@@ -348,7 +348,7 @@ cargo run --features neural --bin train_merge_initializer -- \
   --epochs 40 --output target/merge-initializer.burnpack
 
 PSPR_MERGE_MODEL=target/merge-initializer.burnpack \
-  cargo run --features neural -- --hierarchical \
+  cargo run --features neural -- \
   ../hddl/test_data/ipc/Satellite-GTOHP/domain.hddl \
   ../hddl/test_data/ipc/Satellite-GTOHP/p03.hddl
 ```

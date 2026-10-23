@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::parsing::json::{
     Action, DomainAst, Function, Method, Predicate, RequirementType, Symbol, Task,
 };
@@ -54,9 +52,12 @@ impl Domain {
         if type_name == ancestor {
             return true;
         }
-        let mut visited = HashSet::new();
+        // The type hierarchy is tiny and acyclic in practice. The bound on the
+        // number of steps replaces the per-call `HashSet` that used to detect
+        // cycles, which matters because grounding calls this per candidate
+        // object.
         let mut current = type_name;
-        while visited.insert(current) {
+        for _ in 0..=self.types.len() {
             let Some(symbol) = self.types.iter().find(|symbol| symbol.name == current) else {
                 return false;
             };

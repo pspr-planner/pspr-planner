@@ -1,11 +1,13 @@
 //! Best-first search (Sections 6.3 and 6.4 of Helmert, JAIR 2006).
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 
 use anyhow::{Result, ensure};
 
-use super::heuristics::{causal_graph_heuristic, ff_heuristic, h_max};
+use super::heuristics::{
+    HeuristicScratch, causal_graph_heuristic_with, ff_heuristic_with, h_max_with,
+};
 use super::knowledge::CompiledTask;
 use super::{State, Task};
 
@@ -146,11 +148,7 @@ pub fn best_first_search<P: SearchProblem>(
     for (heuristic, list) in open.iter_mut().enumerate().take(heuristic_count) {
         insertion += 1;
         list.push(QueueEntry {
-            priority: initial_evaluation
-                .estimates
-                .get(heuristic)
-                .copied()
-                .unwrap_or(0.0),
+            priority: initial_evaluation.estimates[heuristic],
             insertion,
             node: 0,
         });
@@ -214,8 +212,6 @@ pub fn best_first_search<P: SearchProblem>(
 
         let successors = problem.successors(&nodes[entry.node].state);
         let parent_estimates = nodes[entry.node].estimates.clone();
-        let parent_preferred: HashSet<usize> =
-            nodes[entry.node].preferred.iter().copied().collect();
 
         for action in successors {
             generated += 1;
@@ -234,7 +230,9 @@ pub fn best_first_search<P: SearchProblem>(
                 let evaluation = problem.evaluate(&action.state);
                 (evaluation.estimates, evaluation.preferred)
             };
-            let is_preferred = parent_preferred.contains(&action.id);
+            // `preferred` is a short list of operator ids in practice; a
+            // linear scan beats building a HashSet per expanded node.
+            let is_preferred = nodes[entry.node].preferred.contains(&action.id);
             nodes.push(Node {
                 state: action.state,
                 g: child_g,
@@ -246,11 +244,7 @@ pub fn best_first_search<P: SearchProblem>(
             });
             let child = nodes.len() - 1;
             for heuristic in 0..heuristic_count {
-                let priority = nodes[child]
-                    .estimates
-                    .get(heuristic)
-                    .copied()
-                    .unwrap_or(0.0);
+                let priority = nodes[child].estimates[heuristic];
                 insertion += 1;
                 open[heuristic].push(QueueEntry {
                     priority,
@@ -284,6 +278,8 @@ pub enum HeuristicKind {
 struct PlanningProblem<'a, 'b> {
     compiled: &'a CompiledTask<'b>,
     heuristics: &'a [HeuristicKind],
+    /// Reused heuristic buffers; the engine evaluates one state at a time.
+    scratch: std::cell::RefCell<HeuristicScratch>,
 }
 
 impl SearchProblem for PlanningProblem<'_, '_> {
@@ -299,34 +295,42 @@ impl SearchProblem for PlanningProblem<'_, '_> {
 
     fn successors(&self, state: &State) -> Vec<Action<State>> {
         let task = self.compiled.task;
+        let mut successors = Vec::new();
         self.compiled
             .successor_generator
-            .applicable(state)
-            .into_iter()
-            .filter_map(|operator| {
-                task.apply(operator, state).map(|next| Action {
-                    id: operator,
-                    state: next,
-                    cost: task.operators[operator].cost,
-                })
-            })
-            .collect()
+            .for_each_applicable(state, |operator| {
+                if let Some(next) = task.apply(operator, state) {
+                    successors.push(Action {
+                        id: operator,
+                        state: next,
+                        cost: task.operators[operator].cost,
+                    });
+                }
+            });
+        successors
     }
 
     fn evaluate(&self, state: &State) -> Evaluation {
         let mut estimates = Vec::with_capacity(self.heuristics.len());
         let mut preferred = Vec::new();
+        let mut scratch = self.scratch.borrow_mut();
         for heuristic in self.heuristics {
             match heuristic {
                 HeuristicKind::Ff => {
-                    let value = ff_heuristic(self.compiled, state);
+                    let value = ff_heuristic_with(self.compiled, state, &mut scratch);
                     estimates.push(value.estimate);
                     preferred.extend(value.preferred);
                 }
                 HeuristicKind::CausalGraph => {
-                    estimates.push(causal_graph_heuristic(self.compiled, state));
+                    estimates.push(causal_graph_heuristic_with(
+                        self.compiled,
+                        state,
+                        &mut scratch,
+                    ));
                 }
-                HeuristicKind::Max => estimates.push(h_max(self.compiled, state)),
+                HeuristicKind::Max => {
+                    estimates.push(h_max_with(self.compiled, state, &mut scratch))
+                }
             }
         }
         Evaluation {
@@ -350,6 +354,7 @@ pub fn search(
     let problem = PlanningProblem {
         compiled: &compiled,
         heuristics,
+        scratch: std::cell::RefCell::new(HeuristicScratch::new()),
     };
     Ok(best_first_search(&problem, options))
 }

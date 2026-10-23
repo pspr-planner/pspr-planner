@@ -70,7 +70,10 @@ mod successor;
 mod task;
 mod transitions;
 
-pub use heuristics::{HeuristicValue, causal_graph_heuristic, ff_heuristic, h_max};
+pub use heuristics::{
+    HeuristicScratch, HeuristicValue, causal_graph_heuristic, causal_graph_heuristic_with,
+    ff_heuristic, ff_heuristic_with, h_max, h_max_with,
+};
 pub use knowledge::CompiledTask;
 pub use search::{
     Action, Evaluation, HeuristicKind, SearchOptions, SearchOutcome, SearchProblem,

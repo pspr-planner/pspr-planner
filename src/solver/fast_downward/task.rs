@@ -239,6 +239,12 @@ impl Task {
 
     /// Evaluate all axioms in the extended state `state`, in place (Fig. 16).
     pub fn evaluate_axioms(&self, state: &mut State) {
+        // Leaf tasks compile without axioms; this early return keeps the
+        // per-successor call free of the layer bookkeeping and the full
+        // derived-variable scan below.
+        if self.axioms.is_empty() {
+            return;
+        }
         let mut layers: BTreeSet<usize> = BTreeSet::new();
         for axiom in &self.axioms {
             layers.insert(axiom.layer);

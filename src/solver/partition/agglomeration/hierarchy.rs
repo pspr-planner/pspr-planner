@@ -191,6 +191,26 @@ pub fn optimal_hierarchy_with(
         );
     }
 
+    // The ILP below solves the same objective as the enumeration but its
+    // branch-and-bound effort grows very quickly with the number of
+    // instances: five instances already take tens of milliseconds and eight
+    // take seconds. Small problems are therefore solved exactly by
+    // enumerating the level-ordered dendrograms instead.
+    if let Some(hierarchy) = enumerate_hierarchy(distance, levels, groups, global_weight) {
+        return Ok(hierarchy);
+    }
+
+    solve_ilp(distance, levels, groups, global_weight)
+}
+
+/// Solve the merge-level ILP of Gilpin et al. directly.
+fn solve_ilp(
+    distance: &DistanceMatrix,
+    levels: usize,
+    groups: &[Vec<usize>],
+    global_weight: f64,
+) -> Result<Hierarchy> {
+    let n = distance.len();
     let mut variables = ProblemVariables::new();
     let mut merge: Vec<Vec<Option<Variable>>> = vec![vec![None; n]; n];
     for (a, row) in merge.iter_mut().enumerate() {
@@ -330,6 +350,250 @@ pub fn optimal_hierarchy_with(
     Ok(hierarchy)
 }
 
+// ---------------------------------------------------------------------------
+// Exact enumeration for small instances
+// ---------------------------------------------------------------------------
+
+/// Largest number of instances solved by enumeration instead of the ILP.
+///
+/// Every extra instance multiplies the number of coarsening steps to
+/// enumerate, so the enumeration is limited to the sizes where it stays in the
+/// microsecond range; larger problems keep the exact ILP.
+const EXACT_INSTANCE_LIMIT: usize = 6;
+
+/// Enumeration nodes after which the instance is handed to the ILP solver, so
+/// that a pathological small instance can never be slower than before.
+const EXACT_NODE_LIMIT: usize = 100_000;
+
+/// Solve the merge-level problem by enumerating level-ordered dendrograms.
+///
+/// The ILP levels are an ultrametric `M(a, c) <= max(M(a, b), M(b, c))` on
+/// `1..=levels`, i.e. a chain of nested partitions in which a pair shares a
+/// block from its merge level onwards. Only the *order* of the distinct levels
+/// enters the triple term, and the height penalty `global_weight * sum max M`
+/// only shrinks when levels move down, so an optimum merges at the consecutive
+/// levels `1, 2, 3, ...`. What remains is every sequence of at most `levels`
+/// proper coarsenings; the search scores each one and keeps the best.
+///
+/// Returns `None` when the instance is too large or the search exceeds
+/// [`EXACT_NODE_LIMIT`]; the caller then solves the ILP.
+fn enumerate_hierarchy(
+    distance: &DistanceMatrix,
+    levels: usize,
+    groups: &[Vec<usize>],
+    global_weight: f64,
+) -> Option<Hierarchy> {
+    let n = distance.len();
+    if n > EXACT_INSTANCE_LIMIT {
+        return None;
+    }
+    let mut search = Enumeration {
+        distance,
+        levels,
+        groups,
+        global_weight,
+        nodes: 0,
+        best_score: f64::NEG_INFINITY,
+        best: None,
+        merge: vec![vec![0usize; n]; n],
+    };
+    let mut blocks: Vec<Vec<usize>> = (0..n).map(|instance| vec![instance]).collect();
+    search.visit(&mut blocks, 0)?;
+    let merge = search.best?;
+    let mut hierarchy = Hierarchy::empty(n, levels);
+    for a in 0..n {
+        for b in a + 1..n {
+            // A pair that no coarsening joined sits at the last level, which is
+            // also how the ILP completes a partial hierarchy.
+            let level = match merge[a][b] {
+                0 => levels,
+                value => value,
+            };
+            hierarchy.set_merge(a, b, level);
+        }
+    }
+    Some(hierarchy)
+}
+
+/// Depth-first search over the coarsening chains of [`enumerate_hierarchy`].
+struct Enumeration<'a> {
+    distance: &'a DistanceMatrix,
+    levels: usize,
+    groups: &'a [Vec<usize>],
+    global_weight: f64,
+    /// Number of visited nodes, for [`EXACT_NODE_LIMIT`].
+    nodes: usize,
+    best_score: f64,
+    /// Level matrix of the best chain so far (`0` marks an unmerged pair).
+    best: Option<Vec<Vec<usize>>>,
+    /// Level matrix of the current branch.
+    merge: Vec<Vec<usize>>,
+}
+
+impl Enumeration<'_> {
+    /// Evaluate the current chain and recurse into every proper coarsening.
+    ///
+    /// Returns `None` once the node budget is exhausted.
+    fn visit(&mut self, blocks: &mut Vec<Vec<usize>>, level: usize) -> Option<()> {
+        self.nodes += 1;
+        if self.nodes > EXACT_NODE_LIMIT {
+            return None;
+        }
+        self.record();
+
+        let count = blocks.len();
+        if level == self.levels || count < 2 {
+            return Some(());
+        }
+
+        let mut next_blocks: Vec<Vec<usize>> = Vec::with_capacity(count);
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        // Every partition of the current blocks merges the blocks of each of
+        // its groups at the next level; the identity partition is skipped
+        // because finishing here scores the same and uses fewer levels.
+        for_each_partition(count, &mut |labels, group_count| {
+            if group_count == count {
+                return Some(());
+            }
+            next_blocks.clear();
+            merged.clear();
+            for group in 0..group_count {
+                let mut block: Vec<usize> = Vec::new();
+                let mut members = 0usize;
+                for (index, &label) in labels.iter().enumerate() {
+                    if label == group {
+                        block.extend_from_slice(&blocks[index]);
+                        members += 1;
+                    }
+                }
+                if members >= 2 {
+                    for first in 0..block.len() {
+                        for second in first + 1..block.len() {
+                            let (low, high) = if block[first] < block[second] {
+                                (block[first], block[second])
+                            } else {
+                                (block[second], block[first])
+                            };
+                            // Pairs inside one of the merged blocks already
+                            // have an earlier level; only the pairs that cross
+                            // two of them merge now.
+                            if self.merge[low][high] == 0 {
+                                merged.push((low, high));
+                            }
+                        }
+                    }
+                }
+                next_blocks.push(block);
+            }
+            for &(low, high) in &merged {
+                self.merge[low][high] = level + 1;
+            }
+            let outcome = self.visit(&mut next_blocks, level + 1);
+            for &(low, high) in &merged {
+                self.merge[low][high] = 0;
+            }
+            outcome
+        })
+    }
+
+    /// Score the current chain and keep it if it is the best one so far.
+    fn record(&mut self) {
+        let score = self.score();
+        if self.best.is_none() || score > self.best_score {
+            self.best_score = score;
+            self.best = Some(self.merge.clone());
+        }
+    }
+
+    /// The objective of Equation (1) plus the height penalty, evaluated on the
+    /// current chain. Pairs that never merge sit at the last level.
+    fn score(&self) -> f64 {
+        let n = self.distance.len();
+        let levels = self.levels;
+        let level = |a: usize, b: usize| -> usize {
+            if a == b {
+                return 0;
+            }
+            let (low, high) = if a < b { (a, b) } else { (b, a) };
+            match self.merge[low][high] {
+                0 => levels,
+                value => value,
+            }
+        };
+
+        let mut score = 0.0;
+        for a in 0..n {
+            for b in 0..n {
+                if b == a {
+                    continue;
+                }
+                let merged_ab = level(a, b);
+                for c in 0..n {
+                    if c == a || c == b {
+                        continue;
+                    }
+                    if merged_ab < level(a, c) {
+                        score += self.distance.get(a, c) - self.distance.get(a, b);
+                    }
+                }
+            }
+        }
+        if self.global_weight > 0.0 {
+            let mut members: Vec<usize> = Vec::new();
+            for group in self.groups {
+                members.clear();
+                members.extend_from_slice(group);
+                members.sort_unstable();
+                members.dedup();
+                if members.len() < 2 {
+                    continue;
+                }
+                let mut height = 0usize;
+                for (index, &a) in members.iter().enumerate() {
+                    for &b in &members[index + 1..] {
+                        height = height.max(level(a, b));
+                    }
+                }
+                score -= self.global_weight * height as f64;
+            }
+        }
+        score
+    }
+}
+
+/// Visit every set partition of `0..count` as a restricted growth string.
+///
+/// `visit` receives the label of every element and the number of groups; it
+/// returns `None` to stop the enumeration.
+fn for_each_partition(
+    count: usize,
+    visit: &mut impl FnMut(&[usize], usize) -> Option<()>,
+) -> Option<()> {
+    fn recurse(
+        count: usize,
+        labels: &mut Vec<usize>,
+        index: usize,
+        groups: usize,
+        visit: &mut impl FnMut(&[usize], usize) -> Option<()>,
+    ) -> Option<()> {
+        if index == count {
+            return visit(labels, groups);
+        }
+        for label in 0..=groups {
+            labels[index] = label;
+            let next_groups = if label == groups { groups + 1 } else { groups };
+            recurse(count, labels, index + 1, next_groups, visit)?;
+        }
+        Some(())
+    }
+
+    if count == 0 {
+        return Some(());
+    }
+    let mut labels = vec![0usize; count];
+    recurse(count, &mut labels, 1, 1, visit)
+}
+
 struct DisjointSet {
     parent: Vec<usize>,
 }
@@ -358,6 +622,93 @@ impl DisjointSet {
                 (second_root, first_root)
             };
             self.parent[high] = low;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic pseudo-random distance matrix.
+    fn random_distance(n: usize, seed: u64) -> DistanceMatrix {
+        let mut state = seed | 1;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1000) as f64 / 1000.0
+        };
+        let mut rows = vec![vec![0.0; n]; n];
+        for a in 0..n {
+            for b in a + 1..n {
+                let value = next();
+                rows[a][b] = value;
+                rows[b][a] = value;
+            }
+        }
+        DistanceMatrix::new(&rows).expect("the matrix is symmetric")
+    }
+
+    fn objective(
+        hierarchy: &Hierarchy,
+        distance: &DistanceMatrix,
+        groups: &[Vec<usize>],
+        weight: f64,
+    ) -> f64 {
+        hierarchy.clustering_score(distance) - weight * hierarchy.constraint_cost(groups)
+    }
+
+    #[test]
+    fn enumeration_finds_the_ilp_optimum() {
+        for n in 2..=4usize {
+            for seed in 1..=3u64 {
+                let distance = random_distance(n, seed * 7919 + n as u64);
+                for levels in 1..=n {
+                    for groups in [
+                        Vec::new(),
+                        vec![vec![0, n - 1]],
+                        vec![vec![0, 1], vec![0, n - 1]],
+                    ] {
+                        let groups: Vec<Vec<usize>> = groups
+                            .into_iter()
+                            .filter(|group| group[0] != group[1])
+                            .collect();
+                        for weight in [0.0, 4.0] {
+                            let enumerated =
+                                enumerate_hierarchy(&distance, levels, &groups, weight)
+                                    .expect("small instances are enumerated");
+                            let solved = solve_ilp(&distance, levels, &groups, weight)
+                                .expect("the ILP solves every small instance");
+                            let enumerated_score =
+                                objective(&enumerated, &distance, &groups, weight);
+                            let solved_score = objective(&solved, &distance, &groups, weight);
+                            assert!(
+                                (enumerated_score - solved_score).abs() < 1e-9,
+                                "n={n} levels={levels} groups={groups:?} weight={weight}: \
+                                 enumeration {enumerated_score} != ILP {solved_score}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enumeration_respects_the_level_order() {
+        let distance = random_distance(4, 42);
+        let hierarchy = enumerate_hierarchy(&distance, 4, &[], 0.0).expect("enumerated");
+        assert!(hierarchy.is_complete());
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    let ac = hierarchy.merge_level(a, c).expect("complete");
+                    let ab = hierarchy.merge_level(a, b).expect("complete");
+                    let bc = hierarchy.merge_level(b, c).expect("complete");
+                    assert!(ac <= ab.max(bc), "the merge levels must be an ultrametric");
+                }
+            }
         }
     }
 }

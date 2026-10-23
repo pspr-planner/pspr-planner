@@ -1,6 +1,6 @@
 //! The SGPlan penalty merger: a relaxed MINLP optimized with Adam.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ use anyhow::{Result, bail, ensure};
 use super::super::graph::ConstraintNode;
 use super::adam::AdamOptions;
 use super::optimizer::{OptimizerKind, OptimizerState};
-use super::penalty::{PenaltySpace, logistic, smooth_max, softplus};
+use super::penalty::{PenaltySpace, smooth_max_into};
 use super::{
     MergeInitialization, MergeInitializer, MergeOutcome, MergeProblem, MergeSolver,
     PartialSolution, PenaltyReport,
@@ -168,6 +168,28 @@ struct RelaxedProblem<'a> {
     unresolved: usize,
 }
 
+/// Buffers reused by every evaluation of the relaxed objective.
+///
+/// The merge runs up to `iterations * adam_steps` evaluations per node and
+/// each one used to allocate three vectors; keeping them alive turns the inner
+/// loop allocation-free after the first call.
+#[derive(Debug, Default)]
+struct MergeScratch {
+    /// `position + length` of every child, the input of the smooth maximum.
+    completions: Vec<f64>,
+    /// Softmax weights, i.e. the gradient of the smooth maximum.
+    softmax: Vec<f64>,
+    /// Gradient with respect to the child positions.
+    gradient: Vec<f64>,
+    /// Exact violations of every shared constraint.
+    violations: Vec<f64>,
+}
+
+/// A margin larger than this many temperatures makes both the smoothed
+/// violation and its slope smaller than `1e-21`, far below the tolerance of
+/// every penalty space.
+const NEGLIGIBLE_MARGIN: f64 = 50.0;
+
 impl<'a> RelaxedProblem<'a> {
     fn new(problem: &'a MergeProblem, atoms: &BTreeSet<String>) -> Self {
         let steps = problem
@@ -183,6 +205,9 @@ impl<'a> RelaxedProblem<'a> {
             .collect();
         let mut unresolved = 0;
         let mut constraints = Vec::with_capacity(problem.shared_constraints.len());
+        // Reused key buffer: the atom lookup used to allocate one `String` per
+        // shared atom constraint.
+        let mut key = String::new();
         for constraint in &problem.shared_constraints {
             match constraint {
                 ConstraintNode::Ordering { before, after } => {
@@ -200,8 +225,10 @@ impl<'a> RelaxedProblem<'a> {
                     }
                 }
                 ConstraintNode::Atom(atom) => {
+                    key.clear();
+                    let _ = write!(key, "{atom}");
                     constraints.push(RelaxedConstraint::Fixed {
-                        violated: !atoms.contains(&atom.to_string()),
+                        violated: !atoms.contains(key.as_str()),
                     });
                 }
                 ConstraintNode::Equality { left, right, equal } => {
@@ -227,32 +254,65 @@ impl<'a> RelaxedProblem<'a> {
     }
 
     /// The relaxed objective and its gradient with respect to the positions.
-    fn evaluate(
+    ///
+    /// The gradient is written into `scratch.gradient`, which is cleared and
+    /// refilled, so the inner loop of the optimizer allocates nothing.
+    fn evaluate_into(
         &self,
         parameters: &[f64],
         weights: &[f64],
         space: PenaltySpace,
         cost_weight: f64,
         temperature: f64,
-    ) -> (f64, Vec<f64>) {
+        scratch: &mut MergeScratch,
+    ) -> f64 {
         let temperature = temperature.max(1e-9);
-        let completions: Vec<f64> = parameters
-            .iter()
-            .zip(&self.lengths)
-            .map(|(position, length)| position + length)
-            .collect();
-        let (makespan, softmax) = smooth_max(&completions, temperature);
+        scratch.completions.clear();
+        scratch.completions.extend(
+            parameters
+                .iter()
+                .zip(&self.lengths)
+                .map(|(position, length)| position + length),
+        );
+        let makespan = smooth_max_into(&scratch.completions, temperature, &mut scratch.softmax);
         let mut objective = cost_weight * makespan;
-        let mut gradient: Vec<f64> = softmax.iter().map(|weight| cost_weight * weight).collect();
+        scratch.gradient.clear();
+        scratch
+            .gradient
+            .extend(scratch.softmax.iter().map(|weight| cost_weight * weight));
+        let inverse_temperature = 1.0 / temperature;
         for (constraint, &weight) in self.constraints.iter().zip(weights) {
             match constraint {
                 RelaxedConstraint::Ordering { before, after } => {
                     let margin = self.margin(parameters, before, after);
-                    let violation = temperature * softplus(-margin / temperature);
-                    objective += weight * space.value(violation);
-                    let slope = weight * space.slope(violation) * -logistic(-margin / temperature);
-                    gradient[after.child] += slope;
-                    gradient[before.child] -= slope;
+                    // A comfortably satisfied ordering contributes neither to
+                    // the objective nor to the gradient; skipping it avoids two
+                    // transcendental calls for the majority of the constraints
+                    // once the schedule is nearly feasible.
+                    if margin > NEGLIGIBLE_MARGIN * temperature {
+                        continue;
+                    }
+                    // One exponential serves the softplus of the violation and
+                    // the logistic of its derivative: `z = exp(-margin / T)`,
+                    // `softplus(x) = ln(1 + z)` and `logistic(x) = z / (1 + z)`.
+                    let scaled = -margin * inverse_temperature;
+                    let exponential = scaled.exp();
+                    let logistic = if exponential.is_finite() {
+                        exponential / (1.0 + exponential)
+                    } else {
+                        1.0
+                    };
+                    let softplus = if scaled > 30.0 {
+                        scaled
+                    } else {
+                        exponential.ln_1p()
+                    };
+                    let violation = temperature * softplus;
+                    let (value, slope) = space.value_and_slope(violation);
+                    objective += weight * value;
+                    let slope = -weight * slope * logistic;
+                    scratch.gradient[after.child] += slope;
+                    scratch.gradient[before.child] -= slope;
                 }
                 RelaxedConstraint::Fixed { violated } => {
                     let violation = if *violated { 1.0 } else { 0.0 };
@@ -260,30 +320,35 @@ impl<'a> RelaxedProblem<'a> {
                 }
             }
         }
-        (objective, gradient)
+        objective
     }
 
     /// Exact violations at a relaxed point; positive means violated.
-    fn exact_violations(&self, parameters: &[f64]) -> Vec<f64> {
-        self.constraints
-            .iter()
-            .map(|constraint| match constraint {
-                RelaxedConstraint::Ordering { before, after } => {
-                    (-self.margin(parameters, before, after)).max(0.0)
+    fn exact_violations_into(&self, parameters: &[f64], out: &mut Vec<f64>) {
+        out.clear();
+        out.extend(self.constraints.iter().map(|constraint| match constraint {
+            RelaxedConstraint::Ordering { before, after } => {
+                (-self.margin(parameters, before, after)).max(0.0)
+            }
+            RelaxedConstraint::Fixed { violated } => {
+                if *violated {
+                    1.0
+                } else {
+                    0.0
                 }
-                RelaxedConstraint::Fixed { violated } => {
-                    if *violated {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-            })
-            .collect()
+            }
+        }));
     }
 
     /// Exact violations of a concrete plan, in shared-constraint order.
     fn validate(&self, problem: &MergeProblem, plan_tasks: &[usize]) -> Vec<f64> {
+        // The plan can be long and there is one shared constraint per entry, so
+        // the former `position(..)` scan per constraint was quadratic. A single
+        // pass over the plan gives the position of every task.
+        let mut positions: HashMap<usize, usize> = HashMap::with_capacity(plan_tasks.len());
+        for (position, &task) in plan_tasks.iter().enumerate() {
+            positions.entry(task).or_insert(position);
+        }
         problem
             .shared_constraints
             .iter()
@@ -300,8 +365,8 @@ impl<'a> RelaxedProblem<'a> {
                     ConstraintNode::Ordering { before, after },
                     RelaxedConstraint::Ordering { .. },
                 ) => {
-                    let before = plan_tasks.iter().position(|task| task == before);
-                    let after = plan_tasks.iter().position(|task| task == after);
+                    let before = positions.get(before);
+                    let after = positions.get(after);
                     match (before, after) {
                         (Some(before), Some(after)) if before < after => 0.0,
                         (Some(_), Some(_)) => 1.0,
@@ -336,30 +401,35 @@ impl<'a> RelaxedProblem<'a> {
     /// Decode the relaxed positions into a concrete interleaving that keeps the
     /// order inside every child.
     fn decode(&self, parameters: &[f64]) -> (Vec<String>, Vec<usize>) {
-        let mut next = vec![0usize; self.children.len()];
-        let steps: usize = self.children.iter().map(|child| child.plan.len()).sum();
+        let count = self.children.len();
+        let mut next = vec![0usize; count];
+        let remaining: Vec<usize> = self.children.iter().map(|child| child.plan.len()).collect();
+        let steps: usize = remaining.iter().sum();
+        // The child lengths are hoisted out of the scan, so the inner loop only
+        // reads a counter and a position.
+        let total = self.total;
         let mut plan = Vec::with_capacity(steps);
         let mut tasks = Vec::with_capacity(steps);
         for _ in 0..steps {
-            let mut selected: Option<(usize, f64)> = None;
-            for (index, child) in self.children.iter().enumerate() {
-                if next[index] >= child.plan.len() {
+            let mut selected = usize::MAX;
+            let mut selected_time = f64::INFINITY;
+            for index in 0..count {
+                if next[index] >= remaining[index] {
                     continue;
                 }
-                let time = parameters[index] + next[index] as f64 / self.total;
-                if selected.is_none_or(|(_, best)| time < best) {
-                    selected = Some((index, time));
+                let time = parameters[index] + next[index] as f64 / total;
+                if time < selected_time {
+                    selected_time = time;
+                    selected = index;
                 }
             }
-            match selected {
-                Some((index, _)) => {
-                    let child = &self.children[index];
-                    plan.push(child.plan[next[index]].clone());
-                    tasks.push(child.plan_tasks[next[index]]);
-                    next[index] += 1;
-                }
-                None => break,
+            if selected == usize::MAX {
+                break;
             }
+            let child = &self.children[selected];
+            plan.push(child.plan[next[selected]].clone());
+            tasks.push(child.plan_tasks[next[selected]]);
+            next[selected] += 1;
         }
         (plan, tasks)
     }
@@ -418,7 +488,11 @@ impl SgplanMerger {
             weights = initialization.weights;
             preferred_space = initialization.space;
         }
-        let initial: f64 = problem.exact_violations(&parameters).iter().sum();
+        let initial: f64 = {
+            let mut scratch = MergeScratch::default();
+            problem.exact_violations_into(&parameters, &mut scratch.violations);
+            scratch.violations.iter().sum()
+        };
         if !problem.has_orderings() || self.iterations == 0 || initial <= self.tolerance {
             return Optimization {
                 parameters,
@@ -435,25 +509,33 @@ impl SgplanMerger {
         let mut previous: Option<f64> = None;
         let mut best: Option<(f64, f64, Vec<f64>)> = None;
         let mut rounds = 0;
+        let mut scratch = MergeScratch::default();
+        // The gradient of the current iterate. Swapping it with the scratch
+        // buffer keeps one allocation alive instead of one per Adam step.
+        let mut gradient: Vec<f64> = Vec::new();
         for _ in 0..self.iterations {
             rounds += 1;
             let space = spaces[space_index];
             for _ in 0..self.adam_steps.max(1) {
-                let (objective, gradient) = problem.evaluate(
+                let objective = problem.evaluate_into(
                     &parameters,
                     &weights,
                     space,
                     self.cost_weight,
                     self.temperature,
+                    &mut scratch,
                 );
+                std::mem::swap(&mut gradient, &mut scratch.gradient);
                 let mut evaluate = |candidate: &[f64]| {
-                    problem.evaluate(
+                    let value = problem.evaluate_into(
                         candidate,
                         &weights,
                         space,
                         self.cost_weight,
                         self.temperature,
-                    )
+                        &mut scratch,
+                    );
+                    (value, std::mem::take(&mut scratch.gradient))
                 };
                 optimizer.update(
                     &mut parameters,
@@ -465,14 +547,16 @@ impl SgplanMerger {
                     1.0,
                 );
             }
-            let violations = problem.exact_violations(&parameters);
+            problem.exact_violations_into(&parameters, &mut scratch.violations);
+            let violations = std::mem::take(&mut scratch.violations);
             let total: f64 = violations.iter().sum();
-            let (objective, _) = problem.evaluate(
+            let objective = problem.evaluate_into(
                 &parameters,
                 &weights,
                 space,
                 self.cost_weight,
                 self.temperature,
+                &mut scratch,
             );
             let better = match &best {
                 None => true,
@@ -505,7 +589,8 @@ impl SgplanMerger {
             previous = Some(total);
         }
         if let Some((best_violation, _, best_parameters)) = best {
-            let current: f64 = problem.exact_violations(&parameters).iter().sum();
+            problem.exact_violations_into(&parameters, &mut scratch.violations);
+            let current: f64 = scratch.violations.iter().sum();
             if best_violation < current {
                 parameters = best_parameters;
             }
@@ -564,15 +649,15 @@ impl SgplanMerger {
         let feasible = violations
             .iter()
             .all(|violation| *violation <= self.tolerance);
-        let objective = relaxed
-            .evaluate(
-                &optimization.parameters,
-                &optimization.weights,
-                optimization.space,
-                self.cost_weight,
-                self.temperature,
-            )
-            .0;
+        let mut scratch = MergeScratch::default();
+        let objective = relaxed.evaluate_into(
+            &optimization.parameters,
+            &optimization.weights,
+            optimization.space,
+            self.cost_weight,
+            self.temperature,
+            &mut scratch,
+        );
         self.report = Some(PenaltyReport {
             rounds: optimization.rounds,
             space: optimization.space,

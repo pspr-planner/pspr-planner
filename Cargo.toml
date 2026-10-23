@@ -10,7 +10,7 @@ readme = "README.md"
 default = []
 neural-base = ["dep:burn"]
 neural = ["neural-base", "dep:rayon"]
-neural-gpu = ["neural-base", "burn/wgpu"]
+neural-gpu = ["neural-base", "dep:rayon", "burn/wgpu"]
 
 [lib]
 name = "pspr"

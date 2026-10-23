@@ -23,13 +23,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail, ensure};
 
-use crate::parsing::json::{Action, Formula};
+use crate::parsing::json::Formula;
 use crate::solver::domain::Domain;
 use crate::solver::problem::Problem;
 
 use super::formula::Universe;
 use super::graph::{
-    ConstraintNode, TaskNode, bindings_from, build_task_constraint_graph, ground_atom,
+    ConstraintNode, TaskNode, atom_key_into, bindings_from, build_task_constraint_graph,
     ground_methods,
 };
 use super::leaf::initial_atoms;
@@ -277,7 +277,11 @@ pub(super) fn apply_action(
     universe: &Universe<'_>,
     budget: usize,
 ) -> Result<BTreeSet<String>> {
-    let mut applicable: Vec<(&Action, BTreeMap<String, String>)> = Vec::new();
+    // A plan step only stores the grounded operator name. If several schemas
+    // share the name and arity the plan cannot distinguish them, so the first
+    // applicable schema is used. Stop at that schema instead of collecting and
+    // then discarding the remaining candidates.
+    let mut selected = None;
     for action in domain.actions_for(&task.name) {
         if action.parameters.len() != task.terms.len() {
             continue;
@@ -298,39 +302,38 @@ pub(super) fn apply_action(
             universe,
             budget,
         )? {
-            applicable.push((action, bindings));
+            selected = Some((action, bindings));
+            break;
         }
     }
-    ensure!(
-        !applicable.is_empty(),
-        "no action schema for `{task}` is applicable in the current state"
-    );
-    // A plan step only stores the grounded operator name. If several schemas
-    // share the name and arity the plan cannot distinguish them, so the first
-    // applicable schema is used.
-    let (action, bindings) = &applicable[0];
+    let Some((action, bindings)) = selected else {
+        bail!("no action schema for `{task}` is applicable in the current state");
+    };
 
     let mut adds = BTreeSet::new();
     let mut deletes = BTreeSet::new();
+    let mut scratch = String::new();
     collect_effects(
         action.effects.as_ref(),
-        bindings,
+        &bindings,
         state,
         universe,
         budget,
         &mut adds,
         &mut deletes,
+        &mut scratch,
     )?;
-    let conflicts: Vec<&String> = adds.intersection(&deletes).collect();
-    ensure!(
-        conflicts.is_empty(),
-        "the effects of `{task}` both add and delete {}",
-        conflicts
-            .iter()
-            .map(|atom| format!("`{atom}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    if !adds.is_disjoint(&deletes) {
+        let conflicts: Vec<&String> = adds.intersection(&deletes).collect();
+        bail!(
+            "the effects of `{task}` both add and delete {}",
+            conflicts
+                .iter()
+                .map(|atom| format!("`{atom}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let mut next = state.clone();
     for atom in &deletes {
         next.remove(atom);
@@ -434,15 +437,32 @@ pub(super) fn holds(
     universe: &Universe<'_>,
     budget: usize,
 ) -> Result<bool> {
+    // One scratch buffer per evaluation: atom keys are written into it and
+    // looked up as `&str`, so checking a literal allocates nothing.
+    let mut scratch = String::new();
+    holds_into(formula, bindings, state, universe, budget, &mut scratch)
+}
+
+fn holds_into(
+    formula: &Formula,
+    bindings: &BTreeMap<String, String>,
+    state: &BTreeSet<String>,
+    universe: &Universe<'_>,
+    budget: usize,
+    scratch: &mut String,
+) -> Result<bool> {
     match formula {
         Formula::Empty => Ok(true),
         Formula::Atom(predicate) => {
-            Ok(state.contains(&ground_atom(predicate, bindings).to_string()))
+            atom_key_into(predicate, bindings, scratch);
+            Ok(state.contains(scratch.as_str()))
         }
-        Formula::Not(inner) => Ok(!holds(inner, bindings, state, universe, budget)?),
+        Formula::Not(inner) => Ok(!holds_into(
+            inner, bindings, state, universe, budget, scratch,
+        )?),
         Formula::And(items) => {
             for item in items {
-                if !holds(item, bindings, state, universe, budget)? {
+                if !holds_into(item, bindings, state, universe, budget, scratch)? {
                     return Ok(false);
                 }
             }
@@ -450,7 +470,7 @@ pub(super) fn holds(
         }
         Formula::Or(items) => {
             for item in items {
-                if holds(item, bindings, state, universe, budget)? {
+                if holds_into(item, bindings, state, universe, budget, scratch)? {
                     return Ok(true);
                 }
             }
@@ -459,7 +479,7 @@ pub(super) fn holds(
         Formula::Xor(items) => {
             let mut satisfied = 0;
             for item in items {
-                if holds(item, bindings, state, universe, budget)? {
+                if holds_into(item, bindings, state, universe, budget, scratch)? {
                     satisfied += 1;
                     if satisfied > 1 {
                         return Ok(false);
@@ -468,13 +488,16 @@ pub(super) fn holds(
             }
             Ok(satisfied == 1)
         }
-        Formula::Imply(left, right) => Ok(!holds(left, bindings, state, universe, budget)?
-            || holds(right, bindings, state, universe, budget)?),
+        Formula::Imply(left, right) => Ok(!holds_into(
+            left, bindings, state, universe, budget, scratch,
+        )? || holds_into(
+            right, bindings, state, universe, budget, scratch,
+        )?),
         Formula::Exists(variables, body) => {
             for assignment in universe.assignments(variables, budget)? {
                 let mut local = bindings.clone();
                 local.extend(assignment);
-                if holds(body, &local, state, universe, budget)? {
+                if holds_into(body, &local, state, universe, budget, scratch)? {
                     return Ok(true);
                 }
             }
@@ -484,7 +507,7 @@ pub(super) fn holds(
             for assignment in universe.assignments(variables, budget)? {
                 let mut local = bindings.clone();
                 local.extend(assignment);
-                if !holds(body, &local, state, universe, budget)? {
+                if !holds_into(body, &local, state, universe, budget, scratch)? {
                     return Ok(false);
                 }
             }
@@ -497,6 +520,7 @@ pub(super) fn holds(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_effects(
     formula: Option<&Formula>,
     bindings: &BTreeMap<String, String>,
@@ -505,6 +529,7 @@ fn collect_effects(
     budget: usize,
     adds: &mut BTreeSet<String>,
     deletes: &mut BTreeSet<String>,
+    scratch: &mut String,
 ) -> Result<()> {
     let Some(formula) = formula else {
         return Ok(());
@@ -512,12 +537,14 @@ fn collect_effects(
     match formula {
         Formula::Empty => Ok(()),
         Formula::Atom(predicate) => {
-            adds.insert(ground_atom(predicate, bindings).to_string());
+            atom_key_into(predicate, bindings, scratch);
+            adds.insert(scratch.clone());
             Ok(())
         }
         Formula::Not(inner) => match inner.as_ref() {
             Formula::Atom(predicate) => {
-                deletes.insert(ground_atom(predicate, bindings).to_string());
+                atom_key_into(predicate, bindings, scratch);
+                deletes.insert(scratch.clone());
                 Ok(())
             }
             Formula::Empty => bail!("the effect `not ()` is unsatisfiable"),
@@ -529,6 +556,7 @@ fn collect_effects(
                 budget,
                 adds,
                 deletes,
+                scratch,
             ),
             Formula::Or(items) => {
                 for item in items {
@@ -541,6 +569,7 @@ fn collect_effects(
                         budget,
                         adds,
                         deletes,
+                        scratch,
                     )?;
                 }
                 Ok(())
@@ -556,7 +585,16 @@ fn collect_effects(
         },
         Formula::And(items) => {
             for item in items {
-                collect_effects(Some(item), bindings, state, universe, budget, adds, deletes)?;
+                collect_effects(
+                    Some(item),
+                    bindings,
+                    state,
+                    universe,
+                    budget,
+                    adds,
+                    deletes,
+                    scratch,
+                )?;
             }
             Ok(())
         }
@@ -570,6 +608,7 @@ fn collect_effects(
                     budget,
                     adds,
                     deletes,
+                    scratch,
                 )?;
             }
             Ok(())
@@ -578,7 +617,16 @@ fn collect_effects(
             for assignment in universe.assignments(variables, budget)? {
                 let mut local = bindings.clone();
                 local.extend(assignment);
-                collect_effects(Some(body), &local, state, universe, budget, adds, deletes)?;
+                collect_effects(
+                    Some(body),
+                    &local,
+                    state,
+                    universe,
+                    budget,
+                    adds,
+                    deletes,
+                    scratch,
+                )?;
             }
             Ok(())
         }

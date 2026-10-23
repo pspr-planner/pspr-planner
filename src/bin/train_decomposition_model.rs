@@ -28,10 +28,13 @@ use pspr::parsing::parser::{ParserConfig, parse_program, resolve_parser_config};
 use pspr::solver::domain::{Domain, process_domain};
 use pspr::solver::evaluation_tree::{
     DECOMPOSITION_FEATURE_DIM, DECOMPOSITION_HIDDEN, DecompositionGraph, DecompositionModel,
-    DecompositionSession, DecompositionTraceSink, EvaluationOptions, GuidanceKind, MethodSummary,
-    MethodTrace, RefinementOptions, SearchTrace, SgplanMerger, evaluate, refine_plan_with_session,
+    DecompositionSession, DecompositionTraceSink, EvaluationOptions, GraphTensors, GuidanceKind,
+    MethodSummary, MethodTrace, RefinementOptions, SearchTrace, SgplanMerger, evaluate,
+    refine_plan_with_session,
 };
 use pspr::solver::problem::{Problem, load_problem};
+#[cfg(any(feature = "neural", feature = "neural-gpu"))]
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum TrainTask {
@@ -74,6 +77,11 @@ struct Args {
     /// budget between the two heads.
     #[arg(long, default_value_t = 4_096)]
     max_samples: usize,
+    /// Number of Rayon worker threads for trace collection and example
+    /// construction. Zero uses Rayon's default or `RAYON_NUM_THREADS`.
+    #[cfg(any(feature = "neural", feature = "neural-gpu"))]
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    jobs: usize,
     /// Grounding limit while collecting traces.
     #[arg(long, default_value_t = 32_768)]
     max_groundings: usize,
@@ -116,19 +124,51 @@ impl Example {
             Example::Policy(_) => TrainTask::Policy,
         }
     }
-
-    fn label(&self) -> &str {
-        match self {
-            Example::Method(example) => &example.label,
-            Example::Policy(example) => &example.label,
-        }
-    }
 }
 
 #[derive(Debug, Default)]
 struct TraceCollector {
     methods: Vec<MethodTrace>,
     searches: Vec<SearchTrace>,
+}
+
+struct CollectedProblem {
+    methods: Vec<MethodTrace>,
+    searches: Vec<SearchTrace>,
+    refined: Option<(usize, usize)>,
+    refinement_error: Option<String>,
+}
+
+struct LoadedProblem {
+    domain: Domain,
+    problem: Problem,
+}
+
+struct EvaluatedProblem {
+    domain_path: PathBuf,
+    problem_path: PathBuf,
+    domain: Domain,
+    problem: Problem,
+    plan: Vec<String>,
+}
+
+struct PreparedExample {
+    graph: GraphTensors,
+    indices: Tensor<1, Int>,
+    target: Tensor<1>,
+    value_target: Option<Tensor<1>>,
+    task: TrainTask,
+    label: String,
+}
+
+impl PreparedExample {
+    fn task(&self) -> TrainTask {
+        self.task
+    }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
 }
 
 impl DecompositionTraceSink for TraceCollector {
@@ -148,6 +188,13 @@ fn main() -> Result<()> {
     }
     if args.max_samples == 0 {
         bail!("--max-samples must be at least 1");
+    }
+    #[cfg(any(feature = "neural", feature = "neural-gpu"))]
+    if args.jobs > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(args.jobs)
+            .build_global()
+            .map_err(|error| anyhow::anyhow!("cannot configure Rayon: {error}"))?;
     }
     let run_started = Instant::now();
     let parser = resolve_parser_config(args.parser.as_deref()).map_err(anyhow::Error::msg)?;
@@ -269,31 +316,64 @@ fn collect_traces(
         max_groundings: args.max_groundings,
         max_depth: 64,
     };
-    let mut methods = Vec::new();
-    let mut searches = Vec::new();
     let mut failures: BTreeMap<String, (usize, PathBuf)> = BTreeMap::new();
-    for (domain_path, problem_path) in pairs {
-        match collect_one(
-            parser,
-            domain_path,
-            problem_path,
-            &evaluation_options,
-            &refinement_options,
-            args.verbose,
-        ) {
-            Ok((mut method_traces, mut search_traces)) => {
-                if args.verbose {
-                    println!(
-                        "{} + {}: {} method trace(s), {} frontier trace(s)",
-                        domain_path.display(),
-                        problem_path.display(),
-                        method_traces.len(),
-                        search_traces.len()
-                    );
-                }
-                methods.append(&mut method_traces);
-                searches.append(&mut search_traces);
-            }
+
+    // Parse and load inputs in parallel. This stage does not touch SCIP.
+    #[cfg(any(feature = "neural", feature = "neural-gpu"))]
+    let loaded: Vec<Result<LoadedProblem>> = pairs
+        .par_iter()
+        .map(|(domain_path, problem_path)| load_one(parser, domain_path, problem_path))
+        .collect();
+    #[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
+    let loaded: Vec<Result<LoadedProblem>> = pairs
+        .iter()
+        .map(|(domain_path, problem_path)| load_one(parser, domain_path, problem_path))
+        .collect();
+
+    // `russcip` creates one model per call and its own test suite exercises
+    // concurrent models. If a downstream SCIP build is not thread-safe, run
+    // with `--jobs 1`; the parallel iterator then degenerates to serial work.
+    #[cfg(any(feature = "neural", feature = "neural-gpu"))]
+    let evaluated_with_paths: Vec<(PathBuf, PathBuf, Result<EvaluatedProblem>)> = pairs
+        .par_iter()
+        .zip(loaded.into_par_iter())
+        .map(|((domain_path, problem_path), loaded)| {
+            let result = loaded.and_then(|loaded| {
+                let (domain, problem, plan) = evaluate_one(loaded, &evaluation_options)?;
+                Ok(EvaluatedProblem {
+                    domain_path: domain_path.clone(),
+                    problem_path: problem_path.clone(),
+                    domain,
+                    problem,
+                    plan,
+                })
+            });
+            (domain_path.clone(), problem_path.clone(), result)
+        })
+        .collect();
+    #[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
+    let evaluated_with_paths: Vec<(PathBuf, PathBuf, Result<EvaluatedProblem>)> = pairs
+        .iter()
+        .zip(loaded)
+        .map(|((domain_path, problem_path), loaded)| {
+            let result = loaded.and_then(|loaded| {
+                let (domain, problem, plan) = evaluate_one(loaded, &evaluation_options)?;
+                Ok(EvaluatedProblem {
+                    domain_path: domain_path.clone(),
+                    problem_path: problem_path.clone(),
+                    domain,
+                    problem,
+                    plan,
+                })
+            });
+            (domain_path.clone(), problem_path.clone(), result)
+        })
+        .collect();
+
+    let mut evaluated = Vec::new();
+    for (domain_path, problem_path, result) in evaluated_with_paths {
+        match result {
+            Ok(evaluated_problem) => evaluated.push(evaluated_problem),
             Err(error) => {
                 let message = format!("{error:#}");
                 if args.verbose {
@@ -310,6 +390,39 @@ fn collect_traces(
             }
         }
     }
+
+    #[cfg(any(feature = "neural", feature = "neural-gpu"))]
+    let results: Vec<CollectedProblem> = evaluated
+        .par_iter()
+        .map(|evaluated| refine_one(evaluated, &refinement_options))
+        .collect();
+    #[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
+    let results: Vec<CollectedProblem> = evaluated
+        .iter()
+        .map(|evaluated| refine_one(evaluated, &refinement_options))
+        .collect();
+
+    let mut methods = Vec::new();
+    let mut searches = Vec::new();
+    for (evaluated, mut collected) in evaluated.into_iter().zip(results) {
+        if args.verbose {
+            if let Some((actions, methods)) = collected.refined {
+                println!("  refined {actions} action(s), {methods} method(s)");
+            }
+            if let Some(error) = &collected.refinement_error {
+                eprintln!("  refinement ended early: {error}");
+            }
+            println!(
+                "{} + {}: {} method trace(s), {} frontier trace(s)",
+                evaluated.domain_path.display(),
+                evaluated.problem_path.display(),
+                collected.methods.len(),
+                collected.searches.len()
+            );
+        }
+        methods.append(&mut collected.methods);
+        searches.append(&mut collected.searches);
+    }
     for (reason, (count, example)) in failures {
         eprintln!(
             "skipped {count} problem(s), e.g. {}: {reason}",
@@ -319,14 +432,11 @@ fn collect_traces(
     Ok((methods, searches))
 }
 
-fn collect_one(
+fn load_one(
     parser: &ParserConfig,
     domain_path: &Path,
     problem_path: &Path,
-    evaluation_options: &EvaluationOptions,
-    refinement_options: &RefinementOptions,
-    verbose: bool,
-) -> Result<(Vec<MethodTrace>, Vec<SearchTrace>)> {
+) -> Result<LoadedProblem> {
     let program =
         parse_program(parser, domain_path, Some(problem_path)).map_err(anyhow::Error::msg)?;
     let domain: Domain = process_domain(&program.domain).map_err(anyhow::Error::msg)?;
@@ -334,12 +444,28 @@ fn collect_one(
         .problem
         .ok_or_else(|| anyhow::anyhow!("the parser returned no problem"))?;
     let problem: Problem = load_problem(&domain, &problem_ast).map_err(anyhow::Error::msg)?;
+    Ok(LoadedProblem { domain, problem })
+}
 
+fn evaluate_one(
+    loaded: LoadedProblem,
+    evaluation_options: &EvaluationOptions,
+) -> Result<(Domain, Problem, Vec<String>)> {
+    let LoadedProblem { domain, problem } = loaded;
     let mut merger = SgplanMerger::default().without_initializer();
     let evaluation = evaluate(&domain, &problem, &mut merger, evaluation_options)
         .with_context(|| "evaluation failed")?;
-    if evaluation.plan.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+    Ok((domain, problem, evaluation.plan))
+}
+
+fn refine_one(evaluated: &EvaluatedProblem, options: &RefinementOptions) -> CollectedProblem {
+    if evaluated.plan.is_empty() {
+        return CollectedProblem {
+            methods: Vec::new(),
+            searches: Vec::new(),
+            refined: None,
+            refinement_error: None,
+        };
     }
 
     let mut collector = TraceCollector::default();
@@ -349,30 +475,26 @@ fn collect_one(
             ..DecompositionSession::default()
         };
         refine_plan_with_session(
-            &domain,
-            &problem,
-            &evaluation.plan,
-            refinement_options,
+            &evaluated.domain,
+            &evaluated.problem,
+            &evaluated.plan,
+            options,
             &mut session,
         )
     };
-    match refinement {
-        Ok(refinement) => {
-            if verbose {
-                println!(
-                    "  refined {} action(s), {} method(s)",
-                    refinement.plan.len(),
-                    refinement.method_count()
-                );
-            }
-        }
-        Err(error) => {
-            if verbose {
-                eprintln!("  refinement ended early: {error:#}");
-            }
-        }
+    let (refined, refinement_error) = match refinement {
+        Ok(refinement) => (
+            Some((refinement.plan.len(), refinement.method_count())),
+            None,
+        ),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    CollectedProblem {
+        methods: collector.methods,
+        searches: collector.searches,
+        refined,
+        refinement_error,
     }
-    Ok((collector.methods, collector.searches))
 }
 
 fn build_examples(
@@ -407,28 +529,8 @@ fn build_examples(
     } else {
         (0, max_samples)
     };
-    let mut method_examples = Vec::new();
-    if method_budget > 0 {
-        for trace in method_traces {
-            if method_examples.len() >= method_budget {
-                break;
-            }
-            if let Some(example) = method_example(trace) {
-                method_examples.push(Example::Method(example));
-            }
-        }
-    }
-    let mut policy_examples = Vec::new();
-    if policy_budget > 0 {
-        for trace in search_traces {
-            if policy_examples.len() >= policy_budget {
-                break;
-            }
-            if let Some(example) = policy_example(trace) {
-                policy_examples.push(Example::Policy(example));
-            }
-        }
-    }
+    let method_examples = build_method_examples(method_traces, method_budget);
+    let policy_examples = build_policy_examples(search_traces, policy_budget);
     if !matches!(task, TrainTask::Both) {
         return Ok(method_examples.into_iter().chain(policy_examples).collect());
     }
@@ -466,6 +568,79 @@ fn usable_policy(trace: &SearchTrace) -> bool {
         && trace.order.len() == trace.ready.len()
         && trace.successful.len() == trace.order.len()
         && trace.successful.iter().any(|successful| *successful)
+}
+
+#[cfg(any(feature = "neural", feature = "neural-gpu"))]
+const EXAMPLE_CHUNK: usize = 512;
+
+#[cfg(any(feature = "neural", feature = "neural-gpu"))]
+fn build_method_examples(traces: &[MethodTrace], budget: usize) -> Vec<Example> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    let mut examples = Vec::with_capacity(budget);
+    let chunk_size = EXAMPLE_CHUNK.min(budget).max(1);
+    for chunk in traces.chunks(chunk_size) {
+        let mut batch: Vec<Example> = chunk
+            .par_iter()
+            .filter_map(method_example)
+            .map(Example::Method)
+            .collect();
+        let remaining = budget - examples.len();
+        if batch.len() > remaining {
+            batch.truncate(remaining);
+        }
+        examples.extend(batch);
+        if examples.len() >= budget {
+            break;
+        }
+    }
+    examples
+}
+
+#[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
+fn build_method_examples(traces: &[MethodTrace], budget: usize) -> Vec<Example> {
+    traces
+        .iter()
+        .filter_map(method_example)
+        .take(budget)
+        .map(Example::Method)
+        .collect()
+}
+
+#[cfg(any(feature = "neural", feature = "neural-gpu"))]
+fn build_policy_examples(traces: &[SearchTrace], budget: usize) -> Vec<Example> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    let mut examples = Vec::with_capacity(budget);
+    let chunk_size = EXAMPLE_CHUNK.min(budget).max(1);
+    for chunk in traces.chunks(chunk_size) {
+        let mut batch: Vec<Example> = chunk
+            .par_iter()
+            .filter_map(policy_example)
+            .map(Example::Policy)
+            .collect();
+        let remaining = budget - examples.len();
+        if batch.len() > remaining {
+            batch.truncate(remaining);
+        }
+        examples.extend(batch);
+        if examples.len() >= budget {
+            break;
+        }
+    }
+    examples
+}
+
+#[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
+fn build_policy_examples(traces: &[SearchTrace], budget: usize) -> Vec<Example> {
+    traces
+        .iter()
+        .filter_map(policy_example)
+        .take(budget)
+        .map(Example::Policy)
+        .collect()
 }
 
 fn method_example(trace: &MethodTrace) -> Option<MethodExample> {
@@ -582,23 +757,33 @@ fn train(
     let device = training_device();
     let mut model = DecompositionModel::new(&device);
     let mut optimizer = AdamConfig::new().init();
-    let total_steps = args.epochs.saturating_mul(examples.len());
+    let prepared: Vec<PreparedExample> = examples
+        .iter()
+        .filter_map(|example| prepare_example(example, &device))
+        .collect();
+    if prepared.len() != examples.len() {
+        bail!(
+            "{} training example(s) could not be prepared for the selected device",
+            examples.len() - prepared.len()
+        );
+    }
+    let total_steps = args.epochs.saturating_mul(prepared.len());
     let mut best_loss = f64::INFINITY;
     let mut overall_total = 0.0f64;
     let mut overall_count = 0usize;
 
     println!(
         "training {} example(s), {} epoch(s), feature_dim={DECOMPOSITION_FEATURE_DIM}, hidden={DECOMPOSITION_HIDDEN}",
-        examples.len(),
+        prepared.len(),
         args.epochs
     );
     for epoch in 0..args.epochs {
         let mut total = 0.0f32;
         let mut count = 0usize;
-        for offset in 0..examples.len() {
-            let index = (offset * 7919 + epoch * 104_729) % examples.len();
-            let example = &examples[index];
-            let loss = example_loss(&model, example, &device);
+        for offset in 0..prepared.len() {
+            let index = (offset * 7919 + epoch * 104_729) % prepared.len();
+            let example = &prepared[index];
+            let loss = example_loss(&model, example);
             let step_loss = loss
                 .clone()
                 .and_then(|loss| loss.into_data().try_to_vec::<f32>().ok())
@@ -614,7 +799,7 @@ fn train(
                 overall_count += 1;
             }
 
-            let global_step = epoch * examples.len() + offset + 1;
+            let global_step = epoch * prepared.len() + offset + 1;
             let percent = if total_steps == 0 {
                 100.0
             } else {
@@ -651,11 +836,11 @@ fn train(
         } else {
             overall_total / overall_count as f64
         };
-        let completed_steps = (epoch + 1) * examples.len();
+        let completed_steps = (epoch + 1) * prepared.len();
         let elapsed = training_started.elapsed().as_secs_f64();
         let average_step = elapsed / completed_steps as f64;
         let remaining =
-            average_step * args.epochs.saturating_sub(epoch + 1) as f64 * examples.len() as f64;
+            average_step * args.epochs.saturating_sub(epoch + 1) as f64 * prepared.len() as f64;
         println!(
             "epoch {}/{} complete: loss {mean:.6e} best {best_loss:.6e} overall {overall_mean:.6e} | elapsed {} | eta {}",
             epoch + 1,
@@ -701,11 +886,7 @@ fn train(
     Ok(())
 }
 
-fn example_loss(
-    model: &DecompositionModel,
-    example: &Example,
-    device: &Device,
-) -> Option<Tensor<1>> {
+fn prepare_example(example: &Example, device: &Device) -> Option<PreparedExample> {
     match example {
         Example::Method(example) => {
             if example.graph.candidate_indices.len() < 2
@@ -713,11 +894,14 @@ fn example_loss(
             {
                 return None;
             }
-            let graph = example.graph.tensors(device);
-            let (scores, _, _) = model.forward(&graph);
-            let scores = scores.select(0, index_tensor(&example.graph.candidate_indices, device));
-            let target = tensor(&example.target, device);
-            Some(cross_entropy(scores, target))
+            Some(PreparedExample {
+                graph: example.graph.tensors(device),
+                indices: index_tensor(&example.graph.candidate_indices, device),
+                target: tensor(&example.target, device),
+                value_target: None,
+                task: TrainTask::Method,
+                label: example.label.clone(),
+            })
         }
         Example::Policy(example) => {
             if example.graph.ready_indices.len() < 2
@@ -725,15 +909,33 @@ fn example_loss(
             {
                 return None;
             }
-            let graph = example.graph.tensors(device);
-            let (_, scores, value) = model.forward(&graph);
-            let scores = scores.select(0, index_tensor(&example.graph.ready_indices, device));
-            let target = tensor(&example.target, device);
-            let policy_loss = cross_entropy(scores, target);
-            let value_target = tensor(&[example.value_target], device);
+            Some(PreparedExample {
+                graph: example.graph.tensors(device),
+                indices: index_tensor(&example.graph.ready_indices, device),
+                target: tensor(&example.target, device),
+                value_target: Some(tensor(&[example.value_target], device)),
+                task: TrainTask::Policy,
+                label: example.label.clone(),
+            })
+        }
+    }
+}
+
+fn example_loss(model: &DecompositionModel, example: &PreparedExample) -> Option<Tensor<1>> {
+    let (method_scores, policy_scores, value) = model.forward(&example.graph);
+    match example.task {
+        TrainTask::Method => {
+            let scores = method_scores.select(0, example.indices.clone());
+            Some(cross_entropy(scores, example.target.clone()))
+        }
+        TrainTask::Policy => {
+            let scores = policy_scores.select(0, example.indices.clone());
+            let policy_loss = cross_entropy(scores, example.target.clone());
+            let value_target = example.value_target.clone()?;
             let value_loss = (value - value_target).square().mean().mul_scalar(0.1);
             Some(policy_loss + value_loss)
         }
+        TrainTask::Both => None,
     }
 }
 

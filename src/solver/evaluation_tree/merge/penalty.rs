@@ -45,11 +45,29 @@ impl PenaltySpace {
     }
 
     /// `d phi / d v`.
+    #[allow(dead_code)]
     pub(super) fn slope(self, violation: f64) -> f64 {
         match self {
             PenaltySpace::Linear => 1.0,
             PenaltySpace::Quadratic => 2.0 * violation + 1.0,
             PenaltySpace::Exponential => (EXPONENTIAL_SCALE * violation).exp(),
+        }
+    }
+
+    /// `(phi(v), d phi / d v)` in one pass.
+    ///
+    /// The exponential space needs `exp(4 v)` for both the value and the
+    /// slope; computing it once removes a transcendental call from the inner
+    /// loop of the merge optimizer.
+    #[inline]
+    pub(super) fn value_and_slope(self, violation: f64) -> (f64, f64) {
+        match self {
+            PenaltySpace::Linear => (violation, 1.0),
+            PenaltySpace::Quadratic => (violation * violation + violation, 2.0 * violation + 1.0),
+            PenaltySpace::Exponential => {
+                let exponential = (EXPONENTIAL_SCALE * violation).exp_m1();
+                (exponential / EXPONENTIAL_SCALE, exponential + 1.0)
+            }
         }
     }
 }
@@ -61,6 +79,10 @@ impl fmt::Display for PenaltySpace {
 }
 
 /// The logistic function `1 / (1 + exp(-value))`, computed without overflow.
+///
+/// Reference implementation kept for the tests: the merge derives the logistic
+/// and the softplus of the same argument from one exponential.
+#[cfg(test)]
 pub(super) fn logistic(value: f64) -> f64 {
     if value >= 0.0 {
         1.0 / (1.0 + (-value).exp())
@@ -71,6 +93,9 @@ pub(super) fn logistic(value: f64) -> f64 {
 }
 
 /// The softplus function `ln(1 + exp(value))`, computed without overflow.
+///
+/// Reference implementation kept for the tests, see [`logistic`].
+#[cfg(test)]
 pub(super) fn softplus(value: f64) -> f64 {
     if value > 30.0 {
         value
@@ -83,20 +108,36 @@ pub(super) fn softplus(value: f64) -> f64 {
 ///
 /// Returns the smooth maximum of `values` together with the softmax weights,
 /// which are the gradient of the maximum with respect to the inputs.
+#[cfg(test)]
 pub(super) fn smooth_max(values: &[f64], temperature: f64) -> (f64, Vec<f64>) {
+    let mut weights = Vec::new();
+    let value = smooth_max_into(values, temperature, &mut weights);
+    (value, weights)
+}
+
+/// [`smooth_max`] writing the softmax weights into `weights`.
+///
+/// `weights` is cleared and refilled, so the merge optimizer can reuse one
+/// buffer across the thousands of evaluations of a single merge.
+pub(super) fn smooth_max_into(values: &[f64], temperature: f64, weights: &mut Vec<f64>) -> f64 {
+    weights.clear();
     if values.is_empty() {
-        return (0.0, Vec::new());
+        return 0.0;
     }
     let temperature = temperature.max(f64::MIN_POSITIVE);
     let largest = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let scaled: Vec<f64> = values
-        .iter()
-        .map(|value| ((value - largest) / temperature).exp())
-        .collect();
-    let sum: f64 = scaled.iter().sum();
-    let value = largest + temperature * sum.ln();
-    let weights = scaled.iter().map(|weight| weight / sum).collect();
-    (value, weights)
+    let inverse = 1.0 / temperature;
+    let mut sum = 0.0;
+    weights.extend(values.iter().map(|value| {
+        let weight = ((value - largest) * inverse).exp();
+        sum += weight;
+        weight
+    }));
+    let inverse_sum = 1.0 / sum;
+    for weight in weights.iter_mut() {
+        *weight *= inverse_sum;
+    }
+    largest + temperature * sum.ln()
 }
 
 #[cfg(test)]
@@ -146,5 +187,30 @@ mod tests {
         assert!(softplus(-1e6).is_finite());
         assert!((softplus(1e6) - 1e6).abs() < 1e-9);
         assert!((softplus(0.0) - 2.0_f64.ln()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn one_exponential_serves_the_logistic_and_the_softplus() {
+        // The merge computes both values from `z = exp(x)`; this pins that
+        // fused form to the reference implementations.
+        for &scaled in &[-40.0_f64, -10.0, -1.0, 0.0, 1.0, 10.0, 30.0] {
+            let exponential = scaled.exp();
+            let logistic_from_one = exponential / (1.0 + exponential);
+            let softplus_from_one = exponential.ln_1p();
+            assert!(
+                (logistic_from_one - logistic(scaled)).abs() < 1e-12,
+                "logistic at {scaled}"
+            );
+            assert!(
+                (softplus_from_one - softplus(scaled)).abs() < 1e-9 * (1.0 + scaled.abs()),
+                "softplus at {scaled}"
+            );
+        }
+        // The exponential space takes its value and slope from one `exp_m1`.
+        for &violation in &[0.0_f64, 0.1, 1.0, 5.0] {
+            let (value, slope) = PenaltySpace::Exponential.value_and_slope(violation);
+            assert!((value - PenaltySpace::Exponential.value(violation)).abs() < 1e-12);
+            assert!((slope - PenaltySpace::Exponential.slope(violation)).abs() < 1e-9 * slope);
+        }
     }
 }
