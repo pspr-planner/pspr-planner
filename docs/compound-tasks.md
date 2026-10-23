@@ -236,6 +236,20 @@ but its results must be refined or verified: `validate_plan` detects the
 goal-level failures, while the strict recursive validation described in
 Approach C detects the decomposition-level failures.
 
+The first direction is detectable statically for a fixed grounding.
+`evaluation_tree::liftability` computes the may-write literals of every
+reachable ground task node as a least fixpoint over the method decomposition,
+intersects them with the DNF literals of every later method or action
+precondition in the transitive closure of the top-level ordering, and reports
+each match as a *hidden satisfier* (same sign: the projection cannot see the
+write) or a *hidden falsifier* (opposite sign: the projection keeps believing
+the literal). The analysis over-approximates on purpose -- it ignores
+preconditions, merges disjunctive effects, and expands every method grounding
+-- so a reported pair is a candidate rather than a proof, and a clean report
+is not a proof of liftability. `LiftabilityReport::truncated` records whether
+a grounding or node bound was hit, and the `--liftability` flag of the CLI
+prints the report for a problem.
+
 Call a top-level plan $\pi \in \mathrm{TopPlans}(P)$ **liftable** when there
 is a primitive decomposition $D$ and a linearisation $\pi'$ of $L(D)$ such
 that

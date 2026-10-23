@@ -1,0 +1,986 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.55cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+
+\newtheorem{definition}{Definition}[section]
+\newtheorem{proposition}[definition]{Proposition}
+\newtheorem{remark}[definition]{Remark}
+
+\newcommand{\exec}{\mathrm{exec}}
+\newcommand{\pre}{\mathrm{pre}}
+\newcommand{\add}{\mathrm{add}}
+\newcommand{\del}{\mathrm{del}}
+\newcommand{\clamp}{\operatorname{clamp}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\LSE}{\operatorname{LSE}}
+\newcommand{\pos}{\operatorname{pos}}
+\newcommand{\NN}{\mathbb{N}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\cK}{\mathcal{K}}
+\newcommand{\cT}{\mathcal{T}}
+\newcommand{\cC}{\mathcal{C}}
+\newcommand{\cR}{\mathcal{R}}
+\newcommand{\cS}{\mathcal{S}}
+\newcommand{\cP}{\mathcal{P}}
+
+\title{The PSPR Planning Algorithm\\[2pt]
+\large Constraint Partitioning, Relaxed Penalty Merging, and Hierarchical Refinement}
+\author{PSPR project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{The planning problem}
+
+A grounded hierarchical planning problem is a tuple
+\begin{equation}
+P=\langle F,\,A,\,C,\,M,\,s_0,\,TN_0,\,g\rangle,
+\end{equation}
+where $F$ is a finite set of ground atoms, $A$ a set of primitive action schemas,
+$C$ a set of compound task schemas, $M$ a set of methods,
+$s_0\subseteq F$ the initial state, $TN_0=\langle T_0,\prec_0,\approx_0\rangle$
+the initial task network, and $g$ a state-goal formula, possibly absent.
+For a primitive action $a$ with precondition $\pre_a\subseteq F$,
+add effects $\add_a\subseteq F$, and delete effects $\del_a\subseteq F$,
+the state transition is
+\begin{equation}
+\tau_a(s)=
+\begin{cases}
+(s\setminus\del_a)\cup\add_a & \text{if } s\models\pre_a,\\
+\text{undefined} & \text{otherwise}.
+\end{cases}
+\end{equation}
+A task network is $TN=\langle T,\prec,\approx\rangle$: a finite multiset of task
+occurrences, an acyclic ordering $\prec\;\subseteq T\times T$, and equality and
+inequality constraints $\approx$. A method
+\begin{equation}
+m=\langle c(\vec{x}),\,\phi_m,\,TN_m\rangle
+\end{equation}
+decomposes the compound task $c(\vec{x})$ into the subtask network $TN_m$.
+A decomposition step replaces an occurrence $t=c(\vec{t})$ by a grounded method
+instance $m\sigma$ and updates the ordering by
+\begin{equation}
+\prec'=\prec\;\cup\;\prec_m\sigma
+\;\cup\;\{(u,v)\mid u\prec t,\;v\in T_m\sigma\}
+\;\cup\;\{(v,w)\mid v\in T_m\sigma,\;t\prec w\}.
+\end{equation}
+A decomposition tree $D$ is primitive when every task in its frontier $L(D)$
+is a primitive action. A plan $\pi=\langle a_1,\dots,a_k\rangle$ is a
+linearisation of $L(D)$ that respects $\prec_D$ and $\approx_D$; it is
+executable from $s_0$ when each $a_i$ is applicable in the state produced by
+its predecessors, and it is a solution when, in addition, the final state
+satisfies $g$.
+
+\paragraph{Notation.}
+For a task occurrence $t$ we write $\mathrm{head}(t)$ for its task symbol and
+$\mathrm{args}(t)$ for its ground arguments. The projection of a set of ground
+atoms onto a subset $X\subseteq F$ is $s[X]=\{a\in s\mid a\in X\}$.
+
+\section{The abstraction computed by the evaluation tree}
+
+The evaluation tree does not solve $P$ directly. It solves a
+\emph{top-level projection} $\alpha(P)$ in which compound tasks are opaque.
+For every grounded task occurrence $t\in T_0$ introduce a marker atom
+$\exec_t\notin F$. A primitive occurrence $t$ with $\mathrm{head}(t)=a$ is
+compiled into the operator
+\begin{equation}
+\pre(o_t)=\pre_a\;\wedge\;\bigwedge_{u\prec_0 t}\exec_u,
+\qquad
+\add(o_t)=\add_a\cup\{\exec_t\},
+\qquad
+\del(o_t)=\del_a,
+\label{eq:abstract-action}
+\end{equation}
+and a compound occurrence $t$ with method instances $M(t)$ gets one operator
+per instance $m\sigma$:
+\begin{equation}
+\pre(o_{t,m})=\phi_m\sigma\;\wedge\;\bigwedge_{u\prec_0 t}\exec_u,
+\qquad
+\add(o_{t,m})=\{\exec_t\},
+\qquad
+\del(o_{t,m})=\varnothing.
+\label{eq:abstract-method}
+\end{equation}
+The ordering of $TN_0$ is thus enforced operationally by predecessor markers,
+not by a separate constraint layer. The state goal $g$ is not part of the
+abstraction; it is checked after planning, either by the strict validator or by
+the refinement stage of Section~\ref{sec:refinement}.
+
+\begin{remark}[The liftability gap]
+The projection is neither a sound relaxation nor a complete abstraction of $P$.
+It can \emph{reject} a valid HTN plan: if the subtasks of a method for $t_1$
+establish an atom $p$ that is a precondition of a method for a later task $t_2$,
+then in $\alpha(P)$ the operator for $t_2$'s method cannot fire, because
+$t_1$ only writes $\exec_{t_1}$. Conversely, it can \emph{accept} a top-level
+plan that no decomposition supports: an abstract method operator only tests
+$\phi_m$, while the first subtask of $m\sigma$ may be inapplicable in $s_0$.
+No inclusion holds in general between the top-level plans of $\alpha(P)$ and
+the top-level plans induced by HTN solutions of $P$. This gap is why PSPR
+offers the bounded refinement of Section~\ref{sec:refinement}; the default
+path returns a plan of the projection plus an independent validation report.
+\end{remark}
+
+\paragraph{Detecting the gap statically.}
+For a fixed grounding the first half of the gap is decidable by a may-write
+analysis. Let $W(t)$ be the set of ground literals that some decomposition of
+the top-level task $t$ can write, computed as the least fixpoint of
+\begin{equation}
+W(t)=\bigcup_{m\in M(t)}\;\bigcup_{s\in TN_m}W(s)
+\qquad\text{and}\qquad
+$W(a)=\bigcup_{\alpha\in\mathrm{eff}(a)}\{(p,v):(p\mathrel{:=}v)\in\alpha\}$,
+\end{equation}
+where a primitive task $a$ uses its effect alternatives and a compound task
+$t$ uses its grounded methods. The least fixpoint converges on recursive
+methods and contains exactly the atoms that a finite decomposition can write.
+Let $R(t)$ be the literals of the DNF of the preconditions of every grounded
+method of $t$ (of the action schemas when $t$ is primitive), together with,
+for each literal, the number of clauses that contain it. For every ordered
+pair $t_1\prec^{+}t_2$ and every $p\in W(t_1)\cap R(t_2)$ the pair is a
+candidate gap. A sign match is a \emph{hidden satisfier} (the projection cannot
+see the establishment and may disable $t_2$'s operator); a sign mismatch is a
+\emph{hidden falsifier} (the projection keeps believing the literal). The
+implementation is \texttt{evaluation\_tree::liftability}. It over-approximates
+on purpose -- preconditions are ignored, disjunctive effects are merged, and
+nested subtasks are expanded over every method grounding -- so a reported pair
+is a candidate rather than a proof, and a clean report is not a proof of
+liftability. Each report entry records the producer method, the consumer method
+or action, the witness subtask, whether the literal occurs in every DNF clause
+of the consumer, whether it already holds initially, and whether a primitive
+top-level task can write it anyway.
+
+\section{Grounding and the task/constraint incidence graph}
+
+\subsection{Grounding}
+The free parameters of $TN_0$ are enumerated over the typed constants and
+objects of the problem. A parameter ranges over the symbols whose declared type
+is a subtype of the parameter type. If the enumeration produces several
+groundings, their task lists are concatenated and each grounding contributes
+its own copy of the ordering and equality constraints. The number of
+assignments is bounded by the grounding budget $B_g$
+(\texttt{EvaluationOptions::max\_groundings}, default $256$ in the CLI).
+
+Action and method formulas are compiled in four steps:
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
+\item quantifiers $\exists$ and $\forall$ are expanded over the typed universe;
+\item $\mathit{Imply}$, $\mathit{Xor}$ and composite $\mathit{Not}$ are
+      rewritten into negation normal form over literals;
+\item $\mathit{Equals}$ is evaluated against the current bindings;
+\item preconditions are converted to disjunctive normal form (DNF), and effects
+      are compiled into conditional effects. Every DNF clause and every
+      disjunctive effect alternative becomes one operator variant.
+\end{enumerate}
+The DNF expansion is capped at $4096$ clauses or alternatives per formula.
+$\mathit{Probabilistic}$ is the only constructor that cannot be represented;
+it is counted in \texttt{EvaluationTree::unmodeled} and makes leaf construction
+fail.
+
+\subsection{The incidence graph}
+Let $\cT=\{t_1,\dots,t_{n_1}\}$ be the grounded task occurrences and let
+$\cK=\{c_1,\dots,c_{n_2}\}$ be the constraints they touch. A constraint node is
+one of:
+\begin{itemize}[leftmargin=1.6em,itemsep=1pt]
+\item an atom occurring in a matching action schema (precondition or effect) or
+      in a matching method precondition (and, when summaries are enabled, in a
+      summary effect);
+\item an ordering pair $(t_i,t_j)$ of the network;
+\item an equality or inequality constraint between two ground terms.
+\end{itemize}
+The incidence graph is the bipartite graph with adjacency matrix
+\begin{equation}
+A_{ij}=
+\begin{cases}
+1 & \text{if task }t_i\text{ touches constraint }c_j,\\
+0 & \text{otherwise}.
+\end{cases}
+\end{equation}
+Its connected components are used as \emph{required groupings}: independent
+parts of the network are clustered separately and never mixed by the spectral
+step. Explicit groupings can be supplied through
+\texttt{EvaluationOptions::groupings}; tasks not mentioned in any grouping
+become singleton groups.
+
+\section{Spectral clustering of tasks}
+\label{sec:clustering}
+
+Each grouping is clustered independently on its induced subgraph. Let the
+group have $n_1$ type-I nodes, $n_2$ type-II nodes, $m$ edges and density
+\begin{equation}
+p=\frac{m}{n_1n_2}.
+\end{equation}
+Two regimes are distinguished by the signal condition
+$n_1n_2p^2\ge\log n_1$.
+
+\subsection{Dense regime: \texorpdfstring{$\mathrm{Spec}$}{Spec} and
+\texorpdfstring{$\mathrm{AdaSpec}$}{AdaSpec}}
+Let
+\begin{equation}
+S=H(AA^\top)
+\end{equation}
+be the \emph{hollowed} Gram matrix: $S_{ij}=(AA^\top)_{ij}$ for $i\ne j$ and
+$S_{ii}=0$. Hollowing is essential because the diagonal of $AA^\top$ is of
+order $n_2p_{\max}$, while the population diagonal of $PP^\top$ is of order
+$n_2p_{\max}^2$; keeping it would dominate the spectrum. Let
+$S=U\Lambda U^\top$ with
+$\lambda_1\ge\lambda_2\ge\dots\ge\lambda_{n_1}$ and orthonormal columns
+$u_1,\dots,u_{n_1}$.
+
+$\mathrm{AdaSpec}$ selects the embedding rank
+\begin{equation}
+r=\max\left\{i\in\{1,\dots,n_1-1\}:\;
+\lambda_i-\lambda_{i+1}>\theta\right\},
+\qquad
+\theta=\frac{n_1n_2p^2}{\log\log n_1},
+\label{eq:adaspec-rank}
+\end{equation}
+where the threshold is replaced by $n_1n_2p^2$ when $\log\log n_1\le0$ or is
+non-finite. If no gap exceeds $\theta$, the implementation falls back to the
+largest gap, provided it exceeds $10^{-9}\max(|\lambda_1|,1)$; otherwise the
+group stays a single cluster. The embedding of task $i$ is
+\begin{equation}
+u(i)=\bigl(U_{i,1},\dots,U_{i,r}\bigr)\in\RR^r,
+\end{equation}
+and the number of communities is $k=r$.
+
+\subsection{Sparse regime: normalized Laplacian}
+When $n_1n_2p^2<\log n_1$ the hollowed Gram matrix is too noisy. The
+implementation uses the symmetric normalized Laplacian of the similarity graph
+$S$:
+\begin{equation}
+L=I-D^{-1/2}SD^{-1/2},
+\qquad
+D_{ii}=\sum_{j}S_{ij},
+\end{equation}
+with spectrum $0=\mu_1\le\mu_2\le\dots\le\mu_{n_1}$. The number of communities
+is the classic eigengap estimate
+\begin{equation}
+k=\arg\max_{c\ge1}\bigl(\mu_{c+1}-\mu_c\bigr),
+\end{equation}
+and the embedding is given by the eigenvectors of
+$\mu_2,\dots,\mu_k$.
+
+\subsection{Assignment and clusters}
+Both regimes partition the embedded rows with $k$-medians:
+\begin{equation}
+\min_{\mu_1,\dots,\mu_k}\;\sum_{i=1}^{n_1}\bigl\|u(i)-\mu_{\ell(i)}\bigr\|_2,
+\end{equation}
+where rows are assigned to the nearest centre in the Euclidean norm and each
+centre is updated to the coordinate-wise median of its cell. The iteration is
+deterministic, seeded with SplitMix64. Cluster $j$ consists of its type-I
+tasks $\cT_j$ together with every type-II node adjacent to at least one of
+them:
+\begin{equation}
+\cK_j=\bigl\{c\in\cK:\exists t\in\cT_j,\;A_{t,c}=1\bigr\}.
+\end{equation}
+A constraint is \emph{shared} when it belongs to more than one $\cK_j$:
+\begin{equation}
+\cS=\Bigl\{c\in\cK:\bigl|\{j:c\in\cK_j\}\bigr|>1\Bigr\},
+\end{equation}
+and \emph{local} to cluster $j$ otherwise. Local constraints are solved inside
+the leaf; shared constraints are delegated to the merge nodes.
+
+\section{Agglomeration and the evaluation tree}
+\label{sec:agglomeration}
+
+\subsection{Pairwise distance}
+For two clusters $j$ and $j'$ the implementation uses the Jaccard distance
+\begin{equation}
+d(j,j')=1-\frac{|\cK_j\cap\cK_{j'}|}{|\cK_j\cup\cK_{j'}|},
+\end{equation}
+with $d(j,j')=0$ when both constraint sets are empty.
+
+\subsection{The merge-level ILP}
+Let $k$ be the number of clusters and $L$ the number of levels
+($L=k-1$ by default). The hierarchy is represented by integer merge-level
+variables
+\begin{equation}
+M_{ab}\in\{1,\dots,L\},\qquad a\ne b,
+\end{equation}
+where $M_{ab}$ is the level at which $a$ and $b$ first belong to the same
+cluster. For every ordered triple $(a,b,c)$ of distinct clusters the
+formulation introduces binary indicators $O_{abc}$, $Z^{ab}_{abc}$ and
+$Z^{bc}_{abc}$, and the constraints
+\begin{align}
+-L\;\le\;&M_{ac}-M_{ab}-(L+1)O_{abc}\;\le\;0,
+\label{eq:gilpin-o}\\
+-L\;\le\;&M_{ab}-M_{ac}-(L+1)Z^{ab}_{abc}+1\;\le\;0,
+\label{eq:gilpin-zab}\\
+-L\;\le\;&M_{bc}-M_{ac}-(L+1)Z^{bc}_{abc}+1\;\le\;0,
+\label{eq:gilpin-zbc}\\
+&Z^{ab}_{abc}+Z^{bc}_{abc}\;\ge\;1.
+\label{eq:gilpin-z}
+\end{align}
+Constraint \eqref{eq:gilpin-o} forces $O_{abc}=1$ exactly when
+$M_{ac}<M_{ab}$, i.e.\ when $b$ joins $a$ before $c$ does.
+Constraints \eqref{eq:gilpin-zab}--\eqref{eq:gilpin-z} encode the dendrogram
+validity condition that $M_{ac}$ cannot be strictly larger than both $M_{ab}$
+and $M_{bc}$; equivalently, none of the three points may join the other two
+last. The clustering objective is
+\begin{equation}
+Q(A)=\sum_{a}\sum_{b\ne a}\sum_{c\ne a,b}
+\bigl(d(a,c)-d(a,b)\bigr)\,O_{abc},
+\label{eq:Q}
+\end{equation}
+which is the sum, over triples where $a$ and $b$ merge before $a$ and $c$, of
+the gain obtained by placing the closer neighbour $b$ first.
+
+\subsection{Constraint locality}
+For every shared constraint $c$ with cluster set
+$S_c=\{j:c\in\cK_j\}$ the formulation adds a continuous height variable
+$h_c\in[1,L]$ and the constraints
+\begin{equation}
+h_c\;\ge\;M_{ab}\qquad\text{for all distinct }a,b\in S_c.
+\end{equation}
+Since the objective penalizes $\sum_c h_c$, at optimality
+\begin{equation}
+h_c=\max_{a,b\in S_c}M_{ab},
+\end{equation}
+which is exactly the level of the lowest common ancestor of the clusters that
+share $c$. The complete hierarchy objective is therefore
+\begin{equation}
+\max_{A}\;\;Q(A)-\gamma\,G(A),
+\qquad
+G(A)=\sum_{c\in\cS}h_c,
+\label{eq:hierarchy-objective}
+\end{equation}
+where $\gamma$ is \texttt{Options::global\_weight} (default $1$). A constraint
+handled by the first merge costs $1$; one pushed to the root costs $L$. The
+penalty keeps shared constraints low in the tree, where they are checked
+against smaller subplans.
+
+\subsection{From merge levels to a binary dendrogram}
+At every level $\ell$ the clusters are the connected components of the relation
+``$M_{ab}\le\ell$'', computed with a union-find structure. A rooted binary
+dendrogram is built by walking the levels from $1$ to $L$: each non-singleton
+cluster at level $\ell$ is formed from the clusters of level $\ell-1$ that it
+contains, and a multi-way merge is binarised by folding its children in
+ascending order. Leaves are the $k$ clusters; the $k-1$ internal nodes are
+created in chronological order, and internal node $k+\ell$ receives evaluation
+id $\ell$.
+
+Each shared constraint is attached to the \emph{first} internal node, in
+creation order, whose member set contains every cluster in $S_c$. Since nodes
+are created bottom-up, this is the lowest common ancestor of $S_c$. The merge
+node therefore receives exactly the constraints whose clusters first meet
+there.
+
+\subsection{The scheduling ILP}
+Let $I$ be the set of internal nodes, $N=|I|=k-1$, and let $E_A$ be the
+parent--child edges of the dendrogram, directed from child to parent. Binary
+variables $x_{v,t}$ indicate that internal node $v$ is evaluated at time $t$:
+\begin{align}
+\sum_{t=1}^{N}x_{v,t}&=1 && \forall v\in I,
+\label{eq:sched-once}\\
+\sum_{v\in I}x_{v,t}&=1 && \forall t\in\{1,\dots,N\},
+\label{eq:sched-slot}
+\end{align}
+with evaluation position $p_v=\sum_{t=1}^{N}t\,x_{v,t}$. Every child is
+evaluated before its parent, and an optional evaluation DAG
+$B=(V_B,E_B)$ adds precedences:
+\begin{align}
+p_u+1&\le p_v && \forall (u,v)\in E_A,\;u,v\in I,
+\label{eq:sched-tree}\\
+p_{f(a)}+1&\le p_{f(b)} && \forall (a,b)\in E_B,
+\label{eq:sched-dag}
+\end{align}
+where $f$ maps DAG vertices to internal nodes. The ILP minimizes
+\begin{equation}
+C(A,\sigma)=\sum_{v\in I}p_v.
+\end{equation}
+The union of \eqref{eq:sched-tree} and \eqref{eq:sched-dag} must be acyclic;
+otherwise the schedule is rejected. The resulting order
+$\sigma$ is a topological order of the merge nodes.
+
+\subsection{Joint objective}
+The selected tree and schedule are scored by
+\begin{equation}
+Q(A)-\lambda\,C(A,\sigma)-\gamma\,G(A),
+\label{eq:joint}
+\end{equation}
+where $\lambda$ is \texttt{Options::lambda} (default $0$). Since every complete
+binary hierarchy over $k$ leaves has exactly $k-1$ internal nodes, $C$ is
+nearly constant across hierarchies and the ILP of
+\eqref{eq:hierarchy-objective} dominates the choice. An optional
+planning-style search over partial dendrograms can be enabled
+(\texttt{use\_search}); it reuses the generic best-first engine and picks its
+candidate only when it improves \eqref{eq:joint}. In the default configuration
+only the exact ILP is solved.
+
+\section{Leaf subproblems}
+\label{sec:leaves}
+
+For cluster $j$ let $L_j$ be the set of atoms in its local constraints. The
+leaf planning task has binary variables
+\begin{equation}
+V_j=\{x_a:a\in L_j\}\;\cup\;\{e_t:t\in\cT_j\},
+\end{equation}
+where $x_a$ is the truth value of atom $a$ and $e_t$ is the execution marker
+of task $t$. The initial assignment is
+\begin{equation}
+x_a=1\iff a\in s_0,
+\qquad
+e_t=0,
+\end{equation}
+and the goal is
+\begin{equation}
+G_j=\{e_t=1:t\in\cT_j\}.
+\end{equation}
+Shared atoms are dropped from the leaf entirely: they neither appear as
+preconditions nor as effects of leaf operators. This is what makes the leaves
+independent; the missing shared atoms are the interface that the merge must
+repair.
+
+\subsection{Ordering closure}
+Let $\prec_j$ be the ordering edges induced by the local ordering constraints
+between tasks of $\cT_j$. The implementation computes the transitive closure
+$\prec_j^*$ (Floyd--Warshall over the cluster positions) and rejects a cyclic
+closure. Every operator for task $t$ contains the predecessor markers
+\begin{equation}
+\prec_j^*(t)=\{e_u=1:u\prec_j^*t\}.
+\end{equation}
+
+\subsection{Action variants}
+Let $\phi$ be a precondition in DNF,
+$\phi=\bigvee_{\kappa\in K}\bigwedge_{\ell\in\kappa}\ell$, and let
+$\alpha=\{(\gamma,a,v)\}$ be one deterministic effect alternative, where
+$\gamma$ is a condition, $a$ an atom and $v\in\{0,1\}$ its new value. For every
+pair $(\kappa,\alpha)$ the leaf contains one operator
+\begin{equation}
+\begin{aligned}
+\pre(o)&=\prec_j^*(t)\;\cup\;
+\bigl\{x_a=\kappa(a):a\in\kappa\cap L_j\bigr\},\\
+\mathrm{eff}(o)&=\bigl\{x_a:=v\text{ if }\gamma:(a,v)\in\alpha,\;a\in L_j\bigr\}
+\cup\{e_t:=1\}.
+\end{aligned}
+\label{eq:leaf-action}
+\end{equation}
+A task that names an action is compiled through its action schemas; methods are
+used only when no action schema matches. The restriction to $L_j$ in the
+condition and effect sets is intentional: constraints outside the leaf belong
+to a merge node. Effect atoms are still recorded in the leaf's
+\texttt{effect\_atoms}, so that the merge can check which shared atoms a child
+plan establishes.
+
+\subsection{Compound tasks}
+A compound task $t$ with no matching action schema gets one operator per
+grounded method instance $m\sigma$ and per DNF clause $\kappa$ of
+$\phi_m\sigma$:
+\begin{equation}
+\pre(o)=\prec_j^*(t)\;\cup\;
+\bigl\{x_a=\kappa(a):a\in\kappa\cap L_j\bigr\},
+\qquad
+\mathrm{eff}(o)=\{e_t:=1\}.
+\label{eq:leaf-method}
+\end{equation}
+If the domain declares no method whose task name and arity match $t$, a
+synthetic operator \texttt{task[$t$]} with no effect other than $e_t:=1$ is
+used. When primitive summaries are enabled
+(Section~\ref{sec:refinement}), a summarisable method is replaced by its macro
+operator; methods outside the summarisable fragment stay opaque.
+
+\subsection{Heuristic search}
+The leaf task is a finite multi-valued planning task. It is solved by greedy
+best-first search with the FF heuristic. The relaxed planning graph assigns
+each fact $p$ a level
+\begin{equation}
+h(p)=\min_{o:\,p\in\add_o}\Bigl(\max_{q\in\pre_o}h(q)+\mathrm{cost}(o)\Bigr),
+\end{equation}
+starting from $h(p)=0$ for facts of the current state; axioms are applied to a
+fixed point on every layer. If a goal fact has infinite level the state is
+dead. Otherwise $h_{\mathrm{FF}}$ is the number of operators in the relaxed
+plan obtained by regressing from the goal facts through their cheapest
+achievers; the relaxed-plan operators that are applicable in the real state
+are returned as \emph{preferred} actions. Search maintains two open lists per
+heuristic (preferred and non-preferred), uses a closed list, evaluates
+heuristics lazily when a node is expanded, and expands at most
+$10^5$ nodes per leaf. Every operator has unit cost, so the leaf returns the
+first plan found, not a cost-optimal one.
+
+\section{Merging as a relaxed MINLP}
+\label{sec:merge}
+
+\subsection{The SGPlan penalty formulation}
+Let a merge node $v$ have $n_c$ children $C_1,\dots,C_{n_c}$ with plans
+\begin{equation}
+\pi_i=\langle o_{i,1},\dots,o_{i,l_i}\rangle,
+\qquad
+\pi_i\models P_i,
+\end{equation}
+and let $\cS_v$ be the shared constraints attached to $v$. SGPlan's
+constraint-partitioning formulation is the mixed-integer nonlinear program
+\begin{equation}
+\begin{aligned}
+\min_{\pi_1,\dots,\pi_{n_c},\;w}\quad &
+\sum_{i=1}^{n_c}\mathrm{cost}_i(\pi_i)
++\sum_{c\in\cS_v}w_c\,v_c(\pi_1,\dots,\pi_{n_c})\\
+\text{s.t.}\quad &
+v_c(\pi_1,\dots,\pi_{n_c})=0 && \forall c\in\cS_v,\\
+& \pi_i\in\mathrm{Plans}(P_i) && \forall i,\\
+& w_c\ge0 && \forall c\in\cS_v,
+\end{aligned}
+\label{eq:minlp}
+\end{equation}
+where $v_c$ is the violation of shared constraint $c$ and $w_c$ its penalty
+weight. PSPR does not re-plan inside the children: it fixes the $\pi_i$ and
+optimizes only how they are interleaved.
+
+\subsection{Continuous relaxation}
+Let
+\begin{equation}
+L=\sum_{i=1}^{n_c}l_i,
+\qquad
+\ell_i=\frac{l_i}{L},
+\qquad
+q_i\in[0,1]
+\end{equation}
+be the total number of steps, the normalized length of child $i$, and its
+continuous start position. Step $k$ of child $i$ (with $k=0,\dots,l_i-1$)
+occurs at the normalized time
+\begin{equation}
+\tau_{i,k}=q_i+\frac{k}{L},
+\end{equation}
+and the child completes at $q_i+\ell_i$. The makespan is replaced by a
+log-sum-exp smooth maximum
+\begin{equation}
+M_T(q)=T\log\sum_{i=1}^{n_c}
+\exp\!\left(\frac{q_i+\ell_i}{T}\right),
+\label{eq:smoothmax}
+\end{equation}
+whose gradient with respect to $q_i$ is the softmax weight
+\begin{equation}
+\frac{\partial M_T}{\partial q_i}
+=
+\frac{\exp\!\bigl((q_i+\ell_i)/T\bigr)}
+{\sum_{j}\exp\!\bigl((q_j+\ell_j)/T\bigr)}.
+\end{equation}
+
+For a shared ordering constraint $a\prec b$, where $a$ is step $k$ of child
+$i$ and $b$ is step $l$ of child $j$, define the signed margin
+\begin{equation}
+g_{ab}(q)=q_j+\frac{l}{L}-q_i-\frac{k}{L}-\frac{1}{L}.
+\label{eq:margin}
+\end{equation}
+It is non-negative exactly when $a$ is scheduled strictly before $b$ with at
+least one step of separation. Its exact violation is $[-g_{ab}]_+$, and its
+smooth violation is the one-sided hinge
+\begin{equation}
+v_{ab}(q)=T\,\mathrm{softplus}\!\left(-\frac{g_{ab}(q)}{T}\right)
+=T\log\!\left(1+\exp\!\left(-\frac{g_{ab}(q)}{T}\right)\right),
+\label{eq:hinge}
+\end{equation}
+with derivative
+\begin{equation}
+\frac{\partial v_{ab}}{\partial g_{ab}}
+=-\sigma\!\left(-\frac{g_{ab}}{T}\right),
+\qquad
+\sigma(z)=\frac{1}{1+e^{-z}}.
+\end{equation}
+Hence the penalty stops pushing as soon as the constraint is comfortably
+satisfied.
+
+Atom and equality constraints do not depend on the schedule. They enter the
+objective as constants, where an unsatisfied atom or equality contributes
+$w_c\,\phi(1)$ and a satisfied one contributes $0$; they still drive
+feasibility and the weight adaptation.
+
+\subsection{The relaxed objective}
+With penalty function $\phi$, make-span weight $c$, and weights $w_c$, the
+optimized objective is
+\begin{equation}
+J_T(q;w)=c\,M_T(q)+\sum_{c\in\cS_v}w_c\,\phi\bigl(v_c(q)\bigr),
+\label{eq:J}
+\end{equation}
+and its gradient is
+\begin{equation}
+\begin{aligned}
+\frac{\partial J_T}{\partial q_i}
+&=
+c\,\frac{\exp\bigl((q_i+\ell_i)/T\bigr)}
+{\sum_{j=1}^{n_c}\exp\bigl((q_j+\ell_j)/T\bigr)}\\
+&\quad+
+\sum_{\substack{c=(a,b)\in\cS_v\\ b\text{ in child }i}}
+w_c\,\phi'(v_c)\left(-\sigma\!\left(-\frac{g_c}{T}\right)\right)\\
+&\quad-
+\sum_{\substack{c=(a,b)\in\cS_v\\ a\text{ in child }i}}
+w_c\,\phi'(v_c)\left(-\sigma\!\left(-\frac{g_c}{T}\right)\right).
+\end{aligned}
+\label{eq:gradient}
+\end{equation}
+The three penalty spaces are
+\begin{equation}
+\phi_{\mathrm{lin}}(v)=v,
+\qquad
+\phi_{\mathrm{quad}}(v)=v^2+v,
+\qquad
+\phi_{\mathrm{exp}}(v)=\frac{e^{4v}-1}{4},
+\end{equation}
+with slopes $1$, $2v+1$ and $e^{4v}$.
+
+\subsection{Adam with box projection}
+The relaxed problem is minimized by Adam. With gradient $g_t$, moments
+\begin{equation}
+m_t=\beta_1m_{t-1}+(1-\beta_1)g_t,
+\qquad
+v_t=\beta_2v_{t-1}+(1-\beta_2)g_t^2,
+\end{equation}
+bias corrections $\hat m_t=m_t/(1-\beta_1^t)$ and
+$\hat v_t=v_t/(1-\beta_2^t)$, the update is
+\begin{equation}
+q^{(t+1)}=\Pi_{[0,1]}\!\left(q^{(t)}
+-\eta\,\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon}\right),
+\label{eq:adam}
+\end{equation}
+where $\Pi_{[0,1]}$ is the coordinate-wise projection onto the unit box. The
+defaults are $\eta=0.05$, $\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$,
+temperature $T=0.05$, make-span weight $c=1$, $10$ outer rounds of $200$ Adam
+steps each.
+
+\subsection{Adaptive weights and penalty continuation}
+After every outer round the exact violations $v_c$ are measured. The weights
+are updated multiplicatively,
+\begin{equation}
+w_c\leftarrow
+\begin{cases}
+\clamp\bigl(\gamma\,w_c,\;w_{\min},\;w_{\max}\bigr)
+& \text{if } v_c>\tau,\\[2pt]
+\clamp\bigl(\delta\,w_c,\;w_{\min},\;w_{\max}\bigr)
+& \text{if } v_c\le\tau,
+\end{cases}
+\label{eq:weights}
+\end{equation}
+with growth $\gamma=4$, decay $\delta=1/2$, floor $w_{\min}=10^{-3}$, ceiling
+$w_{\max}=10^{9}$ and tolerance $\tau=10^{-3}$. Decaying satisfied
+constraints keeps the active set well conditioned.
+
+Let $V^{(r)}$ be the total exact violation after round $r$. A round is
+\emph{stalled} when
+\begin{equation}
+V^{(r)}>(1-\rho)\,V^{(r-1)},
+\qquad \rho=0.05.
+\end{equation}
+A stall advances the continuation from $\phi_{\mathrm{lin}}$ to
+$\phi_{\mathrm{quad}}$ and then to $\phi_{\mathrm{exp}}$, and resets Adam's
+moments so that the new curvature is measured from scratch. The best iterate
+of the whole run, ordered lexicographically by (total violation, objective),
+is retained, so a late divergent round cannot degrade the result.
+
+If the merge node has no ordering constraints, if \texttt{iterations} is zero,
+or if the initial total violation is already at most $\tau$, Adam is skipped
+and the initial (or learned) positions are decoded directly.
+
+\subsection{Decoding and exact validation}
+The relaxed positions are decoded by greedy list scheduling. Let
+$k_i\leftarrow0$ for every child. Repeatedly select
+\begin{equation}
+i^*=\arg\min_{\,i:\,k_i<l_i}\left(q_i+\frac{k_i}{L}\right),
+\end{equation}
+append step $o_{i^*,k_{i^*}}$ to the merged plan, and increment $k_{i^*}$.
+This interleaves the children while preserving the internal order of every
+child plan.
+
+The decoded plan is then validated \emph{exactly}, not through the smooth
+surrogates. For every shared ordering $a\prec b$, let $\pos(t)$ be the index of
+the first step of the decoded plan whose task index is $t$; the constraint
+holds iff both positions exist and $\pos(a)<\pos(b)$. A shared atom holds iff
+it belongs to
+\begin{equation}
+s_0\;\cup\;\bigcup_{i=1}^{n_c}\bigl(\mathrm{final}_i\cup\mathrm{achieved}_i\bigr),
+\end{equation}
+where $\mathrm{final}_i$ are the local atoms true at the end of child $i$ and
+$\mathrm{achieved}_i$ are the ground effect atoms of its operators. An equality
+constraint is evaluated on its ground terms. If any constraint is still
+violated, the merge reports an error with the residual and weight of every
+offending constraint; there is no replanning at this stage.
+
+\begin{proposition}[Merge soundness]
+If a merge node returns successfully, then the decoded plan is a linearisation
+of the child plans that satisfies every shared constraint of that node, and
+its restriction to each child is exactly that child's plan.
+\end{proposition}
+\begin{proof}
+The decoder appends the next unscheduled step of one child at a time, so the
+projection onto each child is its original plan and its internal order is
+preserved. Feasibility is established by the exact validator above, which
+checks every shared ordering, atom and equality independently. A returned
+merge has passed that check for all constraints.
+\end{proof}
+
+\begin{remark}
+The continuous optimization is only a heuristic for \emph{choosing} the
+interleaving. The smooth violation \eqref{eq:hinge} is positive at the
+boundary, so feasibility is always decided by the exact test, never by the
+surrogate value.
+\end{remark}
+
+\section{Hierarchical refinement}
+\label{sec:refinement}
+
+The abstract plan produced by the evaluation tree is a sequence of grounded
+top-level tasks, each annotated with the method chosen by the abstract
+operator. The refinement stage recursively replaces every compound task by a
+method instance and every primitive task by an action, producing a complete
+HTN plan.
+
+\subsection{The refinement relation}
+For a task $t$ and state $s$, let $\cR(t,s)$ be the finite set of pairs
+$(\pi,s')$ such that $\pi$ is a primitive sequence executable from $s$ and
+$s'$ is the resulting state. It is defined recursively:
+\begin{itemize}[leftmargin=1.6em,itemsep=2pt]
+\item If $t$ is a primitive action $a$ and $s\models\pre_a$, then
+      $\cR(t,s)=\{(\langle a\rangle,\tau_a(s))\}$; otherwise
+      $\cR(t,s)=\varnothing$.
+\item If $t$ is compound, let $m\sigma$ range over the grounded method
+      instances with head $t$ and $\phi_m\sigma$ true in $s$. For each such
+      instance, refine the subtask network $TN_m\sigma$:
+      \begin{itemize}[leftmargin=1.2em,itemsep=1pt]
+      \item for a total order $t_1,\dots,t_n$, form the sequential product
+            \[
+            \cR(t_1\cdots t_n,s)
+            =\Bigl\{(\pi_1\cdots\pi_n,s_n):
+            (\pi_1,s_1)\in\cR(t_1,s),\dots,(\pi_n,s_n)\in\cR(t_n,s_{n-1})\Bigr\};
+            \]
+      \item for a partial order, enumerate the ready tasks (those whose
+            predecessors are all scheduled), recurse on each ready task, and
+            thread the state through the recursion. Equality and inequality
+            constraints of the network are checked before expansion.
+      \end{itemize}
+      The results are wrapped into a method step
+      $\langle t,m\sigma,\cdot\rangle$.
+\end{itemize}
+
+\subsection{Bounded search over the abstract plan}
+Let the abstract plan be $s_1,\dots,s_m$ and let
+$\cC_0=\{(\varepsilon,s_0)\}$. For $j=1,\dots,m$,
+\begin{equation}
+\cC_j=\operatorname{trunc}_{2048}
+\Bigl(\bigcup_{(\rho,s)\in\cC_{j-1}}
+\{\rho\cdot\pi:(\pi,s')\in\cR(s_j,s)\}\Bigr),
+\end{equation}
+where $\rho\cdot\pi$ concatenates the prefix $\rho$ with the new primitive
+sequence $\pi$. If
+$\cC_j=\varnothing$ the refinement fails. The bound is
+$N_{\max}=2048$ partial refinements per abstract step, the recursion depth is
+at most $32$, and method grounding is bounded by $B_g$. A path-local visited
+set of $(\text{task},\text{state})$ pairs prunes branches that rediscover the
+same subproblem; this is what stops recursive methods such as
+\texttt{get\_to} through an intermediate location from cycling. The method
+recorded in the abstract plan is tried first, then the remaining methods in
+increasing order of subtask count.
+
+After the last abstract step, the goal is evaluated on each candidate state.
+The first candidate whose goal is satisfied (or absent) is returned; if none
+satisfies the goal, the first candidate is returned as a fallback and the
+caller can inspect \texttt{Refinement::goal}. The result is independently
+checked by \texttt{validate\_refinement}, which re-executes method
+preconditions, subtask orderings, primitive effects, task coverage and the
+goal.
+
+\subsection{Primitive method summaries}
+A method
+$m=\langle c(\vec{x}),\phi_m,\langle a_1\cdots a_n,\varnothing\rangle\rangle$
+is summarised when every subtask $a_i$ is primitive, the network is totally
+ordered, the method has no equality constraints, every action has exactly one
+DNF precondition clause $\kappa_i$ and one unconditional effect alternative
+$(A_i,D_i)$, and $A_i\cap D_i=\varnothing$.
+
+The macro precondition is computed by backward regression. Set
+$R=\varnothing$, $A=\varnothing$, $D=\varnothing$ and process
+$i=n,n-1,\dots,1$:
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
+\item for every literal $\ell=(p,b)$ in $R$: if $p\in A_i$, require $b=1$
+      (otherwise fail); if $p\in D_i$, require $b=0$ (otherwise fail);
+      otherwise keep $\ell$ in $R$;
+\item add the literals of $\kappa_i$ to $R$, failing on a polarity conflict;
+\item for every $p\in A_i$ with $p\notin D$, insert $p$ into $A$;
+\item for every $p\in D_i$ with $p\notin A$, insert $p$ into $D$.
+\end{enumerate}
+If no conflict occurred, the summary operator is
+\begin{equation}
+\pre(o)=\phi_m\;\wedge\;\bigwedge_{\ell\in R}\ell,
+\qquad
+\add(o)=A,
+\qquad
+\del(o)=D,
+\qquad
+\add(o)\mathrel{+}=\{\exec_t\}.
+\label{eq:summary}
+\end{equation}
+This is exact under the stated restrictions: the subtasks are totally ordered,
+deterministic and unconditional, so their composed effect is a single
+add/delete pair and their required precondition is the regressed literal set.
+Any method outside the fragment is left opaque.
+
+\section{Optional learned initialization}
+
+When the crate is compiled with the \texttt{neural} feature, the merger can be
+warm-started by a heterogeneous graph-attention network instead of the
+sequential start. The graph has one node per child plan, one node per shared
+constraint and one global node, with $32$ features per node and a dense
+incidence adjacency including self-loops. Three normalized GAT layers compute
+\begin{equation}
+\alpha_{ij}=\softmax_j\Bigl(\mathrm{LeakyReLU}\bigl(a^\top[Wh_i\,\|\,Wh_j]\bigr)\Bigr),
+\qquad
+h_i'=\sigma\Bigl(\sum_{j\in N(i)}\alpha_{ij}Wh_j\Bigr),
+\end{equation}
+and two heads predict the normalized start positions $q_i$ and the positive
+penalty weights $w_c$. Training targets are produced by running the
+deterministic merger from the sequential start and recording the optimized
+parameters.
+
+The predictions are only an initialization. They are accepted when their
+shape matches the problem, all positions are finite and all weights are
+strictly positive; otherwise the merger falls back to the sequential start.
+The exact validator of Section~\ref{sec:merge} runs in all cases. The default
+build has no Burn dependency and uses the deterministic sequential start.
+
+A second optional model (\texttt{PSPR\_DECOMPOSITION\_MODEL}) can rank method
+candidates and order ready subtasks during refinement. Its outputs are
+accepted only when they form a permutation of the candidate set; otherwise the
+baseline order is used. Both learned components are therefore guidance for
+search ordering, not sources of logical soundness.
+
+\section{Correctness, cost, and limitations}
+\label{sec:analysis}
+
+\subsection{What is guaranteed}
+\begin{proposition}[Leaf soundness]
+Every plan returned by a leaf search is executable in the leaf task and ends
+in a state where all markers $e_t$ of the cluster are true. Each operator
+corresponds to a grounded action or method instance of the original domain.
+\end{proposition}
+
+\begin{proposition}[Conditional completeness of the tree]
+If every leaf is solved, every merge node succeeds, and the refinement stage
+returns a candidate whose goal is satisfied, then the returned primitive plan
+is a complete HTN plan of the initial task network and satisfies the state
+goal.
+\end{proposition}
+\begin{proof}[Proof sketch]
+The merge proposition gives, by induction over the schedule, a plan of every
+subtree that satisfies all shared constraints attached to its nodes. The root
+therefore satisfies all constraints of $TN_0$. Refinement replaces each
+top-level task by a grounded method whose precondition holds in the state
+threaded through the recursion, and its subtasks are recursively refined into
+executable primitive actions. The goal check is performed on the final state,
+and \texttt{validate\_refinement} repeats the check independently.
+\end{proof}
+
+\subsection{Sources of incompleteness}
+The algorithm is deliberately satisficing and incomplete:
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{Abstraction gap.} $\alpha(P)$ is not a relaxation of $P$
+      (Section~2), so an abstract plan can be unrefinable and a valid HTN plan
+      can have no abstract counterpart.
+\item \textbf{Dropped shared atoms.} Leaves cannot test or establish shared
+      atoms. The merge can only reorder existing child plans; it cannot
+      replan a child that needs a shared atom as a precondition.
+\item \textbf{Bounded enumeration.} Grounding, DNF expansion, leaf search,
+      refinement depth and refinement breadth are all capped.
+\item \textbf{No recursive decomposition in the abstract tree.} Compound
+      tasks in a leaf are opaque method operators; decomposition happens only
+      in the refinement stage.
+\item \textbf{Deterministic fragment.} Probabilistic formulas are rejected,
+      and disjunctive effects are compiled as an angelic choice over
+      deterministic variants.
+\end{enumerate}
+
+\subsection{Cost}
+Let $n_1$ be the number of grounded tasks, $n_2$ the number of constraints,
+$k$ the number of clusters, and $n_c$ the largest number of children of a
+merge node.
+\begin{itemize}[leftmargin=1.6em,itemsep=1pt]
+\item Grounding and incidence construction are linear in the number of
+      grounded tasks and their schema atoms, up to the budget $B_g$ and the
+      DNF cap of $4096$.
+\item Spectral clustering costs $O(n_1^3)$ per group for the eigendecomposition
+      and $O(n_1\cdot\mathrm{nnz}(A))$ for the Gram matrix. The number of
+      $k$-median iterations is bounded by the implementation.
+\item The Gilpin ILP has $O(k^3)$ binary indicators and is NP-hard in general;
+      it is solved by SCIP on the small cluster counts that occur in practice.
+      The scheduling ILP has $O(k^2)$ binaries.
+\item A leaf search is bounded by $10^5$ expansions and $5\times10^6$
+      generated states.
+\item A merge node costs $O(R\cdot S\cdot(n_c+|\cS_v|))$ for $R$ rounds of
+      $S$ Adam steps, plus $O(L)$ for decoding. There are $k-1$ merge nodes,
+      and every step of a child plan is decoded exactly once per node on the
+      path to the root.
+\end{itemize}
+
+\subsection{Implementation status}
+The pipeline described here is the one implemented by the current working
+tree. The library test suite passes ($73$ tests at the time of writing); the
+IPC integration tests are gated on an external HDDL benchmark checkout and the
+\texttt{hddl\_analyzer} executable. The default build contains no neural code
+and no Burn dependency. The evaluator reports a plan as \texttt{solved} when
+every leaf is solved and the root merge succeeds; the state goal is reported
+separately and is only enforced by the hierarchical path. The default planner
+is therefore a fast solver of the task-network projection, while
+\texttt{--hierarchical} (stages C+G) is the complete-HTN mode.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Stage & Module \\
+\midrule
+HDDL parsing and JSON decoding & \texttt{src/parsing/} \\
+Domain and problem translation & \texttt{src/solver/domain.rs}, \texttt{problem.rs} \\
+Grounding, incidence graph, formula compiler & \texttt{evaluation\_tree/graph.rs}, \texttt{formula.rs} \\
+Spectral clustering (BiSBM) & \texttt{partition/bisbm/} \\
+Merge-level and scheduling ILPs & \texttt{partition/agglomeration/} \\
+Tree construction and leaf evaluation & \texttt{evaluation\_tree/clustering.rs}, \texttt{leaf.rs} \\
+Leaf search (FF, GBFS) & \texttt{fast\_downward/} \\
+Relaxed SGPlan merger & \texttt{evaluation\_tree/merge/} \\
+Hierarchical refinement (C+G) & \texttt{evaluation\_tree/hierarchical.rs} \\
+Liftability gap detection & \texttt{evaluation\_tree/liftability.rs} \\
+Independent validation & \texttt{evaluation\_tree/verify.rs} \\
+Optional learned warm start & \texttt{evaluation\_tree/merge/neural.rs} \\
+\bottomrule
+\end{tabular}
+\caption{Mapping from the stages of the algorithm to the implementation.}
+\end{table}
+
+\begin{thebibliography}{9}
+
+\bibitem{sgplan}
+Y.~Hsu, B.~Wah, R.~Huang, and Y.~Chen.
+\newblock Constraint partitioning in penalty formulations for solving temporal
+planning problems.
+\newblock \emph{Artificial Intelligence}, 170(3):187--211, 2006.
+
+\bibitem{gilpin}
+S.~Gilpin, T.~Sandholm, and J.~S{\o}rensen.
+\newblock Formalizing hierarchical clustering as integer linear programming.
+\newblock In \emph{Proceedings of AAAI}, 2013.
+
+\bibitem{braun}
+F.~Braun.
+\newblock Strong consistency guarantees for clustering high-dimensional
+bipartite graphs with the spectral method.
+\newblock arXiv:2304.06903, 2023.
+
+\bibitem{helmert}
+M.~Helmert.
+\newblock The Fast Downward planning system.
+\newblock \emph{Journal of Artificial Intelligence Research}, 26:191--246, 2006.
+
+\bibitem{hoffmann}
+J.~Hoffmann and B.~Nebel.
+\newblock The FF planning system: fast plan generation through heuristic
+search.
+\newblock \emph{Journal of Artificial Intelligence Research}, 14:253--302, 2001.
+
+\bibitem{kingma}
+D.~P. Kingma and J.~Ba.
+\newblock Adam: a method for stochastic optimization.
+\newblock In \emph{Proceedings of ICLR}, 2015.
+
+\end{thebibliography}
+
+\end{document}

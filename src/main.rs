@@ -9,7 +9,9 @@ use pspr::parsing::parser::{
     ParserConfig, is_json_file, parse_program, read_program_json, resolve_parser_config,
 };
 use pspr::solver::domain::{Domain, process_domain};
-use pspr::solver::evaluation_tree::{EvaluationOptions, MethodSummary};
+use pspr::solver::evaluation_tree::{
+    EvaluationOptions, LiftabilityOptions, MethodSummary, detect_liftability_gaps,
+};
 use pspr::solver::problem::{Problem, load_problem};
 use pspr::solver::solve::{solve_hierarchical_with_options, solve_with_options};
 
@@ -43,6 +45,11 @@ struct Options {
     /// (enabled automatically by --hierarchical)
     #[arg(long)]
     summary: bool,
+
+    /// Report top-level task pairs whose subtask effects satisfy or falsify a
+    /// later method or action precondition (the liftability gap of the projection)
+    #[arg(long)]
+    liftability: bool,
 
     /// Maximum number of task and method groundings
     #[arg(long, default_value_t = 256, value_name = "N")]
@@ -183,6 +190,19 @@ fn handle_problem(
         max_groundings: options.max_groundings,
         ..pspr::solver::evaluation_tree::RefinementOptions::default()
     };
+
+    if options.liftability {
+        let report = detect_liftability_gaps(
+            domain,
+            &problem,
+            &LiftabilityOptions {
+                max_groundings: options.max_groundings,
+                ..LiftabilityOptions::default()
+            },
+        )
+        .map_err(|err| err.to_string())?;
+        print!("    liftability: {report}");
+    }
 
     if options.hierarchical {
         let refinement = solve_hierarchical_with_options(

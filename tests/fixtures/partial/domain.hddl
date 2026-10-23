@@ -1,0 +1,38 @@
+(define (domain partial-order)
+  (:requirements :typing :hierarchy)
+  (:types item)
+  (:predicates
+    (ready ?x - item)
+    (painted ?x - item)
+    (packed ?x - item)
+  )
+  (:task process :parameters (?x - item))
+  (:method m-process
+    :parameters (?x - item)
+    :task (process ?x)
+    :precondition (ready ?x)
+    :subtasks (and
+      (task0 (paint ?x))
+      (task1 (pack ?x))
+    )
+  )
+  (:method m-process-reverse
+    :parameters (?x - item)
+    :task (process ?x)
+    :precondition (ready ?x)
+    :subtasks (and
+      (task0 (pack ?x))
+      (task1 (paint ?x))
+    )
+  )
+  (:action paint
+    :parameters (?x - item)
+    :precondition (ready ?x)
+    :effect (painted ?x)
+  )
+  (:action pack
+    :parameters (?x - item)
+    :precondition (ready ?x)
+    :effect (packed ?x)
+  )
+)

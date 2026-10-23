@@ -1,0 +1,310 @@
+{
+  "domain": {
+    "name": "partial-order",
+    "types": [
+      {
+        "name": "item"
+      }
+    ],
+    "constants": null,
+    "requirements": [
+      "TypedObjects",
+      "Hierarchy"
+    ],
+    "predicates": [
+      {
+        "name": "ready",
+        "variables": [
+          {
+            "name": "?x",
+            "symbol_type": "item"
+          }
+        ]
+      },
+      {
+        "name": "painted",
+        "variables": [
+          {
+            "name": "?x",
+            "symbol_type": "item"
+          }
+        ]
+      },
+      {
+        "name": "packed",
+        "variables": [
+          {
+            "name": "?x",
+            "symbol_type": "item"
+          }
+        ]
+      }
+    ],
+    "compound_tasks": [
+      {
+        "name": "process",
+        "parameters": [
+          {
+            "name": "?x",
+            "symbol_type": "item"
+          }
+        ]
+      }
+    ],
+    "methods": [
+      {
+        "name": {
+          "name": "m-process"
+        },
+        "task": {
+          "name": "process"
+        },
+        "task_terms": [
+          {
+            "name": "?x"
+          }
+        ],
+        "params": [
+          {
+            "name": "?x",
+            "symbol_type": "item"
+          }
+        ],
+        "precondition": {
+          "Atom": {
+            "name": "ready",
+            "variables": [
+              {
+                "name": "?x"
+              }
+            ]
+          }
+        },
+        "tn": {
+          "subtasks": [
+            {
+              "id": {
+                "name": "task0"
+              },
+              "task": {
+                "name": "paint"
+              },
+              "terms": [
+                {
+                  "name": "?x"
+                }
+              ]
+            },
+            {
+              "id": {
+                "name": "task1"
+              },
+              "task": {
+                "name": "pack"
+              },
+              "terms": [
+                {
+                  "name": "?x"
+                }
+              ]
+            }
+          ],
+          "orderings": {
+            "Partial": []
+          }
+        }
+      },
+      {
+        "name": {
+          "name": "m-process-reverse"
+        },
+        "task": {
+          "name": "process"
+        },
+        "task_terms": [
+          {
+            "name": "?x"
+          }
+        ],
+        "params": [
+          {
+            "name": "?x",
+            "symbol_type": "item"
+          }
+        ],
+        "precondition": {
+          "Atom": {
+            "name": "ready",
+            "variables": [
+              {
+                "name": "?x"
+              }
+            ]
+          }
+        },
+        "tn": {
+          "subtasks": [
+            {
+              "id": {
+                "name": "task0"
+              },
+              "task": {
+                "name": "pack"
+              },
+              "terms": [
+                {
+                  "name": "?x"
+                }
+              ]
+            },
+            {
+              "id": {
+                "name": "task1"
+              },
+              "task": {
+                "name": "paint"
+              },
+              "terms": [
+                {
+                  "name": "?x"
+                }
+              ]
+            }
+          ],
+          "orderings": {
+            "Partial": []
+          }
+        }
+      }
+    ],
+    "actions": [
+      {
+        "name": "paint",
+        "parameters": [
+          {
+            "name": "?x",
+            "symbol_type": "item"
+          }
+        ],
+        "preconditions": {
+          "Atom": {
+            "name": "ready",
+            "variables": [
+              {
+                "name": "?x"
+              }
+            ]
+          }
+        },
+        "effects": {
+          "Atom": {
+            "name": "painted",
+            "variables": [
+              {
+                "name": "?x"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "pack",
+        "parameters": [
+          {
+            "name": "?x",
+            "symbol_type": "item"
+          }
+        ],
+        "preconditions": {
+          "Atom": {
+            "name": "ready",
+            "variables": [
+              {
+                "name": "?x"
+              }
+            ]
+          }
+        },
+        "effects": {
+          "Atom": {
+            "name": "packed",
+            "variables": [
+              {
+                "name": "?x"
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "functions": []
+  },
+  "problem": {
+    "name": "partial-1",
+    "domain_name": "partial-order",
+    "requirements": [],
+    "init_tn": {
+      "parameters": [],
+      "tn": {
+        "subtasks": [
+          {
+            "id": {
+              "name": "task0"
+            },
+            "task": {
+              "name": "process"
+            },
+            "terms": [
+              {
+                "name": "item0"
+              }
+            ]
+          }
+        ],
+        "orderings": {
+          "Partial": []
+        }
+      }
+    },
+    "init_state": [
+      {
+        "name": "ready",
+        "variables": [
+          {
+            "name": "item0"
+          }
+        ]
+      }
+    ],
+    "goal": {
+      "And": [
+        {
+          "Atom": {
+            "name": "painted",
+            "variables": [
+              {
+                "name": "item0"
+              }
+            ]
+          }
+        },
+        {
+          "Atom": {
+            "name": "packed",
+            "variables": [
+              {
+                "name": "item0"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "objects": [
+      {
+        "name": "item0",
+        "symbol_type": "item"
+      }
+    ]
+  }
+}

@@ -20,6 +20,10 @@ use crate::parsing::json::{Constraint, Htn, Subtask, TaskOrdering};
 use crate::solver::domain::Domain;
 use crate::solver::problem::Problem;
 
+use super::decomposition::{
+    DecompositionSession, MethodCandidate, MethodRankingContext, MethodTrace, SearchContext,
+    SearchTrace,
+};
 use super::formula::Universe;
 use super::graph::{TaskNode, ground_methods};
 use super::leaf::initial_atoms;
@@ -121,6 +125,19 @@ pub fn refine_plan(
     abstract_plan: &[String],
     options: &RefinementOptions,
 ) -> Result<Refinement> {
+    let mut session = DecompositionSession::default();
+    refine_plan_with_session(domain, problem, abstract_plan, options, &mut session)
+}
+
+/// Refine with optional neural method ranking, frontier search, and tracing.
+#[allow(clippy::too_many_arguments)]
+pub fn refine_plan_with_session(
+    domain: &Domain,
+    problem: &Problem,
+    abstract_plan: &[String],
+    options: &RefinementOptions,
+    session: &mut DecompositionSession<'_>,
+) -> Result<Refinement> {
     let universe = Universe::new(domain, problem);
     let state = initial_atoms(problem);
     let candidates = refine_plan_steps(
@@ -131,6 +148,7 @@ pub fn refine_plan(
         state,
         options,
         options.max_depth,
+        session,
     )?;
     if candidates.is_empty() {
         bail!("the abstract plan could not be refined into a complete HTN plan");
@@ -190,6 +208,53 @@ fn cap(mut candidates: Vec<RefinedTask>) -> Vec<RefinedTask> {
     candidates
 }
 
+fn rank_order(scores: Vec<f64>) -> Option<Vec<usize>> {
+    if scores.is_empty() || scores.iter().any(|score| !score.is_finite()) {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|left, right| {
+        scores[*right]
+            .total_cmp(&scores[*left])
+            .then(left.cmp(right))
+    });
+    Some(order)
+}
+
+/// Hierarchical solving with an optional neural decomposition session.
+pub fn solve_hierarchical_with_session(
+    domain: &Domain,
+    problem: &Problem,
+    options: &RefinementOptions,
+    evaluation_options: &EvaluationOptions,
+    session: &mut DecompositionSession<'_>,
+) -> Result<Refinement> {
+    let mut merger = SgplanMerger::default();
+    let evaluation = evaluate(domain, problem, &mut merger, evaluation_options)?;
+    ensure!(
+        evaluation.solved,
+        "the evaluation tree did not solve the initial task network"
+    );
+    let refinement = refine_plan_with_session(domain, problem, &evaluation.plan, options, session)?;
+    ensure!(
+        problem.goal.is_none() || refinement.goal != GoalStatus::Violated,
+        "the refinement does not reach the problem goal"
+    );
+    Ok(refinement)
+}
+
+fn valid_method_order(order: &[usize], candidate_count: usize) -> bool {
+    order.len() == candidate_count
+        && order.iter().all(|index| *index < candidate_count)
+        && order.iter().collect::<HashSet<_>>().len() == order.len()
+}
+
+fn valid_search_order(order: &[usize], ready: &[usize]) -> bool {
+    order.len() == ready.len()
+        && order.iter().all(|index| ready.contains(index))
+        && order.iter().collect::<HashSet<_>>().len() == order.len()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn refine_plan_steps(
     domain: &Domain,
@@ -199,6 +264,7 @@ fn refine_plan_steps(
     state: BTreeSet<String>,
     options: &RefinementOptions,
     depth: usize,
+    session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
     let mut candidates = vec![RefinedTask {
         steps: Vec::new(),
@@ -228,6 +294,7 @@ fn refine_plan_steps(
                 depth,
                 preferred,
                 &mut visited,
+                session,
             )?;
             for refined in alternatives {
                 let mut steps = candidate.steps.clone();
@@ -263,6 +330,7 @@ fn refine_task(
     depth: usize,
     preferred_method: Option<&str>,
     visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
     // A method may rediscover the same task in the same state. Such a branch
     // cannot make progress, so prune it instead of letting cycles (for example
@@ -281,6 +349,7 @@ fn refine_task(
         depth,
         preferred_method,
         visited,
+        session,
     );
     visited.remove(&key);
     result
@@ -297,6 +366,7 @@ fn refine_task_uncached(
     depth: usize,
     preferred_method: Option<&str>,
     visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
     if depth == 0 {
         return Ok(Vec::new());
@@ -324,18 +394,52 @@ fn refine_task_uncached(
             instance.method.tn.subtasks.len(),
         )
     });
-    let mut results = Vec::new();
+    let mut applicable = Vec::new();
     for instance in methods {
-        if !holds_optional(
+        if holds_optional(
             instance.method.precondition.as_ref(),
             &instance.bindings,
             state,
             universe,
             options.max_groundings,
         )? {
-            continue;
+            applicable.push(instance);
         }
+    }
 
+    let candidates: Vec<MethodCandidate> = applicable
+        .iter()
+        .map(|instance| MethodCandidate {
+            method: instance.method.name.name.clone(),
+            bindings: instance.bindings.clone(),
+            subtasks: instance.method.tn.subtasks.len(),
+            preferred: preferred_method
+                .is_some_and(|preferred| instance.method.name.name == preferred),
+            applicable: true,
+            precondition_atoms: 0,
+            precondition_fraction: 1.0,
+        })
+        .collect();
+    let context = MethodRankingContext {
+        task: task.clone(),
+        state: state.clone(),
+        depth,
+        max_depth: options.max_depth,
+    };
+    let baseline: Vec<usize> = (0..candidates.len()).collect();
+    let order = session
+        .method_ranker
+        .and_then(|ranker| ranker.rank(&context, &candidates))
+        .filter(|scores| scores.len() == candidates.len())
+        .and_then(rank_order)
+        .filter(|order| valid_method_order(order, candidates.len()))
+        .unwrap_or(baseline);
+
+    let mut results = Vec::new();
+    let mut successful = vec![false; candidates.len()];
+    for &candidate_index in &order {
+        let instance = &applicable[candidate_index];
+        let before = results.len();
         let alternatives = refine_network(
             domain,
             problem,
@@ -346,6 +450,7 @@ fn refine_task_uncached(
             options,
             depth - 1,
             visited,
+            session,
         )?;
         for refined in alternatives {
             results.push(RefinedTask {
@@ -361,9 +466,19 @@ fn refine_task_uncached(
                 break;
             }
         }
+        successful[candidate_index] = results.len() > before;
         if results.len() >= MAX_REFINEMENTS {
             break;
         }
+    }
+
+    if let Some(trace) = session.trace.as_deref_mut() {
+        trace.method_trace(MethodTrace {
+            context,
+            candidates,
+            order,
+            successful,
+        });
     }
 
     Ok(results)
@@ -380,6 +495,7 @@ fn refine_network(
     options: &RefinementOptions,
     depth: usize,
     visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
     let tasks: Vec<TaskNode> = network
         .subtasks
@@ -416,6 +532,7 @@ fn refine_network(
                         depth,
                         None,
                         visited,
+                        session,
                     )?;
                     for refined in alternatives {
                         let mut steps = candidate.steps.clone();
@@ -465,6 +582,7 @@ fn refine_network(
                 options,
                 depth,
                 visited,
+                session,
             )
         }
     }
@@ -481,6 +599,7 @@ fn search_partial(
     options: &RefinementOptions,
     depth: usize,
     visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
+    session: &mut DecompositionSession<'_>,
 ) -> Result<Vec<RefinedTask>> {
     let mut remaining = vec![true; tasks.len()];
     let mut results = Vec::new();
@@ -497,6 +616,7 @@ fn search_partial(
         depth,
         visited,
         &mut results,
+        session,
     )?;
     Ok(cap(results))
 }
@@ -515,6 +635,7 @@ fn search_partial_inner(
     depth: usize,
     visited: &mut HashSet<(TaskNode, BTreeSet<String>)>,
     results: &mut Vec<RefinedTask>,
+    session: &mut DecompositionSession<'_>,
 ) -> Result<()> {
     if results.len() >= MAX_REFINEMENTS {
         return Ok(());
@@ -527,13 +648,30 @@ fn search_partial_inner(
         return Ok(());
     }
 
-    for index in 0..tasks.len() {
-        if !remaining[index] {
-            continue;
-        }
-        if predecessors[index].iter().any(|&before| remaining[before]) {
-            continue;
-        }
+    let ready: Vec<usize> = (0..tasks.len())
+        .filter(|&index| {
+            remaining[index] && !predecessors[index].iter().any(|&before| remaining[before])
+        })
+        .collect();
+    if ready.is_empty() {
+        return Ok(());
+    }
+    let context = SearchContext {
+        tasks: tasks.to_vec(),
+        remaining: remaining.to_vec(),
+        predecessors: predecessors.to_vec(),
+        state: state.clone(),
+        depth,
+    };
+    let order = session
+        .search_policy
+        .and_then(|policy| policy.order_ready(&context))
+        .filter(|order| valid_search_order(order, &ready))
+        .unwrap_or_else(|| ready.clone());
+    let mut successful = vec![false; order.len()];
+
+    for (slot, &index) in order.iter().enumerate() {
+        let before = results.len();
         let alternatives = refine_task(
             domain,
             problem,
@@ -544,6 +682,7 @@ fn search_partial_inner(
             depth,
             None,
             visited,
+            session,
         )?;
         for refined in alternatives {
             remaining[index] = false;
@@ -562,12 +701,28 @@ fn search_partial_inner(
                 depth,
                 visited,
                 results,
+                session,
             )?;
             remaining[index] = true;
             if results.len() >= MAX_REFINEMENTS {
-                return Ok(());
+                break;
             }
         }
+        successful[slot] = results.len() > before;
+        if results.len() >= MAX_REFINEMENTS {
+            break;
+        }
+    }
+
+    if ready.len() > 1
+        && let Some(trace) = session.trace.as_deref_mut()
+    {
+        trace.search_trace(SearchTrace {
+            context,
+            ready,
+            order,
+            successful,
+        });
     }
     Ok(())
 }
@@ -732,4 +887,35 @@ fn validate_steps(
         }
     }
     Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rank_order_sorts_scores_and_breaks_ties_by_index() {
+        assert_eq!(rank_order(vec![0.5, 2.0, 1.0]), Some(vec![1, 2, 0]));
+        assert_eq!(rank_order(vec![1.0, 1.0]), Some(vec![0, 1]));
+        assert_eq!(rank_order(vec![f64::NAN]), None);
+        assert_eq!(rank_order(Vec::new()), None);
+    }
+
+    #[test]
+    fn method_order_rejects_non_permutations() {
+        assert!(valid_method_order(&[0, 1], 2));
+        assert!(valid_method_order(&[], 0));
+        assert!(!valid_method_order(&[0], 2));
+        assert!(!valid_method_order(&[0, 0], 2));
+        assert!(!valid_method_order(&[0, 2], 2));
+    }
+
+    #[test]
+    fn search_order_rejects_missing_duplicate_or_blocked_tasks() {
+        let ready = vec![2, 4];
+        assert!(valid_search_order(&[4, 2], &ready));
+        assert!(!valid_search_order(&[2], &ready));
+        assert!(!valid_search_order(&[2, 2], &ready));
+        assert!(!valid_search_order(&[2, 3], &ready));
+    }
 }

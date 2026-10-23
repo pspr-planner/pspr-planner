@@ -1,0 +1,10 @@
+(define (problem partial-1)
+  (:domain partial-order)
+  (:objects item0 - item)
+  (:htn
+    :parameters ()
+    :subtasks (and (task0 (process item0)))
+  )
+  (:init (ready item0))
+  (:goal (and (painted item0) (packed item0)))
+)

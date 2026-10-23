@@ -99,17 +99,19 @@ use std::collections::BTreeSet;
 use super::graph::ConstraintNode;
 
 mod adam;
-#[cfg(feature = "neural")]
+#[cfg(feature = "neural-base")]
 mod neural;
+mod optimizer;
 mod penalty;
 mod sgplan;
 
 pub use adam::AdamOptions;
-#[cfg(feature = "neural")]
+#[cfg(feature = "neural-base")]
 pub use neural::{
     DEFAULT_HEADS, DEFAULT_HIDDEN, FEATURE_DIM, GatModel, MergeGraph, NeuralMergeInitializer,
     TrainingSample,
 };
+pub use optimizer::OptimizerKind;
 pub use penalty::PenaltySpace;
 pub use sgplan::SgplanMerger;
 

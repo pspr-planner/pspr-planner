@@ -138,6 +138,36 @@ observed step time. Epoch summaries and a final best-loss summary follow.
 Predictions are validated for shape and finiteness; the merger falls back to
 the sequential start and still runs the exact validator.
 
+### Neural decomposition guidance (optional)
+
+The `neural-base` feature builds the unified method-ranker and frontier
+policy/value GAT used by the C+G refiner. It is off by default, so the
+symbolic C+G path has no Burn dependency. `neural-gpu` selects Burn's `wgpu`
+backend for training.
+
+```bash
+# Collect method and frontier traces and train both heads together.
+cargo run --features neural-base --bin train_decomposition_model -- \
+  --task both --ipc-dir ../hddl/test_data/ipc --epochs 20 \
+  --output target/decomposition-model.burnpack
+
+# Use the joint checkpoint during refinement. Separate checkpoints can be
+# enabled with PSPR_METHOD_RANKER and PSPR_SEARCH_POLICY.
+PSPR_DECOMPOSITION_MODEL=target/decomposition-model.burnpack \
+  cargo run --features neural-base -- --hierarchical domain.hddl p01.hddl
+```
+
+`--task method`, `--task policy`, and `--task both` choose the training
+objective; `both` interleaves both listwise losses in one optimizer stream.
+The trainer writes a `.json` sidecar recording the heads that actually had
+training examples, and inference uses it so an untrained head is never
+activated. Method ranking only reorders applicable methods; the policy only
+reorders ready tasks; wrong-length, non-finite, or non-permutation outputs
+fall back to the symbolic order. `PSPR_DECOMPOSITION_MODEL` remains available
+for a single joint checkpoint. See
+[`docs/neural-decomposition/README.md`](docs/neural-decomposition/README.md)
+for details and the unordered test fixture used to exercise policy training.
+
 ## Layout
 
 | Module | Role |
@@ -160,7 +190,10 @@ the sequential start and still runs the exact validator.
 | `src/main.rs` | CLI pipeline |
 | `src/bin/train_merge_initializer.rs` | Offline Burn training for the neural merge warm start |
 | `src/solver/evaluation_tree/merge/neural.rs` | Design 1 graph features, GAT, and inference initializer |
+| `src/bin/train_decomposition_model.rs` | Unified method-ranker and frontier-policy/value trainer |
+| `src/solver/evaluation_tree/decomposition/` | Decomposition graph features, shared GAT, traits, and inference wrappers |
 | `examples/bench_modes.rs` | Machine-readable benchmark for the three compound-task modes |
+| `examples/compare_merge_optimizers.rs` | Adam versus SGD, momentum, adaptive, CG, and quasi-Newton merge optimizers |
 | `scripts/compare_decomposition.sh` | PSPR-versus-pandaPI benchmark harness |
 
 ## Formula support
@@ -390,6 +423,9 @@ the means and totals, so use the medians when comparing typical behaviour.
   five method-ranking GAT designs and five search-policy/value designs, with
   selected design docs for a state-conditioned relational method ranker and a
   frontier GNN policy/value for partial-order refinement.
+- [Merge-solver optimizer comparison](docs/merge-optimizer-comparison.md):
+  Adam versus projected SGD, momentum, Nesterov, RMSProp, Adagrad, BFGS,
+  L-BFGS, and nonlinear CG on real and synthetic merge problems.
 
 ## References
 

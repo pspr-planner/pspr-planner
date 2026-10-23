@@ -7,7 +7,8 @@ use std::sync::Arc;
 use anyhow::{Result, bail, ensure};
 
 use super::super::graph::ConstraintNode;
-use super::adam::{Adam, AdamOptions};
+use super::adam::AdamOptions;
+use super::optimizer::{OptimizerKind, OptimizerState};
 use super::penalty::{PenaltySpace, logistic, smooth_max, softplus};
 use super::{
     MergeInitialization, MergeInitializer, MergeOutcome, MergeProblem, MergeSolver,
@@ -54,6 +55,8 @@ pub struct SgplanMerger {
     pub adam_steps: usize,
     /// Adam hyper-parameters.
     pub adam: AdamOptions,
+    /// Optimization backend used for the relaxed objective.
+    pub optimizer: OptimizerKind,
     /// Weight of the makespan term of the relaxed objective.
     pub cost_weight: f64,
     /// Temperature of the smooth maximum and of the smooth hinge.
@@ -72,7 +75,7 @@ pub struct SgplanMerger {
 
 impl Default for SgplanMerger {
     fn default() -> Self {
-        #[cfg_attr(not(feature = "neural"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "neural-base"), allow(unused_mut))]
         let mut merger = SgplanMerger {
             penalty_weight: 1.0,
             min_penalty: 1e-3,
@@ -82,6 +85,7 @@ impl Default for SgplanMerger {
             iterations: 10,
             adam_steps: 200,
             adam: AdamOptions::default(),
+            optimizer: OptimizerKind::Adam,
             cost_weight: 1.0,
             temperature: 0.05,
             tolerance: 1e-3,
@@ -94,7 +98,7 @@ impl Default for SgplanMerger {
             report: None,
             initializer: None,
         };
-        #[cfg(feature = "neural")]
+        #[cfg(feature = "neural-base")]
         if let Some(path) = std::env::var_os("PSPR_MERGE_MODEL") {
             let path = std::path::PathBuf::from(path);
             match super::neural::NeuralMergeInitializer::from_path(&path) {
@@ -122,6 +126,12 @@ impl SgplanMerger {
     /// produces training targets.
     pub fn without_initializer(mut self) -> Self {
         self.initializer = None;
+        self
+    }
+
+    /// Select the optimizer used for the relaxed objective.
+    pub fn with_optimizer(mut self, optimizer: OptimizerKind) -> Self {
+        self.optimizer = optimizer;
         self
     }
 }
@@ -418,7 +428,7 @@ impl SgplanMerger {
             };
         }
 
-        let mut adam = Adam::new(problem.children.len());
+        let mut optimizer = OptimizerState::new(self.optimizer, problem.children.len());
         let mut space_index = preferred_space
             .and_then(|space| spaces.iter().position(|candidate| *candidate == space))
             .unwrap_or(0);
@@ -429,14 +439,31 @@ impl SgplanMerger {
             rounds += 1;
             let space = spaces[space_index];
             for _ in 0..self.adam_steps.max(1) {
-                let (_, gradient) = problem.evaluate(
+                let (objective, gradient) = problem.evaluate(
                     &parameters,
                     &weights,
                     space,
                     self.cost_weight,
                     self.temperature,
                 );
-                adam.update(&mut parameters, &gradient, &self.adam, 0.0, 1.0);
+                let mut evaluate = |candidate: &[f64]| {
+                    problem.evaluate(
+                        candidate,
+                        &weights,
+                        space,
+                        self.cost_weight,
+                        self.temperature,
+                    )
+                };
+                optimizer.update(
+                    &mut parameters,
+                    &gradient,
+                    objective,
+                    &mut evaluate,
+                    &self.adam,
+                    0.0,
+                    1.0,
+                );
             }
             let violations = problem.exact_violations(&parameters);
             let total: f64 = violations.iter().sum();
@@ -473,7 +500,7 @@ impl SgplanMerger {
                 previous.is_some_and(|previous| total > previous * (1.0 - self.min_progress));
             if stalled && space_index + 1 < spaces.len() {
                 space_index += 1;
-                adam.reset();
+                optimizer.reset();
             }
             previous = Some(total);
         }

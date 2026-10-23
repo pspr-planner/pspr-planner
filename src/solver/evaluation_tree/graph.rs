@@ -434,6 +434,63 @@ impl ConstraintIndex {
     }
 }
 
+/// Grounded top-level tasks together with their ordering edges.
+pub(super) type GroundedNetwork = (Vec<TaskNode>, Vec<(usize, usize)>);
+
+/// Ground the initial task network and return its tasks together with the
+/// ordering edges of every grounding.
+///
+/// The indices are global: a grounding that starts at `offset` contributes
+/// edges `offset + i -> offset + j`. This is the same indexing that
+/// [`build_task_constraint_graph`] uses for its `Ordering` constraint nodes,
+/// but without building the atom incidence.
+pub(super) fn ground_task_network_edges(
+    domain: &Domain,
+    problem: &Problem,
+    max_groundings: usize,
+) -> Result<GroundedNetwork> {
+    let universe = Universe::new(domain, problem);
+    let groundings = ground_task_network(&universe, problem, max_groundings)?;
+    let mut tasks = Vec::new();
+    let mut edges = Vec::new();
+    let Some(network) = problem.task_network() else {
+        return Ok((tasks, edges));
+    };
+    let id_of: HashMap<&str, usize> = network
+        .subtasks
+        .iter()
+        .enumerate()
+        .filter_map(|(position, subtask)| {
+            subtask.id.as_ref().map(|id| (id.name.as_str(), position))
+        })
+        .collect();
+
+    for grounding in &groundings {
+        let offset = tasks.len();
+        let count = grounding.tasks.len();
+        tasks.extend(grounding.tasks.iter().cloned());
+        match &network.orderings {
+            TaskOrdering::Total => {
+                for position in 0..count.saturating_sub(1) {
+                    edges.push((offset + position, offset + position + 1));
+                }
+            }
+            TaskOrdering::Partial(pairs) => {
+                for (before, after) in pairs {
+                    let before = id_of.get(before.as_str()).copied().ok_or_else(|| {
+                        anyhow::anyhow!("unknown subtask id `{before}` in the task ordering")
+                    })?;
+                    let after = id_of.get(after.as_str()).copied().ok_or_else(|| {
+                        anyhow::anyhow!("unknown subtask id `{after}` in the task ordering")
+                    })?;
+                    edges.push((offset + before, offset + after));
+                }
+            }
+        }
+    }
+    Ok((tasks, edges))
+}
+
 /// Build the task/constraint incidence graph of the initial task network.
 pub fn build_task_constraint_graph(
     domain: &Domain,

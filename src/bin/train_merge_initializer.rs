@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use burn::module::Module;
-#[cfg(not(feature = "neural-gpu"))]
+#[cfg(feature = "neural")]
 use burn::module::{ModuleVisitor, Param};
 use burn::optim::{AdamConfig, GradientsParams};
 #[cfg(feature = "neural-gpu")]
@@ -28,7 +28,7 @@ use pspr::solver::evaluation_tree::{
     MergeProblem, MergeSolver, MethodSummary, SgplanMerger, TrainingSample, evaluate,
 };
 use pspr::solver::problem::{Problem, load_problem};
-#[cfg(not(feature = "neural-gpu"))]
+#[cfg(feature = "neural")]
 use rayon::prelude::*;
 
 #[derive(Debug, Parser)]
@@ -318,13 +318,17 @@ fn train(args: &Args, samples: &[TrainingSample], run_started: Instant) -> Resul
     {
         train_sequential(args, samples, run_started)
     }
-    #[cfg(not(feature = "neural-gpu"))]
+    #[cfg(all(not(feature = "neural-gpu"), feature = "neural"))]
     {
         train_parallel_cpu(args, samples, run_started)
     }
+    #[cfg(all(not(feature = "neural-gpu"), not(feature = "neural")))]
+    {
+        train_sequential(args, samples, run_started)
+    }
 }
 
-#[cfg(feature = "neural-gpu")]
+#[cfg(any(feature = "neural-gpu", not(feature = "neural")))]
 fn train_sequential(args: &Args, samples: &[TrainingSample], run_started: Instant) -> Result<()> {
     let _batch_size = args.batch_size;
     if args.epochs == 0 {
@@ -470,7 +474,7 @@ fn train_sequential(args: &Args, samples: &[TrainingSample], run_started: Instan
     Ok(())
 }
 
-#[cfg(not(feature = "neural-gpu"))]
+#[cfg(feature = "neural")]
 fn compute_step(
     model: &GatModel,
     sample: &TrainingSample,
@@ -519,7 +523,7 @@ fn compute_step(
     (Some(gradients), value)
 }
 
-#[cfg(not(feature = "neural-gpu"))]
+#[cfg(feature = "neural")]
 fn compute_batch(
     model: &GatModel,
     batch: &[&TrainingSample],
@@ -536,7 +540,7 @@ fn compute_batch(
         .collect()
 }
 
-#[cfg(not(feature = "neural-gpu"))]
+#[cfg(feature = "neural")]
 fn average_gradients(model: &GatModel, parts: &[GradientsParams]) -> GradientsParams {
     struct Average<'a> {
         parts: &'a [GradientsParams],
@@ -569,7 +573,7 @@ fn average_gradients(model: &GatModel, parts: &[GradientsParams]) -> GradientsPa
     visitor.out
 }
 
-#[cfg(not(feature = "neural-gpu"))]
+#[cfg(feature = "neural")]
 fn train_parallel_cpu(args: &Args, samples: &[TrainingSample], run_started: Instant) -> Result<()> {
     if args.epochs == 0 {
         bail!("--epochs must be at least 1");

@@ -8,8 +8,9 @@ readme = "README.md"
 
 [features]
 default = []
-neural = ["dep:burn", "dep:rayon"]
-neural-gpu = ["neural", "burn/wgpu"]
+neural-base = ["dep:burn"]
+neural = ["neural-base", "dep:rayon"]
+neural-gpu = ["neural-base", "burn/wgpu"]
 
 [lib]
 name = "pspr"
@@ -22,7 +23,12 @@ path = "src/main.rs"
 [[bin]]
 name = "train_merge_initializer"
 path = "src/bin/train_merge_initializer.rs"
-required-features = ["neural"]
+required-features = ["neural-base"]
+
+[[bin]]
+name = "train_decomposition_model"
+path = "src/bin/train_decomposition_model.rs"
+required-features = ["neural-base"]
 
 [dependencies]
 anyhow = "1.0.104"

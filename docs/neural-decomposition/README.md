@@ -1,8 +1,9 @@
 # Neural guidance for compound-task decomposition
 
-Status: design note, 2026-10-22. This directory compares neural components for
-the C+G refinement path. It does not add a model to the default build; the
-symbolic refiner remains the correctness boundary.
+Status: implementation note, 2026-10-22. This directory compares neural
+components for the C+G refinement path and documents the selected
+implementation. It does not add a model to the default build; the symbolic
+refiner remains the correctness boundary.
 
 ## 1. Scope
 
@@ -232,7 +233,81 @@ feature; the default build keeps the existing symbolic path.
 5. **LLM proposals** only if a future setting lacks a formal domain model or
    needs cross-domain priors; keep the symbolic verifier mandatory.
 
-## 8. References
+## 8. Current implementation
+
+The first implementation lives in
+`src/solver/evaluation_tree/decomposition/` and is enabled by the
+`neural-base` feature:
+
+```bash
+cargo build --features neural-base --bin pspr
+```
+
+The default build has no Burn dependency. The symbolic refiner owns all
+applicability checks, state transitions, backtracking, and validation; the
+model only reorders candidate methods and ready tasks.
+
+### 8.1 Unified training
+
+`train_decomposition_model` collects traces from the symbolic C+G path and
+trains the shared graph encoder with listwise cross-entropy:
+
+- `--task method`: method-ranking loss only;
+- `--task policy`: frontier-policy plus value-regression loss only;
+- `--task both`: both losses interleaved in one Adam step stream.
+
+```bash
+cargo run --features neural-base --bin train_decomposition_model -- \
+  --task both \
+  --domain ../hddl/test_data/ipc/Blocksworld-GTOHP/domain.hddl \
+  --problem ../hddl/test_data/ipc/Blocksworld-GTOHP/p01.hddl \
+  --problem ../hddl/test_data/ipc/Blocksworld-GTOHP/p02.hddl \
+  --epochs 20 \
+  --max-samples 4096 \
+  --output target/decomposition-model.burnpack
+```
+
+The trainer writes the Burn checkpoint and a `.json` sidecar recording the
+trained head(s), hidden width, and feature width. The sidecar is read at
+inference time, so a method-only checkpoint never enables the untrained
+policy head (and vice versa).
+
+Policy examples require a genuinely unordered method network. Many IPC
+domains encode partial orderings as chains, so `--task policy` may report no
+usable decision. `tests/fixtures/partial/` is a small two-subtask network that
+exercises both heads:
+
+```bash
+cargo run --features neural-base --bin train_decomposition_model -- \
+  --domain tests/fixtures/partial/domain.hddl \
+  --problem tests/fixtures/partial/p01.hddl \
+  --task both --epochs 8 --max-samples 64 \
+  --output target/decomposition-partial.burnpack
+```
+
+### 8.2 Inference
+
+```bash
+PSPR_METHOD_RANKER=target/decomposition-method.burnpack \
+PSPR_SEARCH_POLICY=target/decomposition-policy.burnpack \
+target/debug/pspr --hierarchical --max-groundings 4096 \
+  ../hddl/test_data/ipc/Blocksworld-GTOHP/domain.hddl \
+  ../hddl/test_data/ipc/Blocksworld-GTOHP/p01.hddl
+```
+
+`PSPR_DECOMPOSITION_MODEL` remains a convenience path for a joint checkpoint;
+its sidecar selects the enabled heads. Missing or malformed checkpoints are
+reported on stderr and ignored, leaving the symbolic path available. A
+returned score vector of the wrong shape, non-finite values, or an invalid
+permutation also falls back to the deterministic order.
+
+The current model is deliberately compact: three shared GAT layers, hidden
+width 64, a candidate-centric method head, a per-ready-task policy head, and a
+global value head. Atom nodes, typed relation-specific projections, and
+multi-head attention from the long-term designs are not yet implemented; the
+graph currently uses task, candidate, frontier, and global nodes.
+
+## 9. References
 
 `velickovic2018gat` for graph attention, `schlichtkrull2018rgcn` for typed
 relational message passing, `xu2019gin` for expressiveness, and

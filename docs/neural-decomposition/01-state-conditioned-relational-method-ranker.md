@@ -1,6 +1,7 @@
 # Design 1: State-conditioned relational method ranker
 
-Status: proposed. This is the selected method-ranking design from
+Status: implemented in `src/solver/evaluation_tree/decomposition/` as a
+candidate-centric GAT. This is the selected method-ranking design from
 [the longlist](README.md). It is a narrow neural component for
 `refine_task`; it never replaces symbolic applicability checking, state
 transition, or validation.

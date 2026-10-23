@@ -46,6 +46,8 @@
 //! * `merge`: the merge-solver interface, the relaxed SGPlan MINLP, Adam, and
 //!   the adaptive penalty continuation.
 //! * `verify`: re-execution of a merged plan against the full HDDL semantics.
+//! * `liftability`: static detection of the top-level task pairs whose
+//!   subtask effects are dropped by the abstraction.
 //!
 //! # Modelling limitations
 //!
@@ -87,24 +89,37 @@ use crate::solver::partition::bisbm::Grouping;
 use crate::solver::problem::Problem;
 
 mod clustering;
+mod decomposition;
 mod formula;
 mod graph;
 mod hierarchical;
 mod leaf;
+mod liftability;
 mod merge;
 mod verify;
 
 pub use clustering::EvaluationTree;
+pub use decomposition::{
+    DECOMPOSITION_FEATURE_DIM, DecompositionGraph, DecompositionSession, DecompositionTraceSink,
+    GuidanceKind, MethodCandidate, MethodRanker, MethodRankingContext, MethodTrace, SearchContext,
+    SearchPolicy, SearchTrace,
+};
+#[cfg(feature = "neural-base")]
+pub use decomposition::{DECOMPOSITION_HIDDEN, DecompositionModel, NeuralDecompositionModel};
 pub use graph::{Atom, ConstraintNode, TaskConstraintGraph, TaskNode, build_task_constraint_graph};
 pub use hierarchical::{
-    Refinement, RefinementOptions, RefinementStep, refine_plan, solve_hierarchical,
-    validate_refinement,
+    Refinement, RefinementOptions, RefinementStep, refine_plan, refine_plan_with_session,
+    solve_hierarchical, solve_hierarchical_with_session, validate_refinement,
+};
+pub use liftability::{
+    ConsumerKind, GapKind, LiftabilityGap, LiftabilityOptions, LiftabilityReport,
+    detect_liftability_gaps,
 };
 pub use merge::{
     AdamOptions, MergeInitialization, MergeInitializer, MergeOutcome, MergeProblem, MergeRecord,
-    MergeSolver, PartialSolution, PenaltyReport, PenaltySpace, SgplanMerger,
+    MergeSolver, OptimizerKind, PartialSolution, PenaltyReport, PenaltySpace, SgplanMerger,
 };
-#[cfg(feature = "neural")]
+#[cfg(feature = "neural-base")]
 pub use merge::{
     DEFAULT_HEADS, DEFAULT_HIDDEN, FEATURE_DIM, GatModel, MergeGraph, NeuralMergeInitializer,
     TrainingSample,

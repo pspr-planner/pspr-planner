@@ -1,6 +1,7 @@
 # Design 2: Frontier GNN policy and value for `search_partial`
 
-Status: proposed. This is the selected search-policy design from
+Status: implemented in `src/solver/evaluation_tree/decomposition/` at the
+initial frontier-GNN scope. This is the selected search-policy design from
 [the longlist](README.md). It learns which ready task to expand next in a
 partial-order method network. The symbolic recursion, state transition,
 backtracking, cycle check, and result cap remain unchanged.
