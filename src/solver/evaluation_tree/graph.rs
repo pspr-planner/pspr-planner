@@ -252,6 +252,270 @@ pub(super) fn bindings_from(parameters: &[Symbol], terms: &[String]) -> BTreeMap
         .collect()
 }
 
+/// Index of one state's atoms, parsed once per demand-driven grounding.
+///
+/// Refinement asks for method groundings in a concrete state. The index turns
+/// that state into a `predicate -> argument tuples` table so a method
+/// precondition can be joined atom by atom instead of enumerating every free
+/// parameter over the whole typed universe.
+struct StateIndex<'a> {
+    atoms: HashMap<&'a str, Vec<Vec<&'a str>>>,
+}
+
+impl<'a> StateIndex<'a> {
+    fn new(state: &'a BTreeSet<String>) -> Self {
+        let mut atoms: HashMap<&str, Vec<Vec<&str>>> = HashMap::new();
+        for atom in state {
+            let Some(open) = atom.find('(') else {
+                atoms.entry(atom.as_str()).or_default().push(Vec::new());
+                continue;
+            };
+            if !atom.ends_with(')') {
+                continue;
+            }
+            let inner = &atom[open + 1..atom.len() - 1];
+            let terms = if inner.is_empty() {
+                Vec::new()
+            } else {
+                // `atom_key_into` writes ", " between terms.
+                inner.split(", ").collect()
+            };
+            atoms.entry(&atom[..open]).or_default().push(terms);
+        }
+        StateIndex { atoms }
+    }
+
+    fn lookup(&self, predicate: &str) -> &[Vec<&'a str>] {
+        self.atoms.get(predicate).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+/// Collect the positive atoms of a precondition conjunction.
+///
+/// Only `And` and `Atom` nodes take part. Every other constructor (`Not`, `Or`,
+/// `Imply`, quantifiers, `Equals`, `Xor`) is left to the caller's full
+/// precondition check, so parameters that only appear there stay unbound and
+/// are enumerated over the universe as before.
+fn positive_atoms<'a>(formula: &'a Formula, out: &mut Vec<&'a Predicate>) {
+    match formula {
+        Formula::And(items) => {
+            for item in items {
+                positive_atoms(item, out);
+            }
+        }
+        Formula::Atom(predicate) => out.push(predicate),
+        _ => {}
+    }
+}
+
+/// Extend every partial binding with the state atoms that match `atom`.
+fn join_atom(
+    index: &StateIndex<'_>,
+    atom: &Predicate,
+    partials: &[BTreeMap<String, String>],
+    budget: usize,
+) -> Vec<BTreeMap<String, String>> {
+    let candidates = index.lookup(&atom.name);
+    let mut joined = Vec::new();
+    if candidates.is_empty() {
+        return joined;
+    }
+    for partial in partials {
+        // Resolve each term once: `Some(value)` is fixed by the task bindings or
+        // a constant, `None` is a variable the state atom has to supply.
+        let pattern: Vec<Option<&str>> = atom
+            .variables
+            .iter()
+            .map(|symbol| match partial.get(&symbol.name) {
+                Some(value) => Some(value.as_str()),
+                None if symbol.name.starts_with('?') => None,
+                None => Some(symbol.name.as_str()),
+            })
+            .collect();
+        for terms in candidates {
+            if terms.len() != pattern.len() {
+                continue;
+            }
+            let mut extended: Option<BTreeMap<String, String>> = None;
+            let mut consistent = true;
+            for (position, term) in terms.iter().enumerate() {
+                match pattern[position] {
+                    Some(value) => {
+                        if value != *term {
+                            consistent = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        let symbol = &atom.variables[position];
+                        let bindings = extended.get_or_insert_with(|| partial.clone());
+                        match bindings.get(&symbol.name) {
+                            Some(bound) if bound.as_str() != *term => {
+                                consistent = false;
+                                break;
+                            }
+                            Some(_) => {}
+                            None => {
+                                bindings.insert(symbol.name.clone(), (*term).to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if !consistent {
+                continue;
+            }
+            joined.push(extended.unwrap_or_else(|| partial.clone()));
+            if joined.len() >= budget {
+                return joined;
+            }
+        }
+    }
+    joined
+}
+
+/// Drop duplicate partial bindings produced by different state atoms.
+fn dedup_partials(partials: &mut Vec<BTreeMap<String, String>>) {
+    let mut seen = std::collections::HashSet::new();
+    partials.retain(|partial| {
+        seen.insert(
+            partial
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect::<Vec<_>>(),
+        )
+    });
+}
+
+/// Ground the method instances of `task` that the given state can support.
+///
+/// This is the demand-driven counterpart of [`ground_methods_bounded`]. Rather
+/// than enumerating every free parameter over the typed universe — for a method
+/// such as Freecell's `M108-ACHIEVE-HOME0`, which has six free parameters, that
+/// cross product exceeds any practical budget and hides the assignments that
+/// actually apply — the positive atoms of the method precondition are joined
+/// against the state, so the state supplies the bindings. Parameters that no
+/// positive atom constrains are still enumerated over the universe, and callers
+/// keep checking the full precondition, so nothing that the state can decide is
+/// lost.
+pub(super) fn ground_methods_in_state<'a>(
+    domain: &'a Domain,
+    universe: &Universe<'_>,
+    task: &TaskNode,
+    state: &BTreeSet<String>,
+    budget: usize,
+) -> Result<BoundedMethods<'a>> {
+    if budget == 0 {
+        return Ok(BoundedMethods {
+            instances: Vec::new(),
+            truncated: true,
+        });
+    }
+    let index = StateIndex::new(state);
+    let mut instances = Vec::new();
+    let mut truncated = false;
+    for method in domain.methods_for(&task.name) {
+        if method.task_terms.len() != task.terms.len() {
+            continue;
+        }
+        if !method
+            .task_terms
+            .iter()
+            .zip(&task.terms)
+            .all(|(parameter, term)| universe.compatible(parameter, term))
+        {
+            continue;
+        }
+
+        let bindings = bindings_from(&method.task_terms, &task.terms);
+        let task_names: BTreeSet<&str> = method
+            .task_terms
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect();
+        let free: Vec<Symbol> = method
+            .params
+            .iter()
+            .filter(|parameter| !task_names.contains(parameter.name.as_str()))
+            .cloned()
+            .collect();
+
+        let mut partials = vec![bindings];
+        if let Some(precondition) = &method.precondition {
+            let mut atoms = Vec::new();
+            positive_atoms(precondition, &mut atoms);
+            // Most selective first: atoms that the task already binds cut the
+            // join down before the unconstrained ones are expanded.
+            atoms.sort_by_key(|atom| {
+                std::cmp::Reverse(
+                    atom.variables
+                        .iter()
+                        .filter(|symbol| {
+                            task_names.contains(symbol.name.as_str())
+                                || !symbol.name.starts_with('?')
+                        })
+                        .count(),
+                )
+            });
+            for atom in atoms {
+                partials = join_atom(&index, atom, &partials, budget);
+                dedup_partials(&mut partials);
+                if partials.len() > budget {
+                    partials.truncate(budget);
+                    truncated = true;
+                }
+                if partials.is_empty() {
+                    break;
+                }
+            }
+        }
+        if partials.is_empty() {
+            continue;
+        }
+
+        for partial in partials {
+            let remaining: Vec<Symbol> = free
+                .iter()
+                .filter(|parameter| !partial.contains_key(&parameter.name))
+                .cloned()
+                .collect();
+            if remaining.is_empty() {
+                if instances.len() >= budget {
+                    truncated = true;
+                    break;
+                }
+                instances.push(GroundedMethod {
+                    method,
+                    bindings: partial,
+                });
+                continue;
+            }
+            for assignment in universe.assignments_capped(&remaining, budget) {
+                if instances.len() >= budget {
+                    truncated = true;
+                    break;
+                }
+                let mut bindings = partial.clone();
+                bindings.extend(assignment);
+                instances.push(GroundedMethod { method, bindings });
+            }
+            if instances.len() >= budget {
+                truncated = true;
+                break;
+            }
+        }
+        if instances.len() >= budget {
+            truncated = true;
+            break;
+        }
+    }
+
+    Ok(BoundedMethods {
+        instances,
+        truncated,
+    })
+}
+
 pub(super) fn ground_atom(predicate: &Predicate, bindings: &BTreeMap<String, String>) -> Atom {
     Atom::new(
         predicate.name.clone(),

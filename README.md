@@ -239,6 +239,15 @@ environment variables drive the diagnostic switches:
 | `PSPR_CYCLE_KEY` | `task-state` (default) prunes a task that recurs in the same state on the current path; `off` disables the visited set |
 | `PSPR_INTERLEAVED_NODES` | node bound of the interleaved frontier fallback (default 20 000, 2 000 in debug builds) |
 | `PSPR_INTERLEAVED_MS` | wall-clock bound of the interleaved frontier fallback (default 3 000 ms) |
+| `PSPR_MAX_FRONTIER` | candidate prefixes kept between two abstract steps (default 128; `0` keeps every prefix) |
+| `PSPR_DEMAND_GROUNDING` | derive method groundings from the state instead of a truncated cross product (default on in release, off in debug builds) |
+| `PSPR_REFINE_BUDGET_MS` | overrides the refinement time budget (measurement only) |
+| `PSPR_NO_COUNT` | disables the producer/consumer counting prune (measurement only) |
+| `PSPR_NO_MEMO` | disables the failed-frontier memo (measurement only) |
+
+The producer/consumer counting prune and the FF-guided linearisation of a
+committed action set are described in
+[`docs/refinement-counting.md`](docs/refinement-counting.md).
 
 `examples/diagnose_refine_modes.rs` prints those counters, the per-task dead
 ends and the unmet precondition literals for one instance:

@@ -251,6 +251,30 @@ fn ipc_blocksworld_gtoph() {
     }
 }
 
+/// p05 is the widest Blocksworld frontier (2048 distinct states per step
+/// before the bound). A narrow goal-guided beam must still refine it, which is
+/// what keeps the instance tractable.
+#[test]
+fn blocksworld_frontier_beam_keeps_p05_solvable() {
+    let Some(ipc) = ipc() else {
+        return;
+    };
+    let (domain, problem) = load_ipc(ipc, "Blocksworld-GTOHP", "p05.hddl");
+    let evaluation = EvaluationOptions {
+        method_summary: MethodSummary::PrimitiveOnly,
+        implicit_orderings: true,
+        ..EvaluationOptions::default()
+    };
+    let refinement = RefinementOptions {
+        max_frontier: 16,
+        ..RefinementOptions::default()
+    };
+    let refined = solve_hierarchical_with_options(&domain, &problem, &refinement, &evaluation)
+        .expect("p05 must refine with a narrow frontier beam");
+    assert!(refined.plan.len() >= 12, "plan {:?}", refined.plan);
+    assert_eq!(refined.goal, GoalStatus::Satisfied);
+}
+
 #[test]
 fn ipc_depots() {
     for (problem, name, length) in [

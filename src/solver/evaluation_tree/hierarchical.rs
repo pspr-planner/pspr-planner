@@ -27,13 +27,19 @@ use super::decomposition::{
     SearchContext, SearchTrace,
 };
 use super::formula::{self, Universe};
-use super::graph::{TaskNode, ground_methods_bounded, ground_task_network_edges};
+use super::graph::{
+    TaskNode, ground_methods_bounded, ground_methods_in_state, ground_task_network_edges,
+};
 use super::leaf::initial_atoms;
 use super::verify::{
-    GoalStatus, Step, apply_action, holds, parse_step, unmet_action_preconditions,
-    unmet_method_preconditions,
+    ActionLiterals, GoalStatus, Step, action_literals, apply_action, collect_positive_atoms, holds,
+    parse_step, unmet_action_preconditions, unmet_method_preconditions,
 };
 use super::{EvaluationOptions, SgplanMerger, evaluate};
+use crate::solver::fast_downward::{
+    Action, CompiledTask, EffectSpec, Evaluation, OperatorSpec, SearchOptions, SearchProblem, Task,
+    best_first_search, ff_heuristic,
+};
 
 /// Counters describing why refinement branches were pruned or failed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,6 +62,27 @@ pub struct RefinementDiagnostics {
     pub dead_end_samples: Vec<String>,
     /// Number of grounded methods rejected by network equality constraints.
     pub network_constraint_rejected: u64,
+    /// Number of grounded methods pruned because their first subtask is a
+    /// primitive action that cannot execute in the current state.
+    pub primitive_prefix_pruned: u64,
+    /// Number of task expansions the search actually performed.
+    pub expansions: u64,
+    /// Widest frontier seen between two abstract steps.
+    pub peak_candidates: usize,
+    /// Number of candidate prefixes the step loop expanded.
+    pub expanded_candidates: u64,
+    /// Number of abstract-step frontiers that were cut to `max_frontier`.
+    pub frontier_truncated: u64,
+    /// Number of frontier nodes rejected by the producer/consumer count.
+    pub counting_pruned: u64,
+    /// Number of frontiers whose decomposition was complete, i.e. whose count
+    /// and ordering were actually evaluated.
+    pub complete_frontiers: u64,
+    /// Number of complete frontiers whose committed action set could not be
+    /// linearised, i.e. no ready action was applicable.
+    pub linearisation_failed: u64,
+    /// Number of frontier nodes the interleaved search visited.
+    pub nodes_visited: u64,
     /// Number of partial-order subnetworks that reached a dead end (no ready task).
     pub partial_ready_empty: u64,
     /// Number of abstract steps that produced no refinement candidates.
@@ -84,6 +111,15 @@ impl RefinementDiagnostics {
             }
         }
         self.network_constraint_rejected += other.network_constraint_rejected;
+        self.primitive_prefix_pruned += other.primitive_prefix_pruned;
+        self.expansions += other.expansions;
+        self.peak_candidates = self.peak_candidates.max(other.peak_candidates);
+        self.expanded_candidates += other.expanded_candidates;
+        self.frontier_truncated += other.frontier_truncated;
+        self.counting_pruned += other.counting_pruned;
+        self.complete_frontiers += other.complete_frontiers;
+        self.linearisation_failed += other.linearisation_failed;
+        self.nodes_visited += other.nodes_visited;
         self.partial_ready_empty += other.partial_ready_empty;
         self.abstract_step_failed += other.abstract_step_failed;
     }
@@ -128,6 +164,14 @@ pub struct RefinementOptions {
     pub max_depth: usize,
     /// How recursive branches are pruned.
     pub cycle_pruning: CyclePruning,
+    /// Maximum number of candidate prefixes kept between two abstract steps.
+    ///
+    /// Zero keeps every candidate. A positive bound turns the step loop into a
+    /// goal-guided beam: when the frontier grows past it, the prefixes that
+    /// satisfy the most top-level goal conjuncts are kept. Learned IPC domains
+    /// such as Blocksworld-GTOHP otherwise reach thousands of distinct states
+    /// per step and pay for each of them in the next step.
+    pub max_frontier: usize,
 }
 
 impl Default for RefinementOptions {
@@ -140,6 +184,10 @@ impl Default for RefinementOptions {
                 .ok()
                 .and_then(|value| CyclePruning::parse(&value))
                 .unwrap_or_default(),
+            max_frontier: std::env::var("PSPR_MAX_FRONTIER")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_MAX_FRONTIER),
         }
     }
 }
@@ -245,11 +293,53 @@ struct GroundedInstance {
 /// Caches groundings per task and applicable instances per `(task, state)`.
 #[derive(Default)]
 struct MethodApplicabilityCache {
-    grounded: HashMap<TaskNode, Arc<[GroundedInstance]>>,
+    /// Enumerated instances per task, with a flag saying whether the grounding
+    /// budget cut the enumeration short.
+    grounded: HashMap<TaskNode, (Arc<[GroundedInstance]>, bool)>,
     applicable: HashMap<ApplicabilityKey, Arc<[u32]>>,
+    /// Instances of tasks whose enumeration was truncated. Those depend on the
+    /// state, so instances and applicability are cached together.
+    demanded: HashMap<ApplicabilityKey, Arc<(Arc<[GroundedInstance]>, Arc<[u32]>)>>,
+    /// Effect literals per task node. They only depend on the action schema and
+    /// its bindings, so they are cached: the counting prune asks for them at
+    /// every search node and re-deriving them dominated the search cost.
+    literals: HashMap<TaskNode, Option<ActionLiterals>>,
+}
+
+/// Whether demand-driven grounding is enabled.
+///
+/// It only runs for tasks whose enumeration exceeded the grounding budget, and
+/// it turns such a task from "no applicable method" into a real search. On
+/// instances that are hard for the search as well (Freecell), that trades a
+/// fast dead end for a long search. Debug builds refine with an unbounded
+/// budget, so the switch defaults off there to keep the test suite responsive;
+/// `PSPR_DEMAND_GROUNDING=1` enables it and `=0` disables it in either profile.
+fn demand_grounding_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PSPR_DEMAND_GROUNDING")
+            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+            .unwrap_or(!cfg!(debug_assertions))
+    })
 }
 
 impl MethodApplicabilityCache {
+    /// Effect literals of `task`, derived once per task node.
+    fn literals(
+        &mut self,
+        domain: &Domain,
+        universe: &Universe<'_>,
+        task: &TaskNode,
+        state: &State,
+        max_groundings: usize,
+    ) -> Option<&ActionLiterals> {
+        if !self.literals.contains_key(task) {
+            let derived = action_literals(domain, task, state.as_ref(), universe, max_groundings);
+            self.literals.insert(task.clone(), derived);
+        }
+        self.literals.get(task).and_then(Option::as_ref)
+    }
+
     #[allow(clippy::type_complexity)]
     fn lookup(
         &mut self,
@@ -259,46 +349,23 @@ impl MethodApplicabilityCache {
         state: &State,
         max_groundings: usize,
     ) -> Result<(Arc<[GroundedInstance]>, Arc<[u32]>)> {
-        let instances = match self.grounded.get(task) {
-            Some(instances) => Arc::clone(instances),
+        let sampling_budget = max_groundings
+            .saturating_mul(REFINEMENT_METHOD_SAMPLING_FACTOR)
+            .max(max_groundings);
+        let (enumerated, truncated) = match self.grounded.get(task) {
+            Some((instances, truncated)) => (Arc::clone(instances), *truncated),
             None => {
-                let sampling_budget = max_groundings
-                    .saturating_mul(REFINEMENT_METHOD_SAMPLING_FACTOR)
-                    .max(max_groundings);
-                let methods =
-                    ground_methods_bounded(domain, universe, task, sampling_budget).instances;
-                let instances: Vec<GroundedInstance> = methods
+                let bounded = ground_methods_bounded(domain, universe, task, sampling_budget);
+                let truncated = bounded.truncated;
+                let instances: Arc<[GroundedInstance]> = bounded
+                    .instances
                     .into_iter()
-                    .map(|instance| {
-                        let tasks: Vec<TaskNode> = instance
-                            .method
-                            .tn
-                            .subtasks
-                            .iter()
-                            .map(|subtask| ground_subtask(subtask, &instance.bindings))
-                            .collect();
-                        let ids: Vec<String> = instance
-                            .method
-                            .tn
-                            .subtasks
-                            .iter()
-                            .enumerate()
-                            .map(|(index, subtask)| subtask_id(subtask, index))
-                            .collect();
-                        GroundedInstance {
-                            subtasks: tasks.len(),
-                            method: instance.method.name.name.clone(),
-                            precondition: instance.method.precondition.clone(),
-                            bindings: instance.bindings,
-                            network: Arc::new(instance.method.tn.clone()),
-                            tasks: tasks.into(),
-                            ids: ids.into(),
-                        }
-                    })
-                    .collect();
-                let instances: Arc<[GroundedInstance]> = instances.into();
-                self.grounded.insert(task.clone(), Arc::clone(&instances));
-                instances
+                    .map(build_instance)
+                    .collect::<Vec<_>>()
+                    .into();
+                self.grounded
+                    .insert(task.clone(), (Arc::clone(&instances), truncated));
+                (instances, truncated)
             }
         };
 
@@ -306,11 +373,47 @@ impl MethodApplicabilityCache {
             task: task.clone(),
             state: Arc::clone(state),
         };
+
+        // The enumeration was cut short, so the instances that the state could
+        // actually support may be outside the retained prefix — Freecell's
+        // `M108-ACHIEVE-HOME0` has six free parameters, so the prefix is an
+        // arbitrary slice of a cross product with millions of elements. Ask the
+        // state itself which bindings are possible instead of extending the
+        // prefix.
+        if truncated && demand_grounding_enabled() {
+            if let Some(entry) = self.demanded.get(&key) {
+                return Ok((Arc::clone(&entry.0), Arc::clone(&entry.1)));
+            }
+            let demanded =
+                ground_methods_in_state(domain, universe, task, state, sampling_budget)?;
+            let instances: Vec<GroundedInstance> =
+                demanded.instances.into_iter().map(build_instance).collect();
+            let mut applicable = Vec::new();
+            for (index, instance) in instances.iter().enumerate() {
+                if holds_optional_bounded(
+                    instance.precondition.as_ref(),
+                    &instance.bindings,
+                    state.as_ref(),
+                    universe,
+                    max_groundings,
+                )? {
+                    applicable.push(index as u32);
+                }
+            }
+            let instances: Arc<[GroundedInstance]> = instances.into();
+            let applicable: Arc<[u32]> = applicable.into();
+            self.demanded.insert(
+                key,
+                Arc::new((Arc::clone(&instances), Arc::clone(&applicable))),
+            );
+            return Ok((instances, applicable));
+        }
+
         if let Some(applicable) = self.applicable.get(&key) {
-            return Ok((instances, Arc::clone(applicable)));
+            return Ok((enumerated, Arc::clone(applicable)));
         }
         let mut applicable = Vec::new();
-        for (index, instance) in instances.iter().enumerate() {
+        for (index, instance) in enumerated.iter().enumerate() {
             if holds_optional_bounded(
                 instance.precondition.as_ref(),
                 &instance.bindings,
@@ -323,7 +426,35 @@ impl MethodApplicabilityCache {
         }
         let applicable: Arc<[u32]> = applicable.into();
         self.applicable.insert(key, Arc::clone(&applicable));
-        Ok((instances, applicable))
+        Ok((enumerated, applicable))
+    }
+}
+
+/// Prepare one grounded method instance for repeated use.
+fn build_instance(instance: super::graph::GroundedMethod<'_>) -> GroundedInstance {
+    let tasks: Vec<TaskNode> = instance
+        .method
+        .tn
+        .subtasks
+        .iter()
+        .map(|subtask| ground_subtask(subtask, &instance.bindings))
+        .collect();
+    let ids: Vec<String> = instance
+        .method
+        .tn
+        .subtasks
+        .iter()
+        .enumerate()
+        .map(|(index, subtask)| subtask_id(subtask, index))
+        .collect();
+    GroundedInstance {
+        subtasks: tasks.len(),
+        method: instance.method.name.name.clone(),
+        precondition: instance.method.precondition.clone(),
+        bindings: instance.bindings,
+        network: Arc::new(instance.method.tn.clone()),
+        tasks: tasks.into(),
+        ids: ids.into(),
     }
 }
 
@@ -569,22 +700,39 @@ pub fn refine_plan_interleaved_with_diagnostics(
     };
 
     let mut cache = MethodApplicabilityCache::default();
-    let mut budget = RefinementBudget::new(grounded.tasks.len(), options);
+    let abilities = TaskAbilities::build(domain);
     let mut nodes_left = interleaved_node_limit();
     let deadline = interleaved_deadline();
-    let Some(done) = interleaved_search(
+    let mut failed = HashSet::new();
+
+    // A single full-depth pass. Iterative deepening used to bound the
+    // decomposition nesting, but re-running every shallower bound spent most of
+    // the budget on levels the counting prune rejects anyway: the prune and the
+    // progression order give the search the guidance the depth bound was
+    // standing in for. `max_depth` still bounds the recursion, so the search
+    // stays finite.
+    let mut attempt = start;
+    for slot in &mut attempt.tree {
+        slot.depth = options.max_depth.max(1);
+    }
+    let mut budget = RefinementBudget::new(grounded.tasks.len(), options)
+        .with_expansions(usize::MAX / 4)
+        .with_millis(refinement_budget_override());
+    let done = interleaved_search(
         domain,
         problem,
         &universe,
         options,
-        start,
+        &abilities,
+        attempt,
         &mut cache,
         &mut budget,
         diagnostics,
         deadline,
+        &mut failed,
         &mut nodes_left,
-    )?
-    else {
+    )?;
+    let Some(done) = done else {
         return Ok(None);
     };
 
@@ -637,18 +785,601 @@ fn frontier_step(tree: &[FrontierTree], slot: usize) -> RefinementStep {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Fingerprint of a frontier node: the state plus the pending tasks and their
+/// ordering.
+///
+/// Two nodes with the same state and the same pending structure have identical
+/// solution potential, so a failed node can be memoised. `None` means the
+/// frontier is too large to fingerprint cheaply and is simply not memoised.
+fn frontier_signature(node: &Frontier) -> Option<u64> {
+    const MAX_MEMO_PENDING: usize = 24;
+    if node.pending.len() > MAX_MEMO_PENDING {
+        return None;
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    // Sort the pending slots by their grounded task so the fingerprint does not
+    // depend on the order in which the slots were created.
+    let mut order: Vec<usize> = node.pending.clone();
+    order.sort_by(|left, right| {
+        let left_task = &node.tree[*left].task;
+        let right_task = &node.tree[*right].task;
+        left_task
+            .name
+            .cmp(&right_task.name)
+            .then(left_task.terms.cmp(&right_task.terms))
+            .then(node.tree[*left].depth.cmp(&node.tree[*right].depth))
+    });
+    let position: HashMap<usize, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| (*slot, index))
+        .collect();
+    let mut edges: Vec<(usize, usize)> = node
+        .edges
+        .iter()
+        .filter_map(|(before, after)| {
+            Some((*position.get(before)?, *position.get(after)?))
+        })
+        .collect();
+    edges.sort_unstable();
+
+    let mut hasher = DefaultHasher::new();
+    node.state.hash(&mut hasher);
+    for slot in &order {
+        node.tree[*slot].task.hash(&mut hasher);
+        node.tree[*slot].depth.hash(&mut hasher);
+    }
+    edges.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// Positive atoms of the problem goal.
+///
+/// Negated and quantified parts are ignored: the result is only a lower bound
+/// on what has to hold at the end, which is all the counting prune needs.
+fn goal_positive_atoms(problem: &Problem) -> BTreeSet<String> {
+    let mut atoms = Vec::new();
+    collect_positive_atoms(problem.goal.as_ref(), &BTreeMap::new(), &mut atoms);
+    atoms.into_iter().collect()
+}
+
+/// `PSPR_REFINE_BUDGET_MS` overrides the refinement time budget, for
+/// measurement only.
+fn refinement_budget_override() -> Option<u64> {
+    static VALUE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("PSPR_REFINE_BUDGET_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    })
+}
+
+/// `PSPR_NO_COUNT` disables the counting prune, for measurement only.
+fn count_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("PSPR_NO_COUNT").is_ok())
+}
+
+/// `PSPR_NO_MEMO` disables the failed-frontier memo, for measurement only.
+fn memo_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("PSPR_NO_MEMO").is_ok())
+}
+
+/// The ordering phase as a classical planning problem.
+///
+/// Least commitment hands the search a *fixed* multiset of actions: every
+/// compound task is decomposed, so the only remaining question is in which
+/// order the actions run. That is a classical planning problem over the same
+/// operators, which is why the refinement search borrows the FF heuristic from
+/// [`crate::solver::fast_downward`] instead of guessing an order depth-first.
+///
+/// The mapping is the obvious one: every ground atom becomes a two-valued
+/// variable (absent/present), an action adds by setting the variable and
+/// deletes by clearing it, and the classical goal is the problem's goal. The
+/// executed-prefix bookkeeping that classical planning does not have — each
+/// action may run at most once — stays in the search state as a bitset.
+struct LinearisationProblem<'a> {
+    compiled: &'a CompiledTask<'a>,
+    /// Pending slot of each operator, in operator order.
+    slots: Vec<usize>,
+    /// Operator positions that must have run before a given position.
+    predecessors: Vec<Vec<usize>>,
+    preconditions: Vec<Vec<usize>>,
+    adds: Vec<Vec<usize>>,
+    deletes: Vec<Vec<usize>>,
+    initial: Vec<usize>,
+    goal: Vec<usize>,
+}
+
+/// Atom values plus the executed subset.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LinearState {
+    values: Vec<usize>,
+    done: Vec<u64>,
+}
+
+fn bit_set(bits: &[u64], index: usize) -> bool {
+    bits[index / 64] & (1u64 << (index % 64)) != 0
+}
+
+fn set_bit(bits: &mut [u64], index: usize) {
+    bits[index / 64] |= 1u64 << (index % 64);
+}
+
+impl LinearisationProblem<'_> {
+    fn is_complete(&self, state: &LinearState) -> bool {
+        self.slots
+            .iter()
+            .enumerate()
+            .all(|(position, _)| bit_set(&state.done, position))
+    }
+
+    fn goal_holds(&self, state: &LinearState) -> bool {
+        self.goal.iter().all(|variable| state.values[*variable] == 1)
+    }
+
+    fn applicable(&self, state: &LinearState, position: usize) -> bool {
+        self.predecessors[position]
+            .iter()
+            .all(|predecessor| bit_set(&state.done, *predecessor))
+            && self.preconditions[position]
+                .iter()
+                .all(|variable| state.values[*variable] == 1)
+    }
+
+    fn apply(&self, state: &LinearState, position: usize) -> LinearState {
+        let mut next = state.clone();
+        for variable in &self.deletes[position] {
+            next.values[*variable] = 0;
+        }
+        for variable in &self.adds[position] {
+            next.values[*variable] = 1;
+        }
+        set_bit(&mut next.done, position);
+        next
+    }
+}
+
+impl SearchProblem for LinearisationProblem<'_> {
+    type State = LinearState;
+
+    fn initial_state(&self) -> LinearState {
+        LinearState {
+            values: self.initial.clone(),
+            done: vec![0; self.slots.len().div_ceil(64)],
+        }
+    }
+
+    fn is_goal(&self, state: &LinearState) -> bool {
+        self.is_complete(state) && self.goal_holds(state)
+    }
+
+    fn successors(&self, state: &LinearState) -> Vec<Action<LinearState>> {
+        let mut out = Vec::new();
+        for position in 0..self.slots.len() {
+            if bit_set(&state.done, position) || !self.applicable(state, position) {
+                continue;
+            }
+            out.push(Action {
+                id: position,
+                state: self.apply(state, position),
+                cost: 1.0,
+            });
+        }
+        out
+    }
+
+    fn evaluate(&self, state: &LinearState) -> Evaluation {
+        let value = ff_heuristic(self.compiled, &state.values);
+        Evaluation {
+            estimates: vec![value.estimate],
+            // Operator ids are operator positions, so the helpful actions map
+            // onto the successors unchanged.
+            preferred: value.preferred,
+        }
+    }
+}
+
+/// Order a committed action set with the FF heuristic.
+///
+/// Returns the slots in execution order together with the state after the last
+/// action, or `None` when no order exists.
+fn linearise(
+    domain: &Domain,
+    problem: &Problem,
+    universe: &Universe<'_>,
+    options: &RefinementOptions,
+    node: &Frontier,
+    nodes_left: usize,
+) -> Result<Option<(Vec<usize>, BTreeSet<String>)>> {
+    let mut slots: Vec<usize> = Vec::new();
+    let mut literals = Vec::new();
+    for slot in &node.pending {
+        let task = &node.tree[*slot].task;
+        let Some(action) = action_literals(
+            domain,
+            task,
+            node.state.as_ref(),
+            universe,
+            options.max_groundings,
+        ) else {
+            return Ok(None);
+        };
+        // Conditional effects make the literals state-dependent, so a single
+        // operator table would be wrong; leave those to the depth-first
+        // linearisation.
+        if action.conditional {
+            return Ok(None);
+        }
+        slots.push(*slot);
+        literals.push(action);
+    }
+    if slots.is_empty() {
+        return Ok(None);
+    }
+
+    // Atom table: everything any operator or the goal mentions.
+    let mut atoms: BTreeSet<&str> = BTreeSet::new();
+    for action in &literals {
+        atoms.extend(action.adds.iter().map(String::as_str));
+        atoms.extend(action.deletes.iter().map(String::as_str));
+        atoms.extend(action.requires.iter().map(String::as_str));
+    }
+    for atom in node.state.iter() {
+        atoms.insert(atom.as_str());
+    }
+    let goal_atoms = goal_positive_atoms(problem);
+    for atom in &goal_atoms {
+        atoms.insert(atom.as_str());
+    }
+    let index: HashMap<&str, usize> = atoms
+        .iter()
+        .enumerate()
+        .map(|(position, atom)| (*atom, position))
+        .collect();
+
+    let variables: Vec<(String, usize, bool)> = atoms
+        .iter()
+        .map(|atom| ((*atom).to_string(), 2, false))
+        .collect();
+    let initial: Vec<usize> = atoms
+        .iter()
+        .map(|atom| usize::from(node.state.contains(*atom)))
+        .collect();
+    let goal: Vec<usize> = goal_atoms
+        .iter()
+        .map(|atom| index[atom.as_str()])
+        .collect();
+
+    let mut operators: Vec<OperatorSpec> = Vec::with_capacity(slots.len());
+    let mut preconditions = Vec::with_capacity(slots.len());
+    let mut adds = Vec::with_capacity(slots.len());
+    let mut deletes = Vec::with_capacity(slots.len());
+    for (position, action) in literals.iter().enumerate() {
+        let requires: Vec<usize> = action
+            .requires
+            .iter()
+            .map(|atom| index[atom.as_str()])
+            .collect();
+        let added: Vec<usize> = action.adds.iter().map(|atom| index[atom.as_str()]).collect();
+        let removed: Vec<usize> = action
+            .deletes
+            .iter()
+            .map(|atom| index[atom.as_str()])
+            .collect();
+        let mut effects: Vec<EffectSpec> = Vec::with_capacity(added.len() + removed.len());
+        for variable in &removed {
+            effects.push((Vec::new(), *variable, 0));
+        }
+        for variable in &added {
+            effects.push((Vec::new(), *variable, 1));
+        }
+        operators.push((
+            format!("op{position}"),
+            requires.iter().map(|variable| (*variable, 1)).collect(),
+            effects,
+            1.0,
+        ));
+        preconditions.push(requires);
+        adds.push(added);
+        deletes.push(removed);
+    }
+
+    // Ordering constraints among the committed actions.
+    let mut predecessors = vec![Vec::new(); slots.len()];
+    for (before, after) in &node.edges {
+        let Some(before) = slots.iter().position(|slot| slot == before) else {
+            continue;
+        };
+        let Some(after) = slots.iter().position(|slot| slot == after) else {
+            continue;
+        };
+        if before != after {
+            predecessors[after].push(before);
+        }
+    }
+
+    let Ok(task) = Task::new(variables, initial.clone(), goal.clone().into_iter()
+        .map(|variable| (variable, 1))
+        .collect(), operators, Vec::new()) else {
+        return Ok(None);
+    };
+    let Ok(compiled) = task.compile() else {
+        return Ok(None);
+    };
+    let linearisation = LinearisationProblem {
+        compiled: &compiled,
+        slots: slots.clone(),
+        predecessors,
+        preconditions,
+        adds,
+        deletes,
+        initial,
+        goal,
+    };
+    let search = SearchOptions {
+        max_expansions: nodes_left.max(1),
+        max_generated: nodes_left.saturating_mul(8).max(64),
+        ..SearchOptions::default()
+    };
+    let Some(outcome) = best_first_search(&linearisation, &search) else {
+        return Ok(None);
+    };
+
+    // Replay the order on the frontier's tree so the refinement records which
+    // action each slot took, and rebuild the final atom set.
+    let mut atoms_out = (*node.state).clone();
+    let mut order = Vec::with_capacity(outcome.plan.len());
+    for position in &outcome.plan {
+        let slot = slots[*position];
+        order.push(slot);
+        for atom in &literals[*position].deletes {
+            atoms_out.remove(atom);
+        }
+        for atom in &literals[*position].adds {
+            atoms_out.insert(atom.clone());
+        }
+    }
+    Ok(Some((order, atoms_out)))
+}
+
+/// Predicates a task's subtree can add or delete, at predicate granularity.
+///
+/// The counting prune needs an over-approximation of what a *not yet
+/// decomposed* compound task may do: a deficit is only prunable when no
+/// remaining compound can supply the atom. Grounding every method instance up
+/// front would be far more expensive than the answer is worth, so the
+/// approximation stays at predicate level and follows the task-name graph.
+#[derive(Default)]
+struct TaskAbilities {
+    may_add: HashMap<String, BTreeSet<String>>,
+    may_delete: HashMap<String, BTreeSet<String>>,
+}
+
+impl TaskAbilities {
+    fn build(domain: &Domain) -> Self {
+        let mut abilities = TaskAbilities::default();
+        for action in &domain.actions {
+            let mut adds = BTreeSet::new();
+            let mut deletes = BTreeSet::new();
+            collect_effect_predicates(action.effects.as_ref(), &mut adds, &mut deletes);
+            abilities
+                .may_add
+                .entry(action.name.clone())
+                .or_default()
+                .extend(adds);
+            abilities
+                .may_delete
+                .entry(action.name.clone())
+                .or_default()
+                .extend(deletes);
+        }
+        // Fixpoint over the method graph: a compound task may do whatever its
+        // subtasks may do.
+        loop {
+            let mut changed = false;
+            for method in &domain.methods {
+                let task = method.task.name.clone();
+                let mut adds = BTreeSet::new();
+                let mut deletes = BTreeSet::new();
+                for subtask in &method.tn.subtasks {
+                    if let Some(inherited) = abilities.may_add.get(&subtask.task.name) {
+                        adds.extend(inherited.iter().cloned());
+                    }
+                    if let Some(inherited) = abilities.may_delete.get(&subtask.task.name) {
+                        deletes.extend(inherited.iter().cloned());
+                    }
+                }
+                let entry = abilities.may_add.entry(task.clone()).or_default();
+                for predicate in adds {
+                    changed |= entry.insert(predicate);
+                }
+                let entry = abilities.may_delete.entry(task).or_default();
+                for predicate in deletes {
+                    changed |= entry.insert(predicate);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        abilities
+    }
+
+    fn can_add(&self, task: &str, predicate: &str) -> bool {
+        self.may_add
+            .get(task)
+            .is_some_and(|predicates| predicates.contains(predicate))
+    }
+}
+
+/// Predicate names an effect formula can add and delete, ignoring bindings.
+///
+/// `imply`-guarded effects are counted on both sides: the guard decides whether
+/// the effect fires, and over-approximating is the sound direction here.
+fn collect_effect_predicates(
+    formula: Option<&Formula>,
+    adds: &mut BTreeSet<String>,
+    deletes: &mut BTreeSet<String>,
+) {
+    let Some(formula) = formula else {
+        return;
+    };
+    match formula {
+        Formula::Atom(predicate) => {
+            adds.insert(predicate.name.clone());
+        }
+        Formula::Not(inner) => match inner.as_ref() {
+            Formula::Atom(predicate) => {
+                deletes.insert(predicate.name.clone());
+            }
+            Formula::Not(inner) => collect_effect_predicates(Some(inner), adds, deletes),
+            other => collect_effect_predicates(Some(other), adds, deletes),
+        },
+        Formula::And(items) => {
+            for item in items {
+                collect_effect_predicates(Some(item), adds, deletes);
+            }
+        }
+        Formula::Imply(_, effect) => collect_effect_predicates(Some(effect), adds, deletes),
+        Formula::ForAll(_, body) => collect_effect_predicates(Some(body), adds, deletes),
+        _ => {}
+    }
+}
+
+/// The predicate of a ground atom key (`pred` or `pred(a, b)`).
+fn atom_predicate(atom: &str) -> &str {
+    match atom.find('(') {
+        Some(position) => &atom[..position],
+        None => atom,
+    }
+}
+
+/// Producer/consumer count over the pending primitive actions.
+///
+/// For every atom, a pending action that deletes it consumes one unit and a
+/// pending action that adds it supplies one; the current state supplies one
+/// more. A plan executes each deletion at a moment where the atom is true, so
+/// `deletions > additions + initial` cannot be repaired by any ordering and the
+/// node is infeasible.
+///
+/// Goal atoms are counted more strictly, because the goal has to hold *after*
+/// the last action: an atom that is true now must not be deleted more often
+/// than it is added, and an atom that is false now must be added at least once
+/// and left alone by the final action. This is the rule that decides
+/// alternating domains — PCP's `turnA` starts true and is deleted by every `G1`
+/// action and re-added by every `G2` action, so the bound `#G1 <= #G2` and its
+/// mirror image for `turnB` together force `#G1 == #G2`, which is exactly what
+/// pandaPI's 26-action plan satisfies and the 7-action one does not.
+///
+/// Actions with conditional effects are skipped: their adds and deletes depend
+/// on the state they run in, so counting them would prune sound solutions.
+///
+/// Returns `true` when the node is pruned.
+#[allow(clippy::too_many_arguments)]
+fn counting_prune(
+    domain: &Domain,
+    problem: &Problem,
+    universe: &Universe<'_>,
+    options: &RefinementOptions,
+    abilities: &TaskAbilities,
+    cache: &mut MethodApplicabilityCache,
+    node: &Frontier,
+    diagnostics: &mut RefinementDiagnostics,
+) -> bool {
+    let goal = goal_positive_atoms(problem);
+    let mut additions: HashMap<String, i64> = HashMap::new();
+    let mut deletions: HashMap<String, i64> = HashMap::new();
+    // Compound tasks still pending: their effects are not committed, but their
+    // predicate-level abilities bound what a deficit can be repaired with.
+    let mut open_tasks: Vec<&str> = Vec::new();
+    for slot in &node.pending {
+        let task = &node.tree[*slot].task;
+        if domain.methods_for(&task.name).next().is_some() {
+            open_tasks.push(task.name.as_str());
+            continue;
+        }
+        let conditional = match cache.literals(
+            domain,
+            universe,
+            task,
+            &node.state,
+            options.max_groundings,
+        ) {
+            Some(literals) => literals.conditional,
+            None => continue,
+        };
+        if conditional {
+            continue;
+        }
+        // Clone out of the cache so the borrow ends before the next lookup.
+        let (adds, deletes) = {
+            let literals = cache
+                .literals(domain, universe, task, &node.state, options.max_groundings)
+                .expect("the literal was derived above");
+            (literals.adds.clone(), literals.deletes.clone())
+        };
+        for atom in adds {
+            *additions.entry(atom).or_default() += 1;
+        }
+        for atom in deletes {
+            *deletions.entry(atom).or_default() += 1;
+        }
+    }
+    let repairable = |atom: &str| {
+        open_tasks
+            .iter()
+            .any(|task| abilities.can_add(task, atom_predicate(atom)))
+    };
+    let mut violated = false;
+    for atom in additions.keys().chain(deletions.keys()) {
+        let adds = additions.get(atom).copied().unwrap_or(0);
+        let deletes = deletions.get(atom).copied().unwrap_or(0);
+        if deletes == 0 {
+            continue;
+        }
+        let initially = i64::from(node.state.contains(atom));
+        let feasible = if goal.contains(atom) {
+            if initially == 1 {
+                // The last event on the atom has to be an addition.
+                deletes <= adds
+            } else {
+                // The last event has to be an addition, and the atom is not
+                // true yet, so there must be at least one.
+                adds >= 1 && deletes < adds
+            }
+        } else {
+            deletes <= adds + initially
+        };
+        if !feasible && !repairable(atom) {
+            violated = true;
+            break;
+        }
+    }
+    if violated {
+        diagnostics.counting_pruned += 1;
+    }
+    violated
+}
+
+#[allow(clippy::too_many_arguments)]
 fn interleaved_search(
     domain: &Domain,
     problem: &Problem,
     universe: &Universe<'_>,
     options: &RefinementOptions,
+    abilities: &TaskAbilities,
     node: Frontier,
     cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     diagnostics: &mut RefinementDiagnostics,
     deadline: Instant,
+    failed: &mut HashSet<u64>,
     nodes_left: &mut usize,
 ) -> Result<Option<Frontier>> {
+    diagnostics.nodes_visited += 1;
     if *nodes_left == 0 || Instant::now() >= deadline {
         diagnostics.budget_expansions_exhausted += 1;
         return Ok(None);
@@ -659,35 +1390,117 @@ fn interleaved_search(
         return Ok(None);
     }
     if node.pending.is_empty() {
-        return Ok(Some(node));
+        // A complete task network is not automatically a solution: PCP's
+        // shortest decomposition leaves `turnB` while the goal asks for
+        // `turnA`. Keep searching until a complete frontier also satisfies the
+        // classical goal, or accept the first one when the problem has none.
+        if problem.goal.is_none()
+            || goal_status(problem, universe, node.state.as_ref(), options.max_groundings)?
+                != GoalStatus::Violated
+        {
+            return Ok(Some(node));
+        }
+        return Ok(None);
     }
+
+    // Alternating domains revisit the same state with the same remaining tasks
+    // many times; remembering failed configurations collapses that search.
+    let signature = frontier_signature(&node);
+    if let Some(signature) = signature
+        && failed.contains(&signature)
+        && !memo_disabled()
+    {
+        diagnostics.cycle_pruned += 1;
+        return Ok(None);
+    }
+    let budget_before = diagnostics.budget_expansions_exhausted
+        + diagnostics.budget_time_exhausted
+        + *nodes_left as u64;
+    // Progression search with decompose-on-demand.
+    //
+    // Execution and decomposition are interleaved, and execution comes first.
+    // That order is what makes alternating domains tractable: a wrong method
+    // choice is punished by the state within a few steps instead of only after
+    // the whole network is decomposed, and in PCP the state itself forces the
+    // order — after a `G1` action consumes `turnA` only a `G2` action is
+    // applicable, so the interleaving pandaPI's plan uses is the one the state
+    // allows.
+    //
+    // A compound task is only decomposed once its predecessors have executed
+    // (`is_ready`): decomposing it earlier cannot expose an applicable action,
+    // so deferring it loses nothing and keeps the branching small.
     let ready: Vec<usize> = node
         .pending
         .iter()
         .copied()
         .filter(|slot| node.is_ready(*slot))
         .collect();
+    // The producer/consumer count runs at *every* node, not just at complete
+    // decompositions: a deficit that no pending compound task can repair makes
+    // the node infeasible immediately, which is what keeps the search from
+    // enumerating the full (method choice)^depth space of alternating domains.
+    if !count_disabled()
+        && counting_prune(
+            domain,
+            problem,
+            universe,
+            options,
+            abilities,
+            cache,
+            &node,
+            diagnostics,
+        )
+    {
+        return Ok(None);
+    }
     if ready.is_empty() {
         diagnostics.partial_ready_empty += 1;
         return Ok(None);
     }
+    let (action_slots, compound_slots): (Vec<usize>, Vec<usize>) = ready.into_iter().partition(|slot| {
+        domain.actions_for(&node.tree[*slot].task.name).next().is_some()
+            && domain.methods_for(&node.tree[*slot].task.name).next().is_none()
+    });
 
-    // Execute first, decompose second. A ready task that is already a
-    // primitive action in an applicable state commits the search to that
-    // action instead of also branching into method decompositions, which keeps
-    // the branching factor of alternating domains like PCP manageable. Only
-    // when no ready action can execute does the search decompose compounds.
-    let (action_slots, compound_slots): (Vec<usize>, Vec<usize>) = ready
-        .into_iter()
-        .partition(|slot| domain.actions_for(&node.tree[*slot].task.name).next().is_some());
+    // Every pending task is primitive, so the action set is committed and only
+    // its order is open. That is a classical planning problem, which the FF
+    // heuristic solves far better than the depth-first fallback: a DFS commits
+    // to whichever action is applicable, and in alternating domains that is the
+    // wrong one — after `t1G1` consumes `turnA` the next G1 action is blocked
+    // and only a G2 action can hand the turn back.
+    let committed = node
+        .pending
+        .iter()
+        .all(|slot| domain.methods_for(&node.tree[*slot].task.name).next().is_none());
+    if committed && !action_slots.is_empty() {
+        diagnostics.complete_frontiers += 1;
+        if let Some((order, state)) = linearise(domain, problem, universe, options, &node, *nodes_left)?
+        {
+            let mut complete = node.clone();
+            complete.state = Arc::new(state);
+            for slot in order {
+                let step = complete.tree[slot].task.to_string();
+                complete.tree[slot].action = Some(step);
+            }
+            complete.pending.clear();
+            if problem.goal.is_none()
+                || goal_status(problem, universe, complete.state.as_ref(), options.max_groundings)?
+                    != GoalStatus::Violated
+            {
+                return Ok(Some(complete));
+            }
+            return Ok(None);
+        }
+    }
 
-    for pass in 0..2 {
-        let slots = if pass == 0 {
-            &action_slots
-        } else {
-            &compound_slots
-        };
-        let mut produced = false;
+    // Execute first, then decompose. Both passes must run: committing to an
+    // applicable action alone rejects every plan whose next step is a
+    // decomposition, which is exactly the shape of PCP's solution.
+    let mut produced = false;
+    for (slots, mode) in [
+        (&action_slots, ExpansionMode::Execute),
+        (&compound_slots, ExpansionMode::Decompose),
+    ] {
         for slot in slots.iter().copied() {
             let expansions = interleaved_expansions(
                 domain,
@@ -695,6 +1508,7 @@ fn interleaved_search(
                 options,
                 &node,
                 slot,
+                mode,
                 cache,
                 budget,
                 diagnostics,
@@ -708,11 +1522,13 @@ fn interleaved_search(
                     problem,
                     universe,
                     options,
+                    abilities,
                     next,
                     cache,
                     budget,
                     diagnostics,
                     deadline,
+                    failed,
                     nodes_left,
                 )? {
                     return Ok(Some(done));
@@ -722,11 +1538,61 @@ fn interleaved_search(
                 }
             }
         }
-        if produced {
-            return Ok(None);
+    }
+    if !produced && !action_slots.is_empty() && compound_slots.is_empty() {
+        // The committed action set could not be linearised: no ready action was
+        // applicable in the current state. Record what was missing so the
+        // failure is attributable to a decomposition choice.
+        diagnostics.linearisation_failed += 1;
+        if diagnostics.dead_end_samples.len() < DEAD_END_SAMPLE_LIMIT
+            && let Some(slot) = action_slots.first()
+        {
+            let task = &node.tree[*slot].task;
+            *diagnostics
+                .no_applicable_tasks
+                .entry(task.to_string())
+                .or_default() += 1;
+            for sample in unmet_action_preconditions(
+                domain,
+                task,
+                node.state.as_ref(),
+                universe,
+                options.max_groundings,
+            ) {
+                if diagnostics.dead_end_samples.len() >= DEAD_END_SAMPLE_LIMIT {
+                    break;
+                }
+                let entry = format!("{task}: {sample}");
+                if !diagnostics.dead_end_samples.contains(&entry) {
+                    diagnostics.dead_end_samples.push(entry);
+                }
+            }
+        }
+    }
+    // Only memoise an exhausted subtree: a node that ran out of budget may
+    // still be solvable with more search, so recording it as failed would be
+    // premature.
+    if let Some(signature) = signature {
+        let budget_after = diagnostics.budget_expansions_exhausted
+            + diagnostics.budget_time_exhausted
+            + *nodes_left as u64;
+        if budget_after == budget_before && !memo_disabled() {
+            failed.insert(signature);
         }
     }
     Ok(None)
+}
+
+/// Which kind of step an expansion may take.
+///
+/// Least-commitment search decomposes every compound task before it executes
+/// anything, so the two kinds never mix inside one node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpansionMode {
+    /// Replace a compound task by a method instance; the state is untouched.
+    Decompose,
+    /// Execute one primitive action.
+    Execute,
 }
 
 /// Every way `slot` can be advanced by one decomposition or action step.
@@ -737,6 +1603,7 @@ fn interleaved_expansions(
     options: &RefinementOptions,
     node: &Frontier,
     slot: usize,
+    mode: ExpansionMode,
     cache: &mut MethodApplicabilityCache,
     budget: &mut RefinementBudget,
     diagnostics: &mut RefinementDiagnostics,
@@ -744,16 +1611,13 @@ fn interleaved_expansions(
     let task = node.tree[slot].task.clone();
     let depth = node.tree[slot].depth;
     let mut expansions = Vec::new();
-    if depth == 0 {
-        diagnostics.depth_exhausted += 1;
-        return Ok(expansions);
-    }
     if !budget.consume() {
         diagnostics.budget_expansions_exhausted += 1;
         return Ok(expansions);
     }
 
-    if domain.actions_for(&task.name).next().is_some()
+    if mode == ExpansionMode::Execute
+        && domain.actions_for(&task.name).next().is_some()
         && let Ok(next) = apply_action(
             domain,
             &task,
@@ -767,6 +1631,10 @@ fn interleaved_expansions(
         expanded.pending.retain(|pending| *pending != slot);
         expanded.tree[slot].action = Some(task.to_string());
         expansions.push(expanded);
+    }
+
+    if mode == ExpansionMode::Execute {
+        return Ok(expansions);
     }
 
     let (instances, applicable) =
@@ -787,8 +1655,16 @@ fn interleaved_expansions(
     // Prefer decompositions whose first subtask can execute right now: in
     // alternating domains such as PCP the state only unlocks one family at a
     // time, so leading with an executable subtask keeps the depth-first search
-    // on the productive branch. Shorter decompositions break ties, which keeps
-    // the search from descending into a recursive variant before its base case.
+    // on the productive branch.
+    //
+    // Among those, prefer the recursive method over the base case when the
+    // recursion still has budget. PCP's solution nests each `SG` task seven
+    // levels deep, so exploring the base case of every task first means the
+    // search enumerates shallow dead ends before it ever considers the depth the
+    // goal needs — and the counting prune only becomes decisive once the shallow
+    // decomposition is complete. Once the depth budget is nearly spent the
+    // order flips back, so the base case is still reached.
+    let prefer_recursion = depth > 1;
     let mut ordered: Vec<(bool, usize, u32)> = applicable
         .iter()
         .map(|index| {
@@ -804,7 +1680,12 @@ fn interleaved_expansions(
                     )
                     .is_ok()
             });
-            (!lead_ready, instance.subtasks, *index)
+            let recursion_rank = if prefer_recursion {
+                usize::MAX - instance.subtasks
+            } else {
+                instance.subtasks
+            };
+            (!lead_ready, recursion_rank, *index)
         })
         .collect();
     ordered.sort_unstable();
@@ -812,6 +1693,13 @@ fn interleaved_expansions(
         let instance = &instances[*index as usize];
         if !constraints_hold(instance.network.constraints.as_deref(), &instance.bindings) {
             diagnostics.network_constraint_rejected += 1;
+            continue;
+        }
+        // The depth budget bounds decomposition nesting only: a primitive
+        // action needs no allowance of its own, and charging it one made the
+        // search spend most of its nodes on actions it then refused to run.
+        if depth == 0 {
+            diagnostics.depth_exhausted += 1;
             continue;
         }
         let mut expanded = node.clone();
@@ -855,6 +1743,39 @@ fn interleaved_expansions(
                 }
             }
         }
+        // Splice the children into the ordering the decomposed task occupied.
+        // Without this the constraints `(pred < slot)` and `(slot < succ)` would
+        // vanish with the slot, and the linearisation phase would be free to
+        // schedule the method's actions outside the window its parent allowed.
+        let predecessors: Vec<usize> = expanded
+            .edges
+            .iter()
+            .filter(|(before, after)| *after == slot && expanded.pending.contains(before))
+            .map(|(before, _)| *before)
+            .collect();
+        let successors: Vec<usize> = expanded
+            .edges
+            .iter()
+            .filter(|(before, after)| *before == slot && expanded.pending.contains(after))
+            .map(|(_, after)| *after)
+            .collect();
+        for child in children.iter().copied() {
+            for predecessor in predecessors.iter().copied() {
+                expanded.edges.push((predecessor, child));
+            }
+            for successor in successors.iter().copied() {
+                expanded.edges.push((child, successor));
+            }
+        }
+        // Drop edges whose endpoints are no longer pending. They carry no
+        // information — readiness only looks at pending predecessors — and
+        // without collecting them the edge list grows quadratically over a
+        // plan, which dominated the per-node cost of the search.
+        expanded
+            .edges
+            .retain(|(before, after)| expanded.pending.contains(before) && expanded.pending.contains(after));
+        expanded.edges.sort_unstable();
+        expanded.edges.dedup();
         expansions.push(expanded);
     }
     Ok(expansions)
@@ -866,6 +1787,12 @@ fn interleaved_expansions(
 // tasks with several interchangeable `do_on_table` methods) and still keeps
 // the search finite on the harder learned domains.
 const MAX_REFINEMENTS: usize = 16384;
+/// Default candidate-prefix bound between two abstract steps.
+///
+/// 128 is above the widest frontier observed on the IPC corpus outside
+/// Blocksworld-GTOHP p05 (p04 peaks at exactly 128 and is not truncated). p05
+/// reaches 2048 distinct states per step, which is where the bound pays off.
+const DEFAULT_MAX_FRONTIER: usize = 128;
 /// Upper bound on the retained dead-end samples in [`RefinementDiagnostics`].
 const DEAD_END_SAMPLE_LIMIT: usize = 8;
 const REFINEMENT_METHOD_SAMPLING_FACTOR: usize = 4;
@@ -881,6 +1808,7 @@ fn refined_retry_options(base: &RefinementOptions, attempt: usize) -> Refinement
         max_groundings: base.max_groundings.saturating_mul(scale),
         max_depth: base.max_depth.saturating_add(8 * attempt),
         cycle_pruning: base.cycle_pruning,
+        max_frontier: base.max_frontier,
     }
 }
 
@@ -914,8 +1842,28 @@ impl RefinementBudget {
         }
     }
 
+    /// Override the time budget, for measurement only.
+    fn with_millis(mut self, milliseconds: Option<u64>) -> Self {
+        if let Some(milliseconds) = milliseconds {
+            self.deadline = Instant::now() + Duration::from_millis(milliseconds);
+        }
+        self
+    }
+
     fn has_time(&self) -> bool {
         Instant::now() < self.deadline
+    }
+
+    /// Widen the expansion count.
+    ///
+    /// The sequential step loop charges one expansion per task expansion. The
+    /// interleaved frontier search additionally probes every ready slot of
+    /// every node, so the same count runs out on failed attempts and would make
+    /// the search report dead ends that are not dead. It is bounded by its own
+    /// node limit and deadline instead.
+    fn with_expansions(mut self, expansions: usize) -> Self {
+        self.expansions_left = expansions;
+        self
     }
 
     fn consume(&mut self) -> bool {
@@ -1267,9 +2215,88 @@ fn refine_plan_steps(
             diagnostics.abstract_step_failed += 1;
             return Ok(Vec::new());
         }
+        diagnostics.peak_candidates = diagnostics.peak_candidates.max(step_candidates.len());
+        diagnostics.expanded_candidates += step_candidates.len() as u64;
+        if options.max_frontier > 0 && step_candidates.len() > options.max_frontier {
+            if problem.goal.is_some() {
+                step_candidates = keep_most_progress(
+                    problem,
+                    universe,
+                    options.max_groundings,
+                    step_candidates,
+                    options.max_frontier,
+                );
+                diagnostics.frontier_truncated += 1;
+            } else {
+                step_candidates.truncate(options.max_frontier);
+                diagnostics.frontier_truncated += 1;
+            }
+        }
         candidates = step_candidates;
     }
     Ok(candidates)
+}
+
+/// Number of top-level goal conjuncts that already hold in `state`.
+///
+/// Refinement uses this as a beam score. A non-conjunctive goal counts as one
+/// conjunct, which still separates states that satisfy it from states that do
+/// not.
+fn goal_progress(
+    problem: &Problem,
+    universe: &Universe<'_>,
+    state: &BTreeSet<String>,
+    budget: usize,
+) -> usize {
+    let Some(goal) = &problem.goal else {
+        return 0;
+    };
+    let empty = BTreeMap::new();
+    match goal {
+        Formula::And(items) => items
+            .iter()
+            .filter(|item| matches!(holds(item, &empty, state, universe, budget), Ok(true)))
+            .count(),
+        other => usize::from(matches!(
+            holds(other, &empty, state, universe, budget),
+            Ok(true)
+        )),
+    }
+}
+
+/// Keep the `limit` candidates that satisfy the most goal conjuncts.
+///
+/// Ties keep the original order, so the beam stays deterministic and earlier
+/// prefixes win when two states make the same progress.
+fn keep_most_progress(
+    problem: &Problem,
+    universe: &Universe<'_>,
+    budget: usize,
+    candidates: Vec<RefinedTask>,
+    limit: usize,
+) -> Vec<RefinedTask> {
+    let mut scored: Vec<(usize, usize)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            (
+                goal_progress(problem, universe, candidate.state.as_ref(), budget),
+                index,
+            )
+        })
+        .collect();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    let keep: HashSet<usize> = scored
+        .iter()
+        .take(limit)
+        .map(|(_, index)| *index)
+        .collect();
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| keep.contains(index))
+        .map(|(_, candidate)| candidate)
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1351,6 +2378,7 @@ fn refine_task_uncached(
         diagnostics.budget_expansions_exhausted += 1;
         return Ok(Vec::new());
     }
+    diagnostics.expansions += 1;
 
     // A task that names an action is tried as a primitive first. Some HDDL
     // domains use the same symbol for a task and an action; the method branch
@@ -1563,6 +2591,39 @@ fn refine_network(
     if !constraints_hold(instance.network.constraints.as_deref(), &instance.bindings) {
         diagnostics.network_constraint_rejected += 1;
         return Ok(Vec::new());
+    }
+
+    // In a totally ordered network the leading primitive subtasks execute
+    // consecutively, starting in the current state. If any of them is not
+    // applicable, no refinement of this instance can succeed, so prune it
+    // before recursing. Domains bind free method parameters only there:
+    // Blocksworld-GTOHP's `m2_do_on_table` has a free `?y` used by
+    // `(unstack ?x ?y)`, and Freecell's `DO-*` methods carry `?NUM`/`?CARD`
+    // parameters that only the executory `SENDTO*`/`MOVE*` action decides.
+    if matches!(instance.network.orderings, TaskOrdering::Total) {
+        let mut current = Arc::clone(state);
+        for subtask in instance.tasks.iter() {
+            if domain.actions_for(&subtask.name).next().is_none()
+                || domain.methods_for(&subtask.name).next().is_some()
+            {
+                // A compound subtask decides the rest of the chain, so stop
+                // here: what follows depends on how it is refined.
+                break;
+            }
+            match apply_action(
+                domain,
+                subtask,
+                current.as_ref(),
+                universe,
+                options.max_groundings,
+            ) {
+                Ok(next) => current = Arc::new(next),
+                Err(_) => {
+                    diagnostics.primitive_prefix_pruned += 1;
+                    return Ok(Vec::new());
+                }
+            }
+        }
     }
 
     match &instance.network.orderings {

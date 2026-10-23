@@ -641,6 +641,118 @@ fn holds_into(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Ground literals of one primitive action, used by refinement's causal
+/// counting.
+///
+/// `requires` holds the positive precondition atoms; conditional effects are
+/// evaluated against `state`, so an atom that is only conditionally added is
+/// counted only when that condition holds right now.
+pub(super) struct ActionLiterals {
+    pub(super) adds: Vec<String>,
+    pub(super) deletes: Vec<String>,
+    pub(super) requires: Vec<String>,
+    /// The effect tree contains an `imply`, so the adds and deletes depend on
+    /// the state the action runs in and cannot be counted ahead of time.
+    pub(super) conditional: bool,
+}
+
+/// Whether any leaf of the effect tree is guarded by a condition.
+fn has_conditional_effect(formula: Option<&Formula>) -> bool {
+    let Some(formula) = formula else {
+        return false;
+    };
+    match formula {
+        Formula::Imply(_, _) => true,
+        Formula::And(items) => items.iter().any(|item| has_conditional_effect(Some(item))),
+        Formula::Not(inner) => has_conditional_effect(Some(inner)),
+        Formula::ForAll(_, body) => has_conditional_effect(Some(body)),
+        _ => false,
+    }
+}
+
+/// Collect the positive atoms of a precondition conjunction with `bindings`
+/// substituted.
+pub(super) fn collect_positive_atoms(
+    formula: Option<&Formula>,
+    bindings: &BTreeMap<String, String>,
+    out: &mut Vec<String>,
+) {
+    let Some(formula) = formula else {
+        return;
+    };
+    match formula {
+        Formula::And(items) => {
+            for item in items {
+                collect_positive_atoms(Some(item), bindings, out);
+            }
+        }
+        Formula::Atom(predicate) => {
+            let mut key = String::new();
+            atom_key_into(predicate, bindings, &mut key);
+            out.push(key);
+        }
+        _ => {}
+    }
+}
+
+/// Literals of the first action schema compatible with `task`.
+///
+/// Unlike [`apply_action`] this does not require the action to be applicable:
+/// refinement's counting runs before the linearisation is known, when the
+/// precondition may not hold yet.
+pub(super) fn action_literals(
+    domain: &Domain,
+    task: &TaskNode,
+    state: &BTreeSet<String>,
+    universe: &Universe<'_>,
+    budget: usize,
+) -> Option<ActionLiterals> {
+    for action in domain.actions_for(&task.name) {
+        if action.parameters.len() != task.terms.len() {
+            continue;
+        }
+        if !action
+            .parameters
+            .iter()
+            .zip(&task.terms)
+            .all(|(parameter, term)| universe.compatible(parameter, term))
+        {
+            continue;
+        }
+        let bindings = bindings_from(&action.parameters, &task.terms);
+        let mut adds = BTreeSet::new();
+        let mut deletes = BTreeSet::new();
+        let mut scratch = String::new();
+        if collect_effects(
+            action.effects.as_ref(),
+            &bindings,
+            state,
+            universe,
+            budget,
+            &mut adds,
+            &mut deletes,
+            &mut scratch,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let mut requires = Vec::new();
+        collect_positive_atoms(action.preconditions.as_ref(), &bindings, &mut requires);
+        // Delete-before-add semantics: an atom that the same action both adds
+        // and removes is left true, so the deletion never constrains the
+        // count.
+        deletes.retain(|atom| !adds.contains(atom));
+        return Some(ActionLiterals {
+            adds: adds.into_iter().collect(),
+            deletes: deletes.into_iter().collect(),
+            requires,
+            conditional: has_conditional_effect(action.effects.as_ref()),
+        });
+    }
+    None
+}
+
 fn collect_effects(
     formula: Option<&Formula>,
     bindings: &BTreeMap<String, String>,

@@ -60,16 +60,23 @@ fn run_mode(
         ),
         Err(error) => println!("{label}: failed in {:?}: {error}", start.elapsed()),
     }
+    println!("  counting_pruned={} complete={}", diagnostics.counting_pruned, diagnostics.complete_frontiers);
     println!(
-        "  stats: time_budget={} expansion_budget={} depth={} cycle={} no_applicable={} constraint_reject={} ready_empty={} abstract_step_failed={}",
+        "  stats: time_budget={} expansion_budget={} expansions={} depth={} cycle={} no_applicable={} constraint_reject={} prefix_pruned={} ready_empty={} abstract_step_failed={}",
         diagnostics.budget_time_exhausted,
         diagnostics.budget_expansions_exhausted,
+        diagnostics.expansions,
         diagnostics.depth_exhausted,
         diagnostics.cycle_pruned,
         diagnostics.no_applicable_method,
         diagnostics.network_constraint_rejected,
+        diagnostics.primitive_prefix_pruned,
         diagnostics.partial_ready_empty,
         diagnostics.abstract_step_failed,
+    );
+    println!(
+        "  frontier: peak={} expanded={}",
+        diagnostics.peak_candidates, diagnostics.expanded_candidates
     );
     let mut dead_ends: Vec<(&String, &u64)> = diagnostics.no_applicable_tasks.iter().collect();
     dead_ends.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
@@ -162,7 +169,7 @@ fn main() {
             Err(error) => println!("interleaved: error in {:?}: {error:#}", start.elapsed()),
         }
         println!(
-            "  interleaved stats: time_budget={} expansion_budget={} depth={} cycle={} no_applicable={} constraint_reject={} ready_empty={}",
+            "  interleaved stats: time_budget={} expansion_budget={} depth={} cycle={} no_applicable={} constraint_reject={} ready_empty={} complete={} counting_pruned={} linearisation_failed={} nodes={}",
             diagnostics.budget_time_exhausted,
             diagnostics.budget_expansions_exhausted,
             diagnostics.depth_exhausted,
@@ -170,6 +177,10 @@ fn main() {
             diagnostics.no_applicable_method,
             diagnostics.network_constraint_rejected,
             diagnostics.partial_ready_empty,
+            diagnostics.complete_frontiers,
+            diagnostics.counting_pruned,
+            diagnostics.linearisation_failed,
+            diagnostics.nodes_visited,
         );
         let mut dead_ends: Vec<(&String, &u64)> = diagnostics.no_applicable_tasks.iter().collect();
         dead_ends.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
@@ -180,6 +191,9 @@ fn main() {
             .collect();
         if !summary.is_empty() {
             println!("  interleaved dead-end tasks: {}", summary.join(" "));
+        }
+        for sample in diagnostics.dead_end_samples.iter() {
+            println!("  interleaved dead-end sample: {sample}");
         }
     }
     run_mode(
