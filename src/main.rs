@@ -51,6 +51,11 @@ struct Options {
     #[arg(long)]
     liftability: bool,
 
+    /// Insert the implicit top-level orderings that repair liftability gaps
+    /// into the task network before planning
+    #[arg(long)]
+    repair_orderings: bool,
+
     /// Maximum number of task and method groundings
     #[arg(long, default_value_t = 256, value_name = "N")]
     max_groundings: usize,
@@ -184,6 +189,7 @@ fn handle_problem(
             MethodSummary::Off
         },
         max_groundings: options.max_groundings,
+        implicit_orderings: options.repair_orderings,
         ..EvaluationOptions::default()
     };
     let refinement_options = pspr::solver::evaluation_tree::RefinementOptions {

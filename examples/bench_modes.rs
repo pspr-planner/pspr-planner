@@ -113,6 +113,7 @@ fn main() {
             MethodSummary::Off
         },
         max_groundings,
+        implicit_orderings: true,
         ..EvaluationOptions::default()
     };
     let refinement_options = RefinementOptions {

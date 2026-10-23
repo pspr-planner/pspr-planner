@@ -52,7 +52,9 @@ use crate::solver::domain::Domain;
 use crate::solver::problem::Problem;
 
 use super::formula::{self, Universe};
-use super::graph::{Atom, TaskNode, bindings_from, ground_methods, ground_task_network_edges};
+use super::graph::{
+    Atom, TaskNode, bindings_from, ground_methods_bounded, ground_task_network_edges,
+};
 use super::leaf::initial_atoms;
 
 /// A ground literal: an atom together with its required polarity.
@@ -245,24 +247,176 @@ pub fn detect_liftability_gaps(
     problem: &Problem,
     options: &LiftabilityOptions,
 ) -> Result<LiftabilityReport> {
-    let (tasks, edges) = ground_task_network_edges(domain, problem, options.max_groundings)?;
-    let closure = transitive_closure(tasks.len(), &edges);
-    let initial = initial_atoms(problem);
+    let grounded = ground_task_network_edges(domain, problem, options.max_groundings)?;
+    let analysis = analyse(
+        domain,
+        problem,
+        &grounded.tasks,
+        &grounded.edges,
+        options,
+        PairScope::Ordered,
+    )?;
+    let orderings = analysis
+        .closure
+        .iter()
+        .enumerate()
+        .flat_map(|(before, after)| after.iter().map(move |&after| (before, after)))
+        .collect();
+    Ok(LiftabilityReport {
+        tasks: grounded.tasks,
+        orderings,
+        gaps: analysis.gaps,
+        truncated: analysis.truncated,
+        expanded: analysis.expanded,
+    })
+}
 
-    // Without an ordered pair there can be no gap, regardless of how the
+/// The implicit top-level orderings that [`implicit_orderings`] would add for
+/// this problem, computed from a fresh grounding.
+pub fn repair_orderings(
+    domain: &Domain,
+    problem: &Problem,
+    options: &LiftabilityOptions,
+) -> Result<Vec<(usize, usize)>> {
+    let grounded = ground_task_network_edges(domain, problem, options.max_groundings)?;
+    implicit_orderings(
+        domain,
+        problem,
+        &grounded.tasks,
+        &grounded.edges,
+        &grounded.groundings,
+        options,
+    )
+}
+
+/// Implicit top-level orderings that repair the detected gaps.
+///
+/// The analysis inspects the pairs that the network leaves unordered in both
+/// directions: they are the ones whose interleaving the abstract plan can get
+/// wrong. A hidden satisfier makes `t1` the producer of a literal that `t2`
+/// cannot do without, so `t1` must be executed (and refined) first; a hidden
+/// falsifier is the mirror image, so `t2` must come first. Both rules only
+/// apply when the literal is unavoidable in the consumer
+/// ([`LiftabilityGap::required_everywhere`]) and neither the initial state nor
+/// another primitive top-level task supplies it. Candidates that would close a
+/// cycle are dropped.
+pub(super) fn implicit_orderings(
+    domain: &Domain,
+    problem: &Problem,
+    tasks: &[TaskNode],
+    edges: &[(usize, usize)],
+    groundings: &[(usize, usize)],
+    options: &LiftabilityOptions,
+) -> Result<Vec<(usize, usize)>> {
+    let analysis = analyse(domain, problem, tasks, edges, options, PairScope::Unordered)?;
+    let mut candidates: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for gap in &analysis.gaps {
+        if !gap.required_everywhere || gap.visible_producer || gap.before == gap.after {
+            continue;
+        }
+        // Groundings are independent instantiations of the same network; an
+        // ordering across them would be meaningless.
+        if !same_grounding(groundings, gap.before, gap.after) {
+            continue;
+        }
+        let pair = match gap.kind {
+            // The producer makes the consumer's literal true; refine it first.
+            GapKind::HiddenSatisfier if !gap.literal_initially_true => (gap.before, gap.after),
+            // The producer makes the consumer's literal false; refine the
+            // consumer first while the literal still holds.
+            GapKind::HiddenFalsifier if gap.literal_initially_true => (gap.after, gap.before),
+            _ => continue,
+        };
+        candidates.insert(pair);
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut closure = analysis.closure;
+    if (0..tasks.len()).any(|node| closure[node].contains(&node)) {
+        // A cyclic task network is rejected elsewhere; do not add to it.
+        return Ok(Vec::new());
+    }
+    let mut accepted: Vec<(usize, usize)> = Vec::new();
+    for (before, after) in candidates {
+        if insert_ordering(&mut closure, before, after) {
+            accepted.push((before, after));
+        }
+    }
+    Ok(accepted)
+}
+
+/// Whether two task indices belong to the same grounding.
+fn same_grounding(ranges: &[(usize, usize)], before: usize, after: usize) -> bool {
+    ranges
+        .iter()
+        .any(|&(start, end)| (start..end).contains(&before) && (start..end).contains(&after))
+}
+
+/// Insert `before -> after` into an acyclicity-preserving closure.
+///
+/// Returns `false` when the edge is already implied or would close a cycle.
+fn insert_ordering(closure: &mut [BTreeSet<usize>], before: usize, after: usize) -> bool {
+    if before == after || closure[before].contains(&after) {
+        return false;
+    }
+    if closure[after].contains(&before) {
+        return false;
+    }
+    let successors = closure[after].clone();
+    let predecessors: Vec<usize> = (0..closure.len())
+        .filter(|&node| node == before || closure[node].contains(&before))
+        .collect();
+    for node in predecessors {
+        closure[node].insert(after);
+        closure[node].extend(successors.iter().copied());
+    }
+    true
+}
+
+/// Which task pairs a gap analysis inspects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairScope {
+    /// Pairs that the current ordering already forces.
+    Ordered,
+    /// Pairs that the current ordering leaves free in both directions.
+    Unordered,
+}
+
+/// The gaps of a grounded task network, together with the ordering closure.
+struct Analysis {
+    gaps: Vec<LiftabilityGap>,
+    closure: Vec<BTreeSet<usize>>,
+    truncated: bool,
+    expanded: usize,
+}
+
+fn analyse(
+    domain: &Domain,
+    problem: &Problem,
+    tasks: &[TaskNode],
+    edges: &[(usize, usize)],
+    options: &LiftabilityOptions,
+    scope: PairScope,
+) -> Result<Analysis> {
+    let closure = transitive_closure(tasks.len(), edges);
+    let initial = initial_atoms(problem);
+    let pairs = pairs(&closure, scope);
+
+    // Without a candidate pair there can be no gap, regardless of how the
     // subtasks decompose; report the result as complete.
-    if closure.iter().all(BTreeSet::is_empty) {
-        return Ok(LiftabilityReport {
-            tasks,
-            orderings: Vec::new(),
+    if pairs.is_empty() {
+        return Ok(Analysis {
             gaps: Vec::new(),
+            closure,
             truncated: false,
             expanded: 0,
         });
     }
 
     let mut expansion = Expansion::new(domain, problem, options);
-    for task in &tasks {
+    for task in tasks {
         expansion.intern(task.clone());
     }
     expansion.expand();
@@ -315,48 +469,46 @@ pub fn detect_liftability_gaps(
         tasks.iter().map(|task| expansion.consumers(task)).collect();
 
     let mut gaps = Vec::new();
-    for before in 0..tasks.len() {
-        for &after in &closure[before] {
-            for producer in &producers[before] {
-                for (atom, witness, produced_positive) in producer.effects.literals() {
-                    for consumer in &consumers[after] {
-                        let Some(usage) = consumer.uses.get(&atom) else {
+    for (before, after) in pairs {
+        for producer in &producers[before] {
+            for (atom, witness, produced_positive) in producer.effects.literals() {
+                for consumer in &consumers[after] {
+                    let Some(usage) = consumer.uses.get(&atom) else {
+                        continue;
+                    };
+                    for required_positive in [true, false] {
+                        let occurrences = usage.count(required_positive);
+                        if occurrences == 0 {
                             continue;
-                        };
-                        for required_positive in [true, false] {
-                            let occurrences = usage.count(required_positive);
-                            if occurrences == 0 {
-                                continue;
-                            }
-                            gaps.push(LiftabilityGap {
-                                before,
-                                after,
-                                before_task: tasks[before].clone(),
-                                after_task: tasks[after].clone(),
-                                before_method: producer.method.clone(),
-                                after_method: consumer.name.clone(),
-                                consumer: consumer.kind,
-                                kind: if produced_positive == required_positive {
-                                    GapKind::HiddenSatisfier
-                                } else {
-                                    GapKind::HiddenFalsifier
-                                },
-                                atom: atom.clone(),
-                                produced_positive,
-                                required_positive,
-                                witness: witness.clone(),
-                                required_everywhere: occurrences >= consumer.clauses,
-                                literal_initially_true: initial.contains(&atom.to_string())
-                                    == required_positive,
-                                visible_producer: visible
-                                    .get(&(atom.clone(), required_positive))
-                                    .is_some_and(|writers| {
-                                        writers.iter().any(|&writer| {
-                                            writer != before && closure[writer].contains(&after)
-                                        })
-                                    }),
-                            });
                         }
+                        gaps.push(LiftabilityGap {
+                            before,
+                            after,
+                            before_task: tasks[before].clone(),
+                            after_task: tasks[after].clone(),
+                            before_method: producer.method.clone(),
+                            after_method: consumer.name.clone(),
+                            consumer: consumer.kind,
+                            kind: if produced_positive == required_positive {
+                                GapKind::HiddenSatisfier
+                            } else {
+                                GapKind::HiddenFalsifier
+                            },
+                            atom: atom.clone(),
+                            produced_positive,
+                            required_positive,
+                            witness: witness.clone(),
+                            required_everywhere: occurrences >= consumer.clauses,
+                            literal_initially_true: initial.contains(&atom.to_string())
+                                == required_positive,
+                            visible_producer: visible
+                                .get(&(atom.clone(), required_positive))
+                                .is_some_and(|writers| {
+                                    writers.iter().any(|&writer| {
+                                        writer != before && closure[writer].contains(&after)
+                                    })
+                                }),
+                        });
                     }
                 }
             }
@@ -384,19 +536,33 @@ pub fn detect_liftability_gaps(
     });
     gaps.dedup();
 
-    let orderings = closure
-        .iter()
-        .enumerate()
-        .flat_map(|(before, after)| after.iter().map(move |&after| (before, after)))
-        .collect();
-
-    Ok(LiftabilityReport {
-        tasks,
-        orderings,
+    Ok(Analysis {
         gaps,
+        closure,
         truncated: expansion.truncated,
         expanded: expansion.len(),
     })
+}
+
+/// The task pairs a [`PairScope`] selects.
+fn pairs(closure: &[BTreeSet<usize>], scope: PairScope) -> Vec<(usize, usize)> {
+    let count = closure.len();
+    match scope {
+        PairScope::Ordered => (0..count)
+            .flat_map(|before| closure[before].iter().map(move |&after| (before, after)))
+            .collect(),
+        PairScope::Unordered => (0..count)
+            .flat_map(|before| {
+                (0..count)
+                    .filter(move |&after| {
+                        before != after
+                            && !closure[before].contains(&after)
+                            && !closure[after].contains(&before)
+                    })
+                    .map(move |after| (before, after))
+            })
+            .collect(),
+    }
 }
 
 /// The transitive closure of the top-level ordering edges.
@@ -434,23 +600,27 @@ struct Effects {
 }
 
 impl Effects {
-    /// Insert the literals of `other`, attributed to `witness`. Returns
-    /// whether anything new was inserted.
-    fn merge_with_witness(&mut self, other: &Effects, witness: &TaskNode) -> bool {
-        let mut changed = false;
+    /// Insert the literals of `other`, attributed to `witness`, and return the
+    /// literals that were not present before.
+    fn merge_with_witness(&mut self, other: &Effects, witness: &TaskNode) -> Effects {
+        let mut delta = Effects::default();
         for atom in other.add.keys() {
             if !self.add.contains_key(atom) {
                 self.add.insert(atom.clone(), witness.clone());
-                changed = true;
+                delta.add.insert(atom.clone(), witness.clone());
             }
         }
         for atom in other.del.keys() {
             if !self.del.contains_key(atom) {
                 self.del.insert(atom.clone(), witness.clone());
-                changed = true;
+                delta.del.insert(atom.clone(), witness.clone());
             }
         }
-        changed
+        delta
+    }
+
+    fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.del.is_empty()
     }
 
     fn literals(&self) -> Vec<(Atom, TaskNode, bool)> {
@@ -627,14 +797,11 @@ impl<'a> Expansion<'a> {
 
             let domain = self.domain;
             let instances =
-                match ground_methods(domain, &self.universe, &task, self.options.max_groundings) {
-                    Ok(instances) => instances,
-                    Err(_) => {
-                        self.truncated = true;
-                        continue;
-                    }
-                };
-            for instance in instances {
+                ground_methods_bounded(domain, &self.universe, &task, self.options.max_groundings);
+            if instances.truncated {
+                self.truncated = true;
+            }
+            for instance in instances.instances {
                 let mut children = Vec::with_capacity(instance.method.tn.subtasks.len());
                 for subtask in &instance.method.tn.subtasks {
                     let child = TaskNode {
@@ -672,20 +839,25 @@ impl<'a> Expansion<'a> {
     /// accumulates the effects of its subtasks. Monotone growth terminates
     /// even when the methods are recursive, and the least solution contains
     /// exactly the atoms that a finite decomposition can write.
+    ///
+    /// Only the literals that a node gained since it was last processed are
+    /// propagated, so every `(atom, edge)` pair is handled once.
     fn propagate(&self) -> Vec<Effects> {
         let mut effects = vec![Effects::default(); self.nodes.len()];
-        let mut queue: VecDeque<usize> = VecDeque::new();
+        let mut pending: VecDeque<(usize, Effects)> = VecDeque::new();
         for (id, primitive) in self.primitive.iter().enumerate() {
             if let Some(primitive) = primitive {
                 effects[id] = primitive.clone();
-                queue.push_back(id);
+                if !primitive.is_empty() {
+                    pending.push_back((id, primitive.clone()));
+                }
             }
         }
-        while let Some(child) = queue.pop_front() {
-            let child_effects = effects[child].clone();
+        while let Some((child, delta)) = pending.pop_front() {
             for &parent in &self.parents[child] {
-                if effects[parent].merge_with_witness(&child_effects, &self.nodes[child]) {
-                    queue.push_back(parent);
+                let gained = effects[parent].merge_with_witness(&delta, &self.nodes[child]);
+                if !gained.is_empty() {
+                    pending.push_back((parent, gained));
                 }
             }
         }
@@ -732,7 +904,12 @@ impl<'a> Expansion<'a> {
     /// and flags the report as truncated.
     fn consumers(&mut self, task: &TaskNode) -> Vec<Consumer> {
         match self.consumers_inner(task) {
-            Ok(consumers) => consumers,
+            Ok((consumers, truncated)) => {
+                if truncated {
+                    self.truncated = true;
+                }
+                consumers
+            }
             Err(_) => {
                 self.truncated = true;
                 Vec::new()
@@ -740,17 +917,19 @@ impl<'a> Expansion<'a> {
         }
     }
 
-    fn consumers_inner(&self, task: &TaskNode) -> Result<Vec<Consumer>> {
+    fn consumers_inner(&self, task: &TaskNode) -> Result<(Vec<Consumer>, bool)> {
         let domain = self.domain;
         let actions: Vec<&Action> = domain
             .actions_for(&task.name)
             .filter(|action| action.parameters.len() == task.terms.len())
             .collect();
         let mut consumers = Vec::new();
+        let mut truncated = false;
         if actions.is_empty() {
             let instances =
-                ground_methods(domain, &self.universe, task, self.options.max_groundings)?;
-            for instance in &instances {
+                ground_methods_bounded(domain, &self.universe, task, self.options.max_groundings);
+            truncated = instances.truncated;
+            for instance in &instances.instances {
                 let clauses = formula::precondition_clauses(
                     instance.method.precondition.as_ref(),
                     &instance.bindings,
@@ -781,7 +960,7 @@ impl<'a> Expansion<'a> {
                 }
             }
         }
-        Ok(consumers)
+        Ok((consumers, truncated))
     }
 }
 
@@ -872,6 +1051,15 @@ mod tests {
     }
 
     fn problem(tasks: &[(&str, &[&str])], objects: &[&str], init_state: Vec<Predicate>) -> Problem {
+        problem_with_orderings(tasks, objects, init_state, TaskOrdering::Total)
+    }
+
+    fn problem_with_orderings(
+        tasks: &[(&str, &[&str])],
+        objects: &[&str],
+        init_state: Vec<Predicate>,
+        orderings: TaskOrdering,
+    ) -> Problem {
         Problem {
             name: "p1".to_string(),
             domain_name: "test".to_string(),
@@ -889,7 +1077,7 @@ mod tests {
                             terms: terms.iter().map(|term| symbol(term)).collect(),
                         })
                         .collect(),
-                    orderings: TaskOrdering::Total,
+                    orderings,
                     constraints: None,
                 },
             }),
@@ -1160,5 +1348,226 @@ mod tests {
         assert!(report.is_clear(), "{report}");
         assert!(!report.truncated);
         assert_eq!(report.orderings, vec![(0, 1)]);
+    }
+
+    fn deliver_and_use_domain(use_precondition: Formula) -> Domain {
+        domain(
+            vec![
+                method(
+                    "deliver-by-truck",
+                    "deliver",
+                    &["?p", "?l"],
+                    &["?t"],
+                    None,
+                    &[("load", &["?p", "?t"])],
+                ),
+                method(
+                    "use-loaded",
+                    "use",
+                    &["?p"],
+                    &[],
+                    Some(use_precondition),
+                    &[("consume", &["?p"])],
+                ),
+            ],
+            vec![
+                action(
+                    "load",
+                    &["?p", "?t"],
+                    None,
+                    Some(atom("loaded", &["?p", "?t"])),
+                ),
+                action("consume", &["?p"], None, None),
+            ],
+        )
+    }
+
+    #[test]
+    fn repairs_a_liftability_gap_with_an_implicit_ordering() {
+        let domain = deliver_and_use_domain(atom("loaded", &["?p", "t1"]));
+        let problem = problem_with_orderings(
+            &[("deliver", &["p1", "l1"]), ("use", &["p1"])],
+            &["p1", "l1", "t1"],
+            Vec::new(),
+            TaskOrdering::Partial(Vec::new()),
+        );
+
+        assert_eq!(
+            repair_orderings(&domain, &problem, &LiftabilityOptions::default()).unwrap(),
+            vec![(0, 1)]
+        );
+    }
+
+    #[test]
+    fn no_repair_when_the_literal_already_holds() {
+        let domain = deliver_and_use_domain(atom("loaded", &["?p", "t1"]));
+        let problem = problem_with_orderings(
+            &[("deliver", &["p1", "l1"]), ("use", &["p1"])],
+            &["p1", "l1", "t1"],
+            vec![predicate("loaded", &["p1", "t1"])],
+            TaskOrdering::Partial(Vec::new()),
+        );
+
+        assert!(
+            repair_orderings(&domain, &problem, &LiftabilityOptions::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn no_repair_when_another_clause_avoids_the_literal() {
+        let domain = deliver_and_use_domain(Formula::Or(vec![
+            atom("loaded", &["?p", "t1"]),
+            atom("ready", &["?p"]),
+        ]));
+        let problem = problem_with_orderings(
+            &[("deliver", &["p1", "l1"]), ("use", &["p1"])],
+            &["p1", "l1", "t1"],
+            Vec::new(),
+            TaskOrdering::Partial(Vec::new()),
+        );
+
+        assert!(
+            repair_orderings(&domain, &problem, &LiftabilityOptions::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_repair_reaches_the_evaluation_tree() {
+        use crate::solver::evaluation_tree::{
+            ConstraintNode, EvaluationOptions, build_evaluation_tree,
+        };
+
+        let domain = deliver_and_use_domain(atom("loaded", &["?p", "t1"]));
+        let problem = problem_with_orderings(
+            &[("deliver", &["p1", "l1"]), ("use", &["p1"])],
+            &["p1", "l1", "t1"],
+            Vec::new(),
+            TaskOrdering::Partial(Vec::new()),
+        );
+        let ordering = ConstraintNode::Ordering {
+            before: 0,
+            after: 1,
+        };
+
+        let plain =
+            build_evaluation_tree(&domain, &problem, &EvaluationOptions::default()).unwrap();
+        assert!(
+            !plain.constraints.contains(&ordering),
+            "without the repair the network has no ordering"
+        );
+
+        let repaired = build_evaluation_tree(
+            &domain,
+            &problem,
+            &EvaluationOptions {
+                implicit_orderings: true,
+                ..EvaluationOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            repaired.constraints.contains(&ordering),
+            "the implicit ordering is part of the constraint graph"
+        );
+        // The incidence of the ordering joins both tasks, so the clusterer
+        // sees a single component and the ordering is enforced downstream.
+        let constraint = repaired
+            .constraints
+            .iter()
+            .position(|constraint| *constraint == ordering)
+            .unwrap();
+        assert!(repaired.clusters.len() == 1);
+        assert!(
+            repaired
+                .clusters
+                .iter()
+                .all(|cluster| cluster.n2s.contains(&constraint))
+        );
+    }
+
+    /// A producer whose only subtask is the ground `load(p1, t1)`, so the
+    /// merge can observe the shared atom without choosing a binding.
+    fn ground_deliver_domain() -> Domain {
+        domain(
+            vec![
+                method(
+                    "deliver-by-truck",
+                    "deliver",
+                    &["?p", "?l"],
+                    &[],
+                    None,
+                    &[("load", &["?p", "t1"])],
+                ),
+                method(
+                    "use-loaded",
+                    "use",
+                    &["?p"],
+                    &[],
+                    Some(atom("loaded", &["?p", "t1"])),
+                    &[("consume", &["?p"])],
+                ),
+            ],
+            vec![
+                action(
+                    "load",
+                    &["?p", "?t"],
+                    None,
+                    Some(atom("loaded", &["?p", "?t"])),
+                ),
+                action("consume", &["?p"], None, None),
+            ],
+        )
+    }
+
+    #[test]
+    fn the_fallback_inserts_the_order_needed_to_refine() {
+        use crate::solver::evaluation_tree::{
+            EvaluationOptions, MethodSummary, RefinementOptions, SgplanMerger, evaluate,
+            refine_plan,
+        };
+        use crate::solver::partition::bisbm::Grouping;
+        use crate::solver::solve::solve_hierarchical_with_options;
+
+        let domain = ground_deliver_domain();
+        // `use` is the first task, so an unconstrained merge decodes it before
+        // `deliver`. Only the implicit ordering makes the plan liftable.
+        let problem = problem_with_orderings(
+            &[("use", &["p1"]), ("deliver", &["p1", "l1"])],
+            &["p1", "l1", "t1"],
+            Vec::new(),
+            TaskOrdering::Partial(Vec::new()),
+        );
+        let options = EvaluationOptions {
+            method_summary: MethodSummary::PrimitiveOnly,
+            groupings: vec![Grouping { n1s: vec![0] }, Grouping { n1s: vec![1] }],
+            ..EvaluationOptions::default()
+        };
+
+        let mut merger = SgplanMerger::default();
+        let evaluation = evaluate(&domain, &problem, &mut merger, &options).unwrap();
+        assert!(
+            evaluation.solved,
+            "both leaves are solved and the merge holds"
+        );
+        assert_eq!(
+            evaluation.plan.first().map(String::as_str),
+            Some("use-loaded[use(p1)]"),
+            "the unrepaired merge schedules the consumer first"
+        );
+
+        let refinement_options = RefinementOptions::default();
+        assert!(
+            refine_plan(&domain, &problem, &evaluation.plan, &refinement_options).is_err(),
+            "the unaugmented plan is not liftable"
+        );
+
+        let repaired =
+            solve_hierarchical_with_options(&domain, &problem, &refinement_options, &options)
+                .expect("the implicit ordering repairs the refinement");
+        assert!(!repaired.plan.is_empty());
     }
 }

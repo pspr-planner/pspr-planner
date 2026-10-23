@@ -11,7 +11,7 @@ use crate::parsing::json::{
 use crate::solver::domain::Domain;
 use crate::solver::problem::Problem;
 
-use super::formula::Universe;
+use super::formula::{self, Universe};
 
 /// A ground atom `predicate(term, ...)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -116,6 +116,12 @@ pub(super) struct GroundedMethod<'a> {
     pub(super) bindings: BTreeMap<String, String>,
 }
 
+/// A bounded set of grounded method instances.
+pub(super) struct BoundedMethods<'a> {
+    pub(super) instances: Vec<GroundedMethod<'a>>,
+    pub(super) truncated: bool,
+}
+
 /// Ground every method instance that can decompose `task`.
 ///
 /// The task terms bind `method.task_terms`; the remaining method parameters are
@@ -169,6 +175,73 @@ pub(super) fn ground_methods<'a>(
         }
     }
     Ok(grounded)
+}
+
+/// Ground method instances up to `budget` without failing on overflow.
+///
+/// Returns whether additional instances were skipped due to the bound.
+pub(super) fn ground_methods_bounded<'a>(
+    domain: &'a Domain,
+    universe: &Universe<'_>,
+    task: &TaskNode,
+    budget: usize,
+) -> BoundedMethods<'a> {
+    if budget == 0 {
+        return BoundedMethods {
+            instances: Vec::new(),
+            truncated: true,
+        };
+    }
+    let mut grounded = Vec::new();
+    let mut truncated = false;
+    for method in domain.methods_for(&task.name) {
+        if method.task_terms.len() != task.terms.len() {
+            continue;
+        }
+        if !method
+            .task_terms
+            .iter()
+            .zip(&task.terms)
+            .all(|(parameter, term)| universe.compatible(parameter, term))
+        {
+            continue;
+        }
+
+        let bindings = bindings_from(&method.task_terms, &task.terms);
+        let task_names: BTreeSet<&str> = method
+            .task_terms
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect();
+        let extra: Vec<Symbol> = method
+            .params
+            .iter()
+            .filter(|parameter| !task_names.contains(parameter.name.as_str()))
+            .cloned()
+            .collect();
+
+        for assignment in universe.assignments_capped(&extra, budget) {
+            if grounded.len() >= budget {
+                truncated = true;
+                break;
+            }
+            let mut instance = bindings.clone();
+            instance.extend(assignment);
+            grounded.push(GroundedMethod {
+                method,
+                bindings: instance,
+            });
+        }
+        if grounded.len() >= budget {
+            truncated = true;
+            break;
+        }
+    }
+
+    BoundedMethods {
+        instances: grounded,
+        truncated,
+    }
 }
 
 pub(super) fn bindings_from(parameters: &[Symbol], terms: &[String]) -> BTreeMap<String, String> {
@@ -288,7 +361,14 @@ fn collect_atoms(
             collect_atoms(right, bindings, universe, budget, atoms, unmodeled)?;
         }
         Formula::Exists(variables, inner) | Formula::ForAll(variables, inner) => {
-            for assignment in universe.assignments(variables, budget)? {
+            let assignments = match universe.assignments(variables, budget) {
+                Ok(assignments) => assignments,
+                Err(error) if formula::is_quantifier_overflow(&error) => {
+                    universe.assignments_capped(variables, budget)
+                }
+                Err(error) => return Err(error),
+            };
+            for assignment in assignments {
                 let mut local = bindings.clone();
                 local.extend(assignment);
                 collect_atoms(inner, &local, universe, budget, atoms, unmodeled)?;
@@ -330,15 +410,12 @@ fn task_atoms(
             collect_atoms(effects, &bindings, universe, budget, &mut atoms, unmodeled)?;
         }
     }
-    for method in domain.methods_for(&task.name) {
-        if method.task_terms.len() != task.terms.len() {
-            continue;
-        }
-        let bindings = bindings_from(&method.task_terms, &task.terms);
-        if let Some(precondition) = &method.precondition {
+    let bounded_methods = ground_methods_bounded(domain, universe, task, budget);
+    for instance in &bounded_methods.instances {
+        if let Some(precondition) = &instance.method.precondition {
             collect_atoms(
                 precondition,
-                &bindings,
+                &instance.bindings,
                 universe,
                 budget,
                 &mut atoms,
@@ -348,7 +425,7 @@ fn task_atoms(
     }
 
     if summaries {
-        for instance in ground_methods(domain, universe, task, budget)? {
+        for instance in &bounded_methods.instances {
             if !matches!(instance.method.tn.orderings, TaskOrdering::Total)
                 || instance.method.tn.constraints.is_some()
             {
@@ -434,8 +511,14 @@ impl ConstraintIndex {
     }
 }
 
-/// Grounded top-level tasks together with their ordering edges.
-pub(super) type GroundedNetwork = (Vec<TaskNode>, Vec<(usize, usize)>);
+/// A grounded top-level task network.
+pub(super) struct GroundedNetwork {
+    pub(super) tasks: Vec<TaskNode>,
+    /// Ordering edges as `(before, after)` task indices.
+    pub(super) edges: Vec<(usize, usize)>,
+    /// Task-index range of every grounding.
+    pub(super) groundings: Vec<(usize, usize)>,
+}
 
 /// Ground the initial task network and return its tasks together with the
 /// ordering edges of every grounding.
@@ -453,8 +536,13 @@ pub(super) fn ground_task_network_edges(
     let groundings = ground_task_network(&universe, problem, max_groundings)?;
     let mut tasks = Vec::new();
     let mut edges = Vec::new();
+    let mut ranges = Vec::new();
     let Some(network) = problem.task_network() else {
-        return Ok((tasks, edges));
+        return Ok(GroundedNetwork {
+            tasks,
+            edges,
+            groundings: ranges,
+        });
     };
     let id_of: HashMap<&str, usize> = network
         .subtasks
@@ -469,6 +557,7 @@ pub(super) fn ground_task_network_edges(
         let offset = tasks.len();
         let count = grounding.tasks.len();
         tasks.extend(grounding.tasks.iter().cloned());
+        ranges.push((offset, offset + count));
         match &network.orderings {
             TaskOrdering::Total => {
                 for position in 0..count.saturating_sub(1) {
@@ -488,7 +577,11 @@ pub(super) fn ground_task_network_edges(
             }
         }
     }
-    Ok((tasks, edges))
+    Ok(GroundedNetwork {
+        tasks,
+        edges,
+        groundings: ranges,
+    })
 }
 
 /// Build the task/constraint incidence graph of the initial task network.
@@ -497,16 +590,18 @@ pub fn build_task_constraint_graph(
     problem: &Problem,
     max_groundings: usize,
 ) -> Result<TaskConstraintGraph> {
-    build_task_constraint_graph_with_summary(domain, problem, max_groundings, false)
+    build_task_constraint_graph_with_summary(domain, problem, max_groundings, false, false)
 }
 
 /// Like [`build_task_constraint_graph`], optionally including the atoms read
-/// and written by eligible primitive method summaries.
+/// and written by eligible primitive method summaries, and optionally adding
+/// the implicit orderings that repair the liftability gaps of the projection.
 pub(super) fn build_task_constraint_graph_with_summary(
     domain: &Domain,
     problem: &Problem,
     max_groundings: usize,
     summaries: bool,
+    implicit_orderings: bool,
 ) -> Result<TaskConstraintGraph> {
     let universe = Universe::new(domain, problem);
     let groundings = ground_task_network(&universe, problem, max_groundings)?;
@@ -519,6 +614,7 @@ pub(super) fn build_task_constraint_graph_with_summary(
 
     let mut unmodeled = 0;
     let mut index = ConstraintIndex::default();
+    let mut unresolved_atoms = 0usize;
     let mut incidence: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); tasks.len()];
     for (task_index, task) in tasks.iter().enumerate() {
         for atom in task_atoms(
@@ -529,11 +625,19 @@ pub(super) fn build_task_constraint_graph_with_summary(
             summaries,
             &mut unmodeled,
         )? {
+            if atom.terms.iter().any(|term| term.starts_with('?')) {
+                unresolved_atoms += 1;
+            }
             let constraint = index.intern(ConstraintNode::Atom(atom));
             incidence[task_index].insert(constraint);
         }
     }
+    debug_assert_eq!(
+        unresolved_atoms, 0,
+        "constraint extraction produced unresolved atom terms"
+    );
 
+    let mut orderings: Vec<(usize, usize)> = Vec::new();
     if let Some(network) = problem.task_network() {
         let id_of: HashMap<&str, usize> = network
             .subtasks
@@ -547,6 +651,7 @@ pub(super) fn build_task_constraint_graph_with_summary(
         for &(offset, grounding) in &offsets {
             let count = grounding.tasks.len();
             let mut add_ordering = |before: usize, after: usize| {
+                orderings.push((before, after));
                 let constraint = index.intern(ConstraintNode::Ordering { before, after });
                 incidence[before].insert(constraint);
                 incidence[after].insert(constraint);
@@ -609,6 +714,34 @@ pub(super) fn build_task_constraint_graph_with_summary(
                     }
                 }
             }
+        }
+    }
+
+    // Implicit orderings that make the abstract plan refine into a complete
+    // HTN plan: a producer task that establishes (or destroys) a literal a
+    // later method needs must run before (after) that consumer. Once added,
+    // the edges are ordinary ordering constraints, so the clusterer, the
+    // leaves (transitive closure) and the merge nodes all enforce them.
+    if implicit_orderings && !tasks.is_empty() {
+        let liftability = super::liftability::LiftabilityOptions {
+            max_groundings,
+            ..super::liftability::LiftabilityOptions::default()
+        };
+        let groundings: Vec<(usize, usize)> = offsets
+            .iter()
+            .map(|&(offset, grounding)| (offset, offset + grounding.tasks.len()))
+            .collect();
+        for (before, after) in super::liftability::implicit_orderings(
+            domain,
+            problem,
+            &tasks,
+            &orderings,
+            &groundings,
+            &liftability,
+        )? {
+            let constraint = index.intern(ConstraintNode::Ordering { before, after });
+            incidence[before].insert(constraint);
+            incidence[after].insert(constraint);
         }
     }
 

@@ -55,7 +55,41 @@ pub fn solve_hierarchical(domain: &Domain, problem: &Problem) -> Result<Refineme
 }
 
 /// Hierarchical refinement with explicit options.
+///
+/// When the first attempt fails and the liftability analysis finds an implicit
+/// ordering that could repair the projection, the solve is retried with those
+/// orderings inserted into the task network
+/// ([`EvaluationOptions::implicit_orderings`]).
 pub fn solve_hierarchical_with_options(
+    domain: &Domain,
+    problem: &Problem,
+    refinement: &RefinementOptions,
+    evaluation: &EvaluationOptions,
+) -> Result<Refinement, String> {
+    match solve_hierarchical_once(domain, problem, refinement, evaluation) {
+        Ok(refinement) => Ok(refinement),
+        Err(first_error) if !evaluation.implicit_orderings => {
+            let liftability = evaluation_tree::LiftabilityOptions {
+                max_groundings: evaluation.max_groundings,
+                ..evaluation_tree::LiftabilityOptions::default()
+            };
+            let repairable = evaluation_tree::repair_orderings(domain, problem, &liftability)
+                .map(|orderings| !orderings.is_empty())
+                .unwrap_or(false);
+            if !repairable {
+                return Err(first_error);
+            }
+            let repaired = EvaluationOptions {
+                implicit_orderings: true,
+                ..evaluation.clone()
+            };
+            solve_hierarchical_once(domain, problem, refinement, &repaired).map_err(|_| first_error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn solve_hierarchical_once(
     domain: &Domain,
     problem: &Problem,
     refinement: &RefinementOptions,

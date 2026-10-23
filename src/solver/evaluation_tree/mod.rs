@@ -113,7 +113,7 @@ pub use hierarchical::{
 };
 pub use liftability::{
     ConsumerKind, GapKind, LiftabilityGap, LiftabilityOptions, LiftabilityReport,
-    detect_liftability_gaps,
+    detect_liftability_gaps, repair_orderings,
 };
 pub use merge::{
     AdamOptions, MergeInitialization, MergeInitializer, MergeOutcome, MergeProblem, MergeRecord,
@@ -166,6 +166,9 @@ pub struct EvaluationOptions {
     /// Whether primitive method effects are summarised into compound-task
     /// operators (Approach G in `docs/compound-tasks.md`).
     pub method_summary: MethodSummary,
+    /// Insert the implicit top-level orderings that repair the liftability
+    /// gaps detected by [`liftability`](self::liftability).
+    pub implicit_orderings: bool,
 }
 
 impl Default for EvaluationOptions {
@@ -180,6 +183,7 @@ impl Default for EvaluationOptions {
             max_groundings: 256,
             leaf_max_expansions: 100_000,
             method_summary: MethodSummary::Off,
+            implicit_orderings: false,
         }
     }
 }
@@ -195,6 +199,7 @@ pub fn build_evaluation_tree(
         problem,
         options.max_groundings,
         options.method_summary != MethodSummary::Off,
+        options.implicit_orderings,
     )?;
     let clusters = cluster_tasks(&graph, options)?;
 
@@ -763,6 +768,61 @@ mod tests {
     }
 
     #[test]
+    fn quantifier_overflow_is_bounded_instead_of_failing() {
+        let domain = Domain {
+            name: "bounded".to_string(),
+            requirements: Vec::new(),
+            types: vec![symbol("place", None)],
+            constants: Vec::new(),
+            predicates: vec![Predicate {
+                name: "at".to_string(),
+                variables: vec![symbol("?a", Some("place")), symbol("?b", Some("place"))],
+            }],
+            compound_tasks: Vec::new(),
+            methods: Vec::new(),
+            actions: vec![Action {
+                name: "flood".to_string(),
+                parameters: vec![symbol("?from", Some("place"))],
+                preconditions: Some(Formula::Exists(
+                    vec![symbol("?x", Some("place")), symbol("?y", Some("place"))],
+                    Box::new(Formula::Atom(atom("at", &["?x", "?y"]))),
+                )),
+                effects: Some(Formula::Empty),
+            }],
+            functions: Vec::new(),
+        };
+        let problem = Problem {
+            name: "p".to_string(),
+            domain_name: "bounded".to_string(),
+            objects: vec![
+                symbol("a", Some("place")),
+                symbol("b", Some("place")),
+                symbol("c", Some("place")),
+                symbol("d", Some("place")),
+                symbol("e", Some("place")),
+            ],
+            init_state: vec![atom("at", &["a", "a"])],
+            goal: None,
+            init_task_network: Some(InitialTaskNetwork {
+                parameters: None,
+                tn: Htn {
+                    subtasks: vec![subtask("t1", "flood", &["a"])],
+                    orderings: TaskOrdering::Total,
+                    constraints: None,
+                },
+            }),
+        };
+        let options = EvaluationOptions {
+            max_groundings: 4,
+            ..EvaluationOptions::default()
+        };
+        let mut merger = SgplanMerger::default();
+        let evaluation = evaluate(&domain, &problem, &mut merger, &options)
+            .expect("quantifier overflow should not abort evaluation");
+        assert_eq!(evaluation.tree.unmodeled, 0);
+    }
+
+    #[test]
     fn composite_negation_and_implication_are_rewritten() {
         let negation = single_action_domain(
             Formula::Not(Box::new(Formula::And(vec![
@@ -880,6 +940,93 @@ mod tests {
             }),
         };
         (domain, problem)
+    }
+
+    #[test]
+    fn method_local_preconditions_are_grounded_in_graph_constraints() {
+        let domain = Domain {
+            name: "lifted-method".to_string(),
+            requirements: Vec::new(),
+            types: vec![
+                symbol("package", None),
+                symbol("truck", None),
+                symbol("place", None),
+            ],
+            constants: Vec::new(),
+            predicates: vec![
+                Predicate {
+                    name: "loaded".to_string(),
+                    variables: vec![symbol("?p", Some("package")), symbol("?t", Some("truck"))],
+                },
+                Predicate {
+                    name: "at".to_string(),
+                    variables: vec![symbol("?t", Some("truck")), symbol("?l", Some("place"))],
+                },
+            ],
+            compound_tasks: vec![Task {
+                name: "ship".to_string(),
+                parameters: vec![symbol("?p", Some("package"))],
+            }],
+            methods: vec![Method {
+                name: symbol("m_ship", None),
+                task: symbol("ship", None),
+                task_terms: vec![symbol("?p", Some("package"))],
+                params: vec![symbol("?p", Some("package")), symbol("?t", Some("truck"))],
+                precondition: Some(Formula::Atom(atom("loaded", &["?p", "?t"]))),
+                tn: Htn {
+                    subtasks: Vec::new(),
+                    orderings: TaskOrdering::Total,
+                    constraints: None,
+                },
+            }],
+            actions: Vec::new(),
+            functions: Vec::new(),
+        };
+        let problem = Problem {
+            name: "p".to_string(),
+            domain_name: "lifted-method".to_string(),
+            objects: vec![
+                symbol("pkg1", Some("package")),
+                symbol("t1", Some("truck")),
+                symbol("t2", Some("truck")),
+                symbol("d0", Some("place")),
+            ],
+            init_state: vec![atom("at", &["t1", "d0"]), atom("at", &["t2", "d0"])],
+            goal: None,
+            init_task_network: Some(InitialTaskNetwork {
+                parameters: None,
+                tn: Htn {
+                    subtasks: vec![subtask("s1", "ship", &["pkg1"])],
+                    orderings: TaskOrdering::Total,
+                    constraints: None,
+                },
+            }),
+        };
+
+        let graph = build_task_constraint_graph(&domain, &problem, 64).unwrap();
+        let atoms: Vec<_> = graph
+            .constraints
+            .iter()
+            .filter_map(|constraint| match constraint {
+                ConstraintNode::Atom(atom) => Some(atom.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            atoms
+                .iter()
+                .all(|atom| atom.terms.iter().all(|term| !term.starts_with('?'))),
+            "all extracted atoms must be fully grounded"
+        );
+        assert!(atoms.contains(&Atom::new(
+            "loaded",
+            vec!["pkg1".to_string(), "t1".to_string()]
+        )));
+        assert!(atoms.contains(&Atom::new(
+            "loaded",
+            vec!["pkg1".to_string(), "t2".to_string()]
+        )));
     }
 
     #[test]

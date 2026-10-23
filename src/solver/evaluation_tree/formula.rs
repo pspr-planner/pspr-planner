@@ -116,6 +116,50 @@ impl<'a> Universe<'a> {
         }
         Ok(assignments)
     }
+
+    /// A prefix of the quantified assignments, capped at `budget`.
+    ///
+    /// This never errors on combinatorial blow-up and is used by bounded
+    /// approximations (for example incidence extraction) where partial
+    /// exploration is preferable to aborting the whole solve.
+    pub(super) fn assignments_capped(
+        &self,
+        variables: &[Symbol],
+        budget: usize,
+    ) -> Vec<BTreeMap<String, String>> {
+        if budget == 0 {
+            return Vec::new();
+        }
+        let mut assignments: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
+        for variable in variables {
+            let candidates = self.candidates(variable);
+            if candidates.is_empty() {
+                return Vec::new();
+            }
+            let mut extended = Vec::new();
+            for assignment in &assignments {
+                for candidate in &candidates {
+                    if extended.len() >= budget {
+                        break;
+                    }
+                    let mut copy = assignment.clone();
+                    copy.insert(variable.name.clone(), candidate.clone());
+                    extended.push(copy);
+                }
+                if extended.len() >= budget {
+                    break;
+                }
+            }
+            assignments = extended;
+        }
+        assignments
+    }
+}
+
+pub(super) fn is_quantifier_overflow(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("the quantified formula expands to more than")
 }
 
 /// A quantifier-free formula in negation normal form.

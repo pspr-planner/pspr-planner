@@ -24,8 +24,8 @@ use super::decomposition::{
     DecompositionSession, MethodCandidate, MethodRankingContext, MethodTrace, SearchContext,
     SearchTrace,
 };
-use super::formula::Universe;
-use super::graph::{TaskNode, ground_methods};
+use super::formula::{self, Universe};
+use super::graph::{TaskNode, ground_methods_bounded};
 use super::leaf::initial_atoms;
 use super::verify::{GoalStatus, Step, apply_action, holds, parse_step};
 use super::{EvaluationOptions, SgplanMerger, evaluate};
@@ -202,6 +202,7 @@ pub fn solve_hierarchical(
 // tasks with several interchangeable `do_on_table` methods) and still keeps
 // the search finite on the harder learned domains.
 const MAX_REFINEMENTS: usize = 2048;
+const REFINEMENT_METHOD_SAMPLING_FACTOR: usize = 4;
 
 fn cap(mut candidates: Vec<RefinedTask>) -> Vec<RefinedTask> {
     candidates.truncate(MAX_REFINEMENTS);
@@ -387,7 +388,11 @@ fn refine_task_uncached(
         }]);
     }
 
-    let mut methods = ground_methods(domain, universe, task, options.max_groundings)?;
+    let sampling_budget = options
+        .max_groundings
+        .saturating_mul(REFINEMENT_METHOD_SAMPLING_FACTOR)
+        .max(options.max_groundings);
+    let mut methods = ground_methods_bounded(domain, universe, task, sampling_budget).instances;
     methods.sort_by_key(|instance| {
         (
             preferred_method.is_some_and(|preferred| instance.method.name.name != preferred),
@@ -396,7 +401,7 @@ fn refine_task_uncached(
     });
     let mut applicable = Vec::new();
     for instance in methods {
-        if holds_optional(
+        if holds_optional_bounded(
             instance.method.precondition.as_ref(),
             &instance.bindings,
             state,
@@ -781,6 +786,20 @@ fn holds_optional(
     }
 }
 
+fn holds_optional_bounded(
+    formula: Option<&crate::parsing::json::Formula>,
+    bindings: &BTreeMap<String, String>,
+    state: &BTreeSet<String>,
+    universe: &Universe<'_>,
+    budget: usize,
+) -> Result<bool> {
+    match holds_optional(formula, bindings, state, universe, budget) {
+        Ok(value) => Ok(value),
+        Err(error) if formula::is_quantifier_overflow(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn goal_status(
     domain: &Domain,
     problem: &Problem,
@@ -790,13 +809,12 @@ fn goal_status(
     let universe = Universe::new(domain, problem);
     match &problem.goal {
         None => Ok(GoalStatus::Absent),
-        Some(goal) => {
-            if holds(goal, &BTreeMap::new(), state, &universe, budget)? {
-                Ok(GoalStatus::Satisfied)
-            } else {
-                Ok(GoalStatus::Violated)
-            }
-        }
+        Some(goal) => match holds(goal, &BTreeMap::new(), state, &universe, budget) {
+            Ok(true) => Ok(GoalStatus::Satisfied),
+            Ok(false) => Ok(GoalStatus::Violated),
+            Err(error) if formula::is_quantifier_overflow(&error) => Ok(GoalStatus::Violated),
+            Err(error) => Err(error),
+        },
     }
 }
 

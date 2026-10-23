@@ -154,6 +154,24 @@ or action, the witness subtask, whether the literal occurs in every DNF clause
 of the consumer, whether it already holds initially, and whether a primitive
 top-level task can write it anyway.
 
+\paragraph{Repairing the gap with implicit orderings.}
+The same analysis drives a repair. Among the task pairs that the network
+leaves unordered in both directions, take every pair where a method of $t_1$
+establishes a literal that every clause of a precondition of $t_2$ requires,
+the literal does not hold initially, and no primitive top-level task can write
+it; add the edge $t_1\prec t_2$. A hidden falsifier is handled symmetrically:
+if $t_1$ destroys a literal that $t_2$ requires and that holds initially, the
+edge $t_2\prec t_1$ is added instead. Candidates that would close a cycle are
+dropped, and the remaining edges are inserted into the task network before
+clustering. They are then ordinary ordering constraints: the incidence graph
+connects their endpoints, the leaves close the ordering transitively, and the
+merge nodes validate them exactly. The abstract plan therefore executes the
+producer before the consumer, and the refinement stage threads the established
+atom into the consumer's method precondition. The hierarchical solver retries
+with this repair when the first attempt fails and the analysis finds an edge
+(\texttt{EvaluationOptions::implicit\_orderings}, \texttt{--repair-orderings}
+on the command line).
+
 \section{Grounding and the task/constraint incidence graph}
 
 \subsection{Grounding}

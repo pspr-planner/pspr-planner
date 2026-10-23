@@ -250,6 +250,21 @@ is not a proof of liftability. `LiftabilityReport::truncated` records whether
 a grounding or node bound was hit, and the `--liftability` flag of the CLI
 prints the report for a problem.
 
+The same analysis repairs the plan. For every pair that the network leaves
+unordered, `evaluation_tree::liftability::implicit_orderings` adds the implied
+edge: `t1 -> t2` when a decomposition of `t1` establishes a literal that every
+clause of `t2`'s precondition requires, and `t2 -> t1` when `t1` destroys such
+a literal while it holds initially. Candidates that would close a cycle are
+dropped. The accepted edges are ordinary `ConstraintNode::Ordering` entries
+inserted before clustering, so they propagate through the whole pipeline: the
+incidence graph joins their endpoints, the leaves include them in their
+transitive predecessor closure, and merge nodes enforce them exactly. The
+abstract plan then executes the producer before the consumer, and refinement
+threads the established atom into the consumer's method precondition. The
+hierarchical solver enables the repair on a retry when the first attempt
+fails, and `EvaluationOptions::implicit_orderings` (or `--repair-orderings`)
+forces it on the first attempt.
+
 Call a top-level plan $\pi \in \mathrm{TopPlans}(P)$ **liftable** when there
 is a primitive decomposition $D$ and a linearisation $\pi'$ of $L(D)$ such
 that

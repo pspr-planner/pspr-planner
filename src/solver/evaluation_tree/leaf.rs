@@ -11,7 +11,7 @@ use crate::solver::problem::Problem;
 
 use super::clustering::EvaluationTree;
 use super::formula::{self, Universe};
-use super::graph::{Atom, ConstraintNode, TaskNode, bindings_from, ground_methods};
+use super::graph::{Atom, ConstraintNode, TaskNode, bindings_from, ground_methods_bounded};
 
 pub(super) struct LeafPlanningTask {
     pub(super) task: fast_downward::Task,
@@ -79,6 +79,32 @@ struct SummaryOperator {
     del: BTreeSet<Atom>,
 }
 
+fn bounded_precondition_clauses(
+    formula: Option<&crate::parsing::json::Formula>,
+    bindings: &BTreeMap<String, String>,
+    universe: &Universe<'_>,
+    max_groundings: usize,
+) -> Result<Vec<formula::Clause>> {
+    match formula::precondition_clauses(formula, bindings, universe, max_groundings) {
+        Ok(clauses) => Ok(clauses),
+        Err(error) if formula::is_quantifier_overflow(&error) => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn bounded_effect_alternatives(
+    formula: Option<&crate::parsing::json::Formula>,
+    bindings: &BTreeMap<String, String>,
+    universe: &Universe<'_>,
+    max_groundings: usize,
+) -> Result<Vec<formula::EffectAlternative>> {
+    match formula::effect_alternatives_of(formula, bindings, universe, max_groundings) {
+        Ok(alternatives) => Ok(alternatives),
+        Err(error) if formula::is_quantifier_overflow(&error) => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Compile a method whose subtasks are primitive, totally ordered and free of
 /// conditional effects into a macro operator. The summary is exact under the
 /// restrictions stated in `docs/compound-tasks.md` (Approach G); any method
@@ -90,7 +116,7 @@ fn summary_operators(
     max_groundings: usize,
 ) -> Result<Vec<SummaryOperator>> {
     let mut summaries = Vec::new();
-    for instance in ground_methods(domain, universe, task, max_groundings)? {
+    for instance in ground_methods_bounded(domain, universe, task, max_groundings).instances {
         let method = instance.method;
         if !matches!(method.tn.orderings, TaskOrdering::Total) || method.tn.constraints.is_some() {
             continue;
@@ -122,13 +148,13 @@ fn summary_operators(
                 break;
             };
             let action_bindings = bindings_from(&action.parameters, &terms);
-            let clauses = formula::precondition_clauses(
+            let clauses = bounded_precondition_clauses(
                 action.preconditions.as_ref(),
                 &action_bindings,
                 universe,
                 max_groundings,
             )?;
-            let effects = formula::effect_alternatives_of(
+            let effects = bounded_effect_alternatives(
                 action.effects.as_ref(),
                 &action_bindings,
                 universe,
@@ -223,7 +249,7 @@ fn summary_operators(
             continue;
         }
 
-        let method_clauses = formula::precondition_clauses(
+        let method_clauses = bounded_precondition_clauses(
             method.precondition.as_ref(),
             &instance.bindings,
             universe,
@@ -335,7 +361,7 @@ pub(super) fn build_leaf_task(
         if !actions.is_empty() {
             for action in actions {
                 let bindings = bindings_from(&action.parameters, &task.terms);
-                let clauses = formula::precondition_clauses(
+                let clauses = bounded_precondition_clauses(
                     action.preconditions.as_ref(),
                     &bindings,
                     &universe,
@@ -345,7 +371,7 @@ pub(super) fn build_leaf_task(
                     // The precondition is unsatisfiable: the action can never run.
                     continue;
                 }
-                let alternatives = formula::effect_alternatives_of(
+                let alternatives = bounded_effect_alternatives(
                     action.effects.as_ref(),
                     &bindings,
                     &universe,
@@ -460,7 +486,7 @@ pub(super) fn build_leaf_task(
                         continue;
                     }
                     let bindings = bindings_from(&method.task_terms, &task.terms);
-                    let clauses = formula::precondition_clauses(
+                    let clauses = bounded_precondition_clauses(
                         method.precondition.as_ref(),
                         &bindings,
                         &universe,

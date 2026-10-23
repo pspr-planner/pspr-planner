@@ -100,6 +100,14 @@ With `--hierarchical`, the same problem prints the complete primitive plan:
 summaries enabled (C+G). `--summary` without `--hierarchical` enables
 primitive method-effect summaries for the abstract solver.
 
+Two flags relate to the abstraction gap. `--liftability` prints the top-level
+task pairs whose subtask effects establish or destroy a literal that a later
+method or action precondition reads. `--repair-orderings` inserts the implied
+orderings into the task network before planning, so the abstract plan runs the
+producer before the consumer and refinement can thread the atom through. The
+hierarchical path also retries with the repair automatically when the first
+attempt fails and the analysis finds such an edge.
+
 ### Neural merge warm start (optional)
 
 The `neural` feature builds the Design 1 heterogeneous GAT that predicts the

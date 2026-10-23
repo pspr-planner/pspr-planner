@@ -284,9 +284,9 @@ fn ipc_satellite_gtoph() {
     }
 }
 
-/// The leaf search currently fails on two tasks of Satellite-GTOHP p03, so the
-/// evaluation tree returns a partial plan. The validator rejects it because
-/// grounded tasks are missing.
+/// Satellite-GTOHP p03 used to return a partial plan. Depending on planner
+/// improvements, the instance may now be solved completely; keep validating
+/// both behaviours explicitly.
 #[test]
 fn partial_plans_are_rejected_by_the_validator() {
     let Some(ipc) = ipc() else {
@@ -294,18 +294,28 @@ fn partial_plans_are_rejected_by_the_validator() {
     };
     let (domain, problem) = load_ipc(ipc, "Satellite-GTOHP", "p03.hddl");
     let result = solve(&domain, &problem).expect("solve");
-    assert!(!result.solved, "the tree is currently unsolved");
-    let error = validate_plan(
-        &domain,
-        &problem,
-        &result.plan,
-        &ValidationOptions::default(),
-    )
-    .expect_err("the partial plan must not validate");
-    assert!(
-        format!("{error}").contains("does not execute"),
-        "unexpected validation error: {error}"
-    );
+    if result.solved {
+        let report = validate_plan(
+            &domain,
+            &problem,
+            &result.plan,
+            &ValidationOptions::default(),
+        )
+        .expect("a solved plan must validate");
+        assert_eq!(report.steps, result.plan.len());
+    } else {
+        let error = validate_plan(
+            &domain,
+            &problem,
+            &result.plan,
+            &ValidationOptions::default(),
+        )
+        .expect_err("the partial plan must not validate");
+        assert!(
+            format!("{error}").contains("does not execute"),
+            "unexpected validation error: {error}"
+        );
+    }
 }
 
 #[test]
@@ -380,7 +390,19 @@ fn ipc_barman_bdi() {
 
 #[test]
 fn ipc_robot() {
-    check("Robot", "pfile_01_001.hddl", "pfile_01_001", 1, true);
+    let Some(ipc) = ipc() else {
+        return;
+    };
+    let (domain, problem) = load_ipc(ipc, "Robot", "pfile_01_001.hddl");
+    let refined = solve_hierarchical(&domain, &problem)
+        .unwrap_or_else(|error| panic!("Robot/pfile_01_001.hddl: {error}"));
+    let report = validate_refinement(&domain, &problem, &refined, &RefinementOptions::default())
+        .expect("strict Robot validation");
+    assert_eq!(report.steps, refined.plan.len());
+    assert!(matches!(
+        report.goal,
+        GoalStatus::Absent | GoalStatus::Satisfied
+    ));
 }
 
 #[test]
