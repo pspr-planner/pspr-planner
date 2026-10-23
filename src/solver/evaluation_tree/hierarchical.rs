@@ -23,8 +23,8 @@ use crate::solver::domain::Domain;
 use crate::solver::problem::Problem;
 
 use super::decomposition::{
-    AbstractPlanContext, DecompositionSession, MethodCandidate, MethodRankingContext,
-    MethodTrace, SearchContext, SearchTrace,
+    AbstractPlanContext, DecompositionSession, MethodCandidate, MethodRankingContext, MethodTrace,
+    SearchContext, SearchTrace,
 };
 use super::formula::{self, Universe};
 use super::graph::{TaskNode, ground_methods_bounded, ground_task_network_edges};
@@ -432,13 +432,8 @@ pub fn solve_hierarchical_with_session(
     );
     for attempt in 0..REFINEMENT_RETRY_ATTEMPTS {
         let retry = refined_retry_options(options, attempt);
-        let candidates = permutation_candidates(
-            &evaluation.plan,
-            &precedence,
-            attempt,
-            &retry,
-            session,
-        );
+        let candidates =
+            permutation_candidates(&evaluation.plan, &precedence, attempt, &retry, session);
         for plan in candidates {
             match refine_plan_with_session(domain, problem, &plan, &retry, session) {
                 Ok(candidate) => {
@@ -521,7 +516,11 @@ fn abstract_plan_precedence(
     precedence
 }
 
-fn valid_plan_permutation(order: &[usize], step_count: usize, precedence: &[(usize, usize)]) -> bool {
+fn valid_plan_permutation(
+    order: &[usize],
+    step_count: usize,
+    precedence: &[(usize, usize)],
+) -> bool {
     if order.len() != step_count {
         return false;
     }

@@ -105,6 +105,7 @@ fn main() {
     let mut session = DecompositionSession {
         method_ranker: None,
         search_policy: None,
+        plan_permuter: None,
         trace: Some(&mut printer),
     };
     let refinement = refine_plan_with_session(

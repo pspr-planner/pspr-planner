@@ -249,7 +249,8 @@ fn main() -> Result<()> {
         bail!("no domain/problem pairs found");
     }
 
-    let (method_traces, search_traces, permutation_traces) = collect_traces(&args, &parser, &pairs)?;
+    let (method_traces, search_traces, permutation_traces) =
+        collect_traces(&args, &parser, &pairs)?;
     let examples = build_examples(
         args.task,
         &method_traces,
@@ -269,17 +270,15 @@ fn main() -> Result<()> {
             }
         );
     }
-    // The examples themselves were consumed while the tensors were prepared;
-    // the per-head counts are taken from the prepared set.
-    let method_count = prepared
+    let method_count = examples
         .iter()
         .filter(|example| example.task() == TrainTask::Method)
         .count();
-    let policy_count = prepared
+    let policy_count = examples
         .iter()
         .filter(|example| example.task() == TrainTask::Policy)
         .count();
-    let permutation_count = prepared
+    let permutation_count = examples
         .iter()
         .filter(|example| example.task() == TrainTask::Permutation)
         .count();
@@ -307,9 +306,7 @@ fn main() -> Result<()> {
             GuidanceKind::Method
         }
         TrainTask::All if method_count == 0 || policy_count == 0 || permutation_count == 0 => {
-            bail!(
-                "--task all requires usable traces for method, policy, and permutation heads"
-            )
+            bail!("--task all requires usable traces for method, policy, and permutation heads")
         }
         TrainTask::Method => GuidanceKind::Method,
         TrainTask::Policy => GuidanceKind::Policy,
@@ -608,9 +605,7 @@ fn permutation_trace(
         if let Ok(refinement) = refinement {
             successful += 1;
             let cost = refinement.plan.len();
-            let replace = best
-                .as_ref()
-                .is_none_or(|(_, best_cost)| cost < *best_cost);
+            let replace = best.as_ref().is_none_or(|(_, best_cost)| cost < *best_cost);
             if replace {
                 best = Some((order, cost));
             }
@@ -787,8 +782,9 @@ fn build_examples(
 
     // Alternate the two heads so that a `--task both` run sees both losses
     // interleaved instead of training one head for the whole first half.
-    let mut examples =
-        Vec::with_capacity(method_examples.len() + policy_examples.len() + permutation_examples.len());
+    let mut examples = Vec::with_capacity(
+        method_examples.len() + policy_examples.len() + permutation_examples.len(),
+    );
     let mut methods = method_examples.into_iter();
     let mut policies = policy_examples.into_iter();
     let mut permutations = permutation_examples.into_iter();
@@ -1232,15 +1228,17 @@ fn train(
         .save_file(&args.output)
         .with_context(|| format!("cannot save {}", args.output.display()))?;
     let metadata = args.output.with_extension("json");
-    let method_count = examples
+    // The examples were consumed while the tensors were prepared, so the
+    // per-head counts come from the prepared set.
+    let method_count = prepared
         .iter()
         .filter(|example| example.task() == TrainTask::Method)
         .count();
-    let policy_count = examples
+    let policy_count = prepared
         .iter()
         .filter(|example| example.task() == TrainTask::Policy)
         .count();
-    let permutation_count = examples
+    let permutation_count = prepared
         .iter()
         .filter(|example| example.task() == TrainTask::Permutation)
         .count();
@@ -1295,7 +1293,9 @@ fn prepare_example(example: &Example, device: &Device) -> Option<PreparedExample
             })
         }
         Example::Permutation(example) => {
-            if example.graph.plan_indices.len() < 2 || example.target.len() != example.graph.plan_indices.len() {
+            if example.graph.plan_indices.len() < 2
+                || example.target.len() != example.graph.plan_indices.len()
+            {
                 return None;
             }
             Some(PreparedExample {
