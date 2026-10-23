@@ -2,13 +2,17 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use anyhow::{Result, bail, ensure};
 
 use super::super::graph::ConstraintNode;
 use super::adam::{Adam, AdamOptions};
 use super::penalty::{PenaltySpace, logistic, smooth_max, softplus};
-use super::{MergeOutcome, MergeProblem, MergeSolver, PartialSolution, PenaltyReport};
+use super::{
+    MergeInitialization, MergeInitializer, MergeOutcome, MergeProblem, MergeSolver,
+    PartialSolution, PenaltyReport,
+};
 
 /// The constraint-partitioning merger of SGPlan (Hsu et al., *Constraint
 /// partitioning in penalty formulations for solving temporal planning
@@ -62,11 +66,14 @@ pub struct SgplanMerger {
     pub spaces: Vec<PenaltySpace>,
     /// Diagnostics of the most recent merge.
     pub report: Option<PenaltyReport>,
+    /// Optional learned warm start.
+    initializer: Option<Arc<dyn MergeInitializer>>,
 }
 
 impl Default for SgplanMerger {
     fn default() -> Self {
-        SgplanMerger {
+        #[cfg_attr(not(feature = "neural"), allow(unused_mut))]
+        let mut merger = SgplanMerger {
             penalty_weight: 1.0,
             min_penalty: 1e-3,
             max_penalty: 1e9,
@@ -85,7 +92,37 @@ impl Default for SgplanMerger {
                 PenaltySpace::Exponential,
             ],
             report: None,
+            initializer: None,
+        };
+        #[cfg(feature = "neural")]
+        if let Some(path) = std::env::var_os("PSPR_MERGE_MODEL") {
+            let path = std::path::PathBuf::from(path);
+            match super::neural::NeuralMergeInitializer::from_path(&path) {
+                Ok(initializer) => {
+                    merger.initializer = Some(Arc::new(initializer));
+                }
+                Err(error) => {
+                    eprintln!("ignoring PSPR_MERGE_MODEL={}: {error:#}", path.display());
+                }
+            }
         }
+        merger
+    }
+}
+
+impl SgplanMerger {
+    /// Attach a learned initializer. The sequential start remains the fallback
+    /// whenever the initializer declines or returns an invalid vector.
+    pub fn with_initializer(mut self, initializer: Arc<dyn MergeInitializer>) -> Self {
+        self.initializer = Some(initializer);
+        self
+    }
+
+    /// Disable any learned initializer, for example for the teacher run that
+    /// produces training targets.
+    pub fn without_initializer(mut self) -> Self {
+        self.initializer = None;
+        self
     }
 }
 
@@ -342,7 +379,11 @@ struct Optimization {
 
 impl SgplanMerger {
     /// Run the multi-space, adaptively weighted Adam iteration.
-    fn optimize(&self, problem: &RelaxedProblem<'_>) -> Optimization {
+    fn optimize(
+        &self,
+        problem: &RelaxedProblem<'_>,
+        initialization: Option<MergeInitialization>,
+    ) -> Optimization {
         let spaces: Vec<PenaltySpace> = if self.spaces.is_empty() {
             vec![PenaltySpace::Linear]
         } else {
@@ -350,18 +391,37 @@ impl SgplanMerger {
         };
         let mut parameters = problem.initial_parameters();
         let mut weights = vec![self.penalty_weight; problem.constraints.len()];
+        let mut preferred_space = None;
+        if let Some(initialization) = initialization
+            && initialization.positions.len() == parameters.len()
+            && initialization.weights.len() == weights.len()
+            && initialization
+                .positions
+                .iter()
+                .all(|value| value.is_finite())
+            && initialization
+                .weights
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+        {
+            parameters = initialization.positions;
+            weights = initialization.weights;
+            preferred_space = initialization.space;
+        }
         let initial: f64 = problem.exact_violations(&parameters).iter().sum();
         if !problem.has_orderings() || self.iterations == 0 || initial <= self.tolerance {
             return Optimization {
                 parameters,
                 rounds: 0,
-                space: spaces[0],
+                space: preferred_space.unwrap_or(spaces[0]),
                 weights,
             };
         }
 
         let mut adam = Adam::new(problem.children.len());
-        let mut space_index = 0usize;
+        let mut space_index = preferred_space
+            .and_then(|space| spaces.iter().position(|candidate| *candidate == space))
+            .unwrap_or(0);
         let mut previous: Option<f64> = None;
         let mut best: Option<(f64, f64, Vec<f64>)> = None;
         let mut rounds = 0;
@@ -432,8 +492,26 @@ impl SgplanMerger {
     }
 }
 
-impl MergeSolver for SgplanMerger {
-    fn merge(&mut self, problem: &MergeProblem) -> Result<MergeOutcome> {
+impl SgplanMerger {
+    /// Return the parameters reached by the current optimizer from the
+    /// sequential start. Used as the teacher target for training a learned
+    /// initializer; it does not touch the configured initializer.
+    pub fn teacher_initialization(&self, problem: &MergeProblem) -> MergeInitialization {
+        let mut atoms = problem.initial_atoms.clone();
+        for child in &problem.children {
+            atoms.extend(child.final_atoms.iter().cloned());
+            atoms.extend(child.achieved.iter().cloned());
+        }
+        let relaxed = RelaxedProblem::new(problem, &atoms);
+        let optimization = self.clone().without_initializer().optimize(&relaxed, None);
+        MergeInitialization {
+            positions: optimization.parameters,
+            weights: optimization.weights,
+            space: Some(optimization.space),
+        }
+    }
+
+    fn merge_inner(&mut self, problem: &MergeProblem) -> Result<MergeOutcome> {
         for child in &problem.children {
             ensure!(
                 child.plan.len() == child.plan_tasks.len(),
@@ -449,7 +527,11 @@ impl MergeSolver for SgplanMerger {
             atoms.extend(child.achieved.iter().cloned());
         }
         let relaxed = RelaxedProblem::new(problem, &atoms);
-        let optimization = self.optimize(&relaxed);
+        let initialization = self
+            .initializer
+            .as_ref()
+            .and_then(|initializer| initializer.initialize(problem));
+        let optimization = self.optimize(&relaxed, initialization);
         let (plan, plan_tasks) = relaxed.decode(&optimization.parameters);
         let violations = relaxed.validate(problem, &plan_tasks);
         let feasible = violations
@@ -521,5 +603,11 @@ impl MergeSolver for SgplanMerger {
             final_atoms: atoms,
             solved: problem.children.iter().all(|child| child.solved),
         })
+    }
+}
+
+impl MergeSolver for SgplanMerger {
+    fn merge(&mut self, problem: &MergeProblem) -> Result<MergeOutcome> {
+        self.merge_inner(problem)
     }
 }

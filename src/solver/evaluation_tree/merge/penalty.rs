@@ -14,7 +14,7 @@ pub enum PenaltySpace {
     /// `phi(v) = v`.
     #[default]
     Linear,
-    /// `phi(v) = v^2`.
+    /// `phi(v) = v^2 + v`.
     Quadratic,
     /// `phi(v) = (exp(4 v) - 1) / 4`.
     Exponential,

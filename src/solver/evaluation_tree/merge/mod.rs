@@ -99,12 +99,37 @@ use std::collections::BTreeSet;
 use super::graph::ConstraintNode;
 
 mod adam;
+#[cfg(feature = "neural")]
+mod neural;
 mod penalty;
 mod sgplan;
 
 pub use adam::AdamOptions;
+#[cfg(feature = "neural")]
+pub use neural::{
+    DEFAULT_HEADS, DEFAULT_HIDDEN, FEATURE_DIM, GatModel, MergeGraph, NeuralMergeInitializer,
+    TrainingSample,
+};
 pub use penalty::PenaltySpace;
 pub use sgplan::SgplanMerger;
+
+/// A learned or heuristic warm start for the relaxed merge problem.
+#[derive(Debug, Clone, Default)]
+pub struct MergeInitialization {
+    /// One normalized start position per child, in `[0, 1]`.
+    pub positions: Vec<f64>,
+    /// One positive penalty weight per shared constraint.
+    pub weights: Vec<f64>,
+    /// Optional first penalty space to try.
+    pub space: Option<PenaltySpace>,
+}
+
+/// A predictor of merge-solver parameters.
+pub trait MergeInitializer: std::fmt::Debug + Send + Sync {
+    /// Return a warm start for `problem`, or `None` to use the sequential
+    /// initialization.
+    fn initialize(&self, problem: &MergeProblem) -> Option<MergeInitialization>;
+}
 
 /// A solution of a leaf or of a merge node.
 #[derive(Debug, Clone)]
@@ -271,11 +296,9 @@ mod tests {
 
     #[test]
     fn weights_grow_and_spaces_escalate_when_a_round_stalls() {
-        let mut merger = SgplanMerger {
-            adam_steps: 1,
-            iterations: 3,
-            ..SgplanMerger::default()
-        };
+        let mut merger = SgplanMerger::default().without_initializer();
+        merger.adam_steps = 1;
+        merger.iterations = 3;
         merger.adam.learning_rate = 1e-12;
         let problem = problem(
             vec![ordering(0, 1)],

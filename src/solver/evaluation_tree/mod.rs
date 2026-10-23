@@ -101,8 +101,13 @@ pub use hierarchical::{
     validate_refinement,
 };
 pub use merge::{
-    AdamOptions, MergeOutcome, MergeProblem, MergeRecord, MergeSolver, PartialSolution,
-    PenaltyReport, PenaltySpace, SgplanMerger,
+    AdamOptions, MergeInitialization, MergeInitializer, MergeOutcome, MergeProblem, MergeRecord,
+    MergeSolver, PartialSolution, PenaltyReport, PenaltySpace, SgplanMerger,
+};
+#[cfg(feature = "neural")]
+pub use merge::{
+    DEFAULT_HEADS, DEFAULT_HIDDEN, FEATURE_DIM, GatModel, MergeGraph, NeuralMergeInitializer,
+    TrainingSample,
 };
 pub use verify::{GoalStatus, ValidationOptions, ValidationReport, validate_plan};
 

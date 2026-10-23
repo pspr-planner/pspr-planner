@@ -6,6 +6,11 @@ description = "HDDL domain/problem loader and solver scaffold"
 license = "AGPL-3.0-or-later"
 readme = "README.md"
 
+[features]
+default = []
+neural = ["dep:burn", "dep:rayon"]
+neural-gpu = ["neural", "burn/wgpu"]
+
 [lib]
 name = "pspr"
 path = "src/lib.rs"
@@ -14,11 +19,18 @@ path = "src/lib.rs"
 name = "pspr"
 path = "src/main.rs"
 
+[[bin]]
+name = "train_merge_initializer"
+path = "src/bin/train_merge_initializer.rs"
+required-features = ["neural"]
+
 [dependencies]
 anyhow = "1.0.104"
+burn = { version = "0.22.1", optional = true, default-features = false, features = ["std", "ndarray", "autodiff", "optim", "store", "safetensors"] }
 clap = { version = "4", features = ["derive"] }
 good_lp = { version = "1.15.3", default-features = false, features = ["scip", "scip_bundled"] }
 nalgebra = "0.35.0"
+rayon = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

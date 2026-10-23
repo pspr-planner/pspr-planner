@@ -18,6 +18,11 @@
 %                                   arthur2007kmeanspp, hakimi1965optimum
 %   Numerical optimization ....... kingma2015adam, achterberg2009scip,
 %                                   hojny2025scipsuite
+%   Graph neural networks ........ kipf2017gcn, velickovic2018gat,
+%                                   hamilton2017graphsage, schlichtkrull2018rgcn,
+%                                   xu2019gin, cuturi2013sinkhorn
+%   Differentiable optimization .. elmachtoub2022spoplus, donti2017dc3,
+%                                   agrawal2019differentiable
 %   Algorithms/utilities ......... tarjan1972depth, steele2014splitmix
 %   Software and data ............ yousefi2025hddlparser, sleath2023detecting,
 %                                   holler2021panda, behnke2020grounding,
@@ -508,4 +513,261 @@
                   checkout at ../hddl/test_data/ipc. That checkout also
                   contains older HTN domains; cite the suite when reporting
                   IPC results.}
+}
+
+% --------------------------------------------------------------------------
+% Graph neural networks and differentiable optimization
+% --------------------------------------------------------------------------
+
+@inproceedings{kipf2017gcn,
+  author    = {Kipf, Thomas N. and Welling, Max},
+  title     = {Semi-Supervised Classification with Graph Convolutional
+               Networks},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2017},
+  eprint    = {1609.02907},
+  archivePrefix = {arXiv},
+  annote    = {The normalized graph-convolution baseline used by the
+               constraint-centric merge initializer
+               (docs/neural-merge-initialization/02-constraint-gcn-layout.md).
+               Cite when describing the GCN backbone and its spectral
+               motivation.}
+}
+
+@inproceedings{velickovic2018gat,
+  author    = {Veli{\v{c}}kovi{\'c}, Petar and Cucurull, Guillem and
+               Casanova, Arantxa and Romero, Adriana and Li{\`o}, Pietro and
+               Bengio, Yoshua},
+  title     = {Graph Attention Networks},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2018},
+  eprint    = {1710.10903},
+  archivePrefix = {arXiv},
+  annote    = {The multi-head attention aggregation behind the heterogeneous
+               GAT warm start
+               (docs/neural-merge-initialization/01-heterogeneous-gat-warm-start.md)
+               and the plan-step GAT
+               (docs/neural-merge-initialization/03-plan-step-gat-unrolled-adam.md).
+               Cite for the attention equation and edge masking.}
+}
+
+@inproceedings{hamilton2017graphsage,
+  author    = {Hamilton, William L. and Ying, Rex and Leskovec, Jure},
+  title     = {Inductive Representation Learning on Large Graphs},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2017},
+  eprint    = {1706.02216},
+  archivePrefix = {arXiv},
+  annote    = {Inductive neighbor aggregation and fixed-size sampling. Cite
+               for the GraphSAGE baseline and for the step-level sampling
+               strategy in the plan-step GAT design.}
+}
+
+@inproceedings{schlichtkrull2018rgcn,
+  author    = {Schlichtkrull, Michael and Kipf, Thomas N. and Bloem, Peter
+               and van den Berg, Rianne and Titov, Ivan and Welling, Max},
+  title     = {Modeling Relational Data with Graph Convolutional Networks},
+  booktitle = {European Semantic Web Conference (ESWC)},
+  pages     = {593--607},
+  year      = {2018},
+  eprint    = {1703.06103},
+  archivePrefix = {arXiv},
+  annote    = {Relational/typed graph convolution. Cite for the typed
+               child/constraint/step edges used by the merge graph
+               initializers and for the R-GCN baseline.}
+}
+
+@inproceedings{xu2019gin,
+  author    = {Xu, Keyulu and Hu, Weihua and Leskovec, Jure and Jegelka,
+               Stefanie},
+  title     = {How Powerful are Graph Neural Networks?},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2019},
+  eprint    = {1810.00826},
+  archivePrefix = {arXiv},
+  annote    = {Expressiveness limits of message-passing GNNs. Cite when
+               justifying the typed/relational aggregation and the
+               expressiveness ablation in the merge-initializer designs.}
+}
+
+@article{cuturi2013sinkhorn,
+  author    = {Cuturi, Marco},
+  title     = {Sinkhorn Distances: Lightspeed Computation of Optimal
+               Transport},
+  journal   = {Advances in Neural Information Processing Systems (NeurIPS)},
+  volume    = {26},
+  year      = {2013},
+  annote    = {Sinkhorn normalization of a soft permutation matrix. Cite for
+               the differentiable layout layer in the constraint-GCN design;
+               the algorithm supplies the doubly stochastic approximation,
+               not the merge objective itself.}
+}
+
+@article{elmachtoub2022spoplus,
+  author    = {Elmachtoub, Adam N. and Grigas, Paul},
+  title     = {Smart ``Predict, then Optimize''},
+  journal   = {Management Science},
+  volume    = {68},
+  number    = {1},
+  pages     = {9--26},
+  year      = {2022},
+  doi       = {10.1287/mnsc.2020.3922},
+  annote    = {Predict-then-optimize training with a decision-aware loss.
+               Cite for the principle that the GNN should be trained on the
+               post-Adam merge outcome rather than only on imitation labels.}
+}
+
+@inproceedings{donti2017dc3,
+  author    = {Donti, Priya L. and Amos, Brandon and Kolter, J. Zico},
+  title     = {Task-based End-to-end Model Learning in Stochastic
+               Optimization},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2017},
+  eprint    = {1703.04529},
+  archivePrefix = {arXiv},
+  annote    = {The DC3 method for end-to-end training through a differentiable
+               optimizer. Cite for the unrolled Adam training path in the
+               merge-initializer designs.}
+}
+
+@inproceedings{agrawal2019differentiable,
+  author    = {Agrawal, Akshay and Amos, Brandon and Barratt, Shane and
+               Boyd, Stephen and Diamond, Steven and Kolter, J. Zico},
+  title     = {Differentiable Convex Optimization Layers},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2019},
+  eprint    = {1910.12430},
+  archivePrefix = {arXiv},
+  annote    = {Differentiation through convex optimization layers. Cite as the
+               alternative to truncated BPTT for a future implicit-gradient
+               version of the merge initializer.}
+}
+
+@article{silver2018alphazero,
+  author    = {Silver, David and Hubert, Thomas and Schrittwieser, Julian and
+               Antonoglou, Ioannis and Lai, Matthew and Guez, Arthur and
+               Lanctot, Marc and Sifre, Laurent and Kumaran, Dharshan and
+               Graepel, Thore and Lillicrap, Timothy and Simonyan, Karen and
+               Hassabis, Demis},
+  title     = {A General Reinforcement Learning Algorithm that Masters Chess,
+               Shogi, and Go through Self-Play},
+  journal   = {Science},
+  volume    = {362},
+  number    = {6419},
+  pages     = {1140--1144},
+  year      = {2018},
+  doi       = {10.1126/science.aar6404},
+  annote    = {AlphaZero-style policy/value search. Cite for the bounded
+               policy-guided search and visit-distribution training in
+               docs/neural-decomposition/02-frontier-gnn-policy-value.md. It
+               supplies the search-control pattern, not a planning-specific
+               correctness argument.}
+}
+
+@article{sutton1999options,
+  author    = {Sutton, Richard S. and Precup, Doina and Singh, Satinder},
+  title     = {Between {MDPs} and Semi-{MDPs}: A Framework for Temporal
+               Abstraction in Reinforcement Learning},
+  journal   = {Artificial Intelligence},
+  volume    = {112},
+  number    = {1--2},
+  pages     = {181--211},
+  year      = {1999},
+  doi       = {10.1016/S0004-3702(99)00052-1},
+  annote    = {Temporal abstraction and options. Cite as background for
+               hierarchical policy/value methods and for the distinction
+               between primitive and compound-task decisions in the neural
+               decomposition design note.}
+}
+
+@article{dietterich2000maxq,
+  author    = {Dietterich, Thomas G.},
+  title     = {Hierarchical Reinforcement Learning with the {MAXQ} Value
+               Function Decomposition},
+  journal   = {Journal of Artificial Intelligence Research},
+  volume    = {13},
+  pages     = {227--303},
+  year      = {2000},
+  doi       = {10.1613/jair.639},
+  annote    = {Hierarchical value decomposition. Cite for the value-head
+               design and the composition of subtask values in
+               docs/neural-decomposition/02-frontier-gnn-policy-value.md.}
+}
+
+@misc{kambhampati2024llmmodulo,
+  author    = {Kambhampati, Subbarao and Valmeekam, Karthik and Guan, Lin and
+               Verma, Mudit and Stechly, Kaya and Bhambri, Siddhant and
+               Saldyt, Lucas and Murthy, Anil},
+  title     = {{LLMs} Can't Plan, But Can Help Planning in {LLM-Modulo}
+               Frameworks},
+  year      = {2024},
+  eprint    = {2402.01817},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.AI},
+  annote    = {The generate-and-verify pattern with an external symbolic
+               verifier. Cite for the proposal-plus-verifier alternative to
+               the learned ranker/policy, and for the requirement that the
+               symbolic planner remains authoritative.}
+}
+
+@misc{liu2023llmp,
+  author    = {Liu, Bo and Jiang, Yuqian and Zhang, Xiaohan and Liu, Qiang and
+               Zhang, Shiqi and Biswas, Joydeep and Stone, Peter},
+  title     = {{LLM+P}: Empowering Large Language Models with Optimal Planning
+               Proficiency},
+  year      = {2023},
+  eprint    = {2304.11477},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.AI},
+  annote    = {Language-to-symbolic-planning translation followed by a
+               classical planner. Cite as the closest LLM-plus-solver pattern
+               and as a non-HTN baseline, not as an HTN decomposition method.}
+}
+
+@inproceedings{ahn2022saycan,
+  author    = {Ahn, Michael and Brohan, Anthony and Brown, Noah and Chebotar,
+               Yevgen and Cortes, Omar and David, Byron and Finn, Chelsea and
+               Fu, Chuyuan and Gopalakrishnan, Keerthana and Hausman, Karol and
+               others},
+  title     = {Do As {I} Can, Not As {I} Say: Grounding Language in Robotic
+               Affordances},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  year      = {2022},
+  eprint    = {2204.01691},
+  archivePrefix = {arXiv},
+  annote    = {Neural language scores skills while an affordance/value model
+               filters them. Cite as an adjacent hierarchical proposal-plus-
+               feasibility pattern, not as an HTN planner.}
+}
+
+@inproceedings{manhaeve2018deepproblog,
+  author    = {Manhaeve, Robin and Dumancic, Sebastijan and Kimmig, Angelika
+               and Demeester, Thomas and De Raedt, Luc},
+  title     = {{DeepProbLog}: Neural Probabilistic Logic Programming},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2018},
+  eprint    = {1805.10872},
+  archivePrefix = {arXiv},
+  annote    = {Neural predicates inside a logic program. Cite as a
+               neurosymbolic alternative for probabilistic or differentiable
+               rule-based decomposition; the current design keeps method
+               choice discrete and verifies it symbolically.}
+}
+
+@inproceedings{ellis2021dreamcoder,
+  author    = {Ellis, Kevin and Wong, Catherine and Nye, Maxwell and
+               Sabl{\'e}-Meyer, Mathias and Morales, Lucas and Hewitt, Luke
+               and Cary, Luc and Solar-Lezama, Armando and Tenenbaum, Joshua
+               B.},
+  title     = {{DreamCoder}: Bootstrapping Inductive Program Synthesis with
+               Wake-Sleep Library Learning},
+  booktitle = {ACM SIGPLAN Conference on Programming Language Design and
+               Implementation (PLDI)},
+  pages     = {835--850},
+  year      = {2021},
+  doi       = {10.1145/3453483.3454080},
+  annote    = {Library learning and abstraction discovery. Cite as the
+               method-induction direction: neural guidance proposes reusable
+               abstractions while a symbolic system checks and compresses
+               them. It is not an HTN planner by itself.}
 }

@@ -100,6 +100,44 @@ With `--hierarchical`, the same problem prints the complete primitive plan:
 summaries enabled (C+G). `--summary` without `--hierarchical` enables
 primitive method-effect summaries for the abstract solver.
 
+### Neural merge warm start (optional)
+
+The `neural` feature builds the Design 1 heterogeneous GAT that predicts the
+start positions and penalty weights of the SGPlan merger. It is off by default,
+so the sequential initialization remains the default and has no Burn
+dependency. The `neural-gpu` feature adds Burn's `wgpu` backend and makes the
+training binary run on the GPU:
+
+```bash
+# Collect teacher labels, train on the GPU, and write the model plus metadata.
+cargo run --features neural-gpu --bin train_merge_initializer -- \
+  --ipc-dir ../hddl/test_data/ipc \
+  --epochs 40 --output target/merge-initializer.burnpack
+
+# Use the trained model during planning (also on the GPU).
+PSPR_MERGE_MODEL=target/merge-initializer.burnpack \
+  cargo run --features neural-gpu -- --hierarchical domain.hddl p01.hddl
+```
+
+Use `--features neural` instead for the CPU-only training path. The training
+binary prints the selected device before starting.
+
+`train_merge_initializer` supports `--domain`/`--problem` for a single pair,
+`--max-samples`, `--max-groundings`, `--batch-size`, `--hidden`, and
+`--learning-rate`. The CPU path uses Rayon to evaluate each mini-batch in
+parallel and averages the per-sample gradients before one optimizer step;
+`--batch-size` controls the mini-batch size and `RAYON_NUM_THREADS` controls
+the worker count. The GPU path ignores `--batch-size` and keeps one optimizer
+step per sample.
+Its `--max-groundings` default is `32768`, rather than the planner's smaller
+default, because the larger IPC Assembly instances need roughly 28k method
+groundings for one compound task; pass a smaller value for faster collection.
+Training prints one progress line per step with overall progress, current
+epoch and sample, current loss, elapsed time, and an ETA based on the average
+observed step time. Epoch summaries and a final best-loss summary follow.
+Predictions are validated for shape and finiteness; the merger falls back to
+the sequential start and still runs the exact validator.
+
 ## Layout
 
 | Module | Role |
@@ -120,7 +158,9 @@ primitive method-effect summaries for the abstract solver.
 | `src/solver/partition/agglomeration/` | Gilpin et al. merge-level ILP and evaluation scheduling |
 | `src/solver/partition/bisbm/` | Spectral clustering of bipartite task/constraint graphs |
 | `src/main.rs` | CLI pipeline |
-| `examples/bench_modes.rs` | Machine-readable benchmark for the four compound-task modes |
+| `src/bin/train_merge_initializer.rs` | Offline Burn training for the neural merge warm start |
+| `src/solver/evaluation_tree/merge/neural.rs` | Design 1 graph features, GAT, and inference initializer |
+| `examples/bench_modes.rs` | Machine-readable benchmark for the three compound-task modes |
 | `scripts/compare_decomposition.sh` | PSPR-versus-pandaPI benchmark harness |
 
 ## Formula support
@@ -340,6 +380,17 @@ the script's median-of-three PSPR timings are stable to a few milliseconds.
 The two 30-second Minecraft and Monroe timeouts per refinement mode dominate
 the means and totals, so use the medians when comparing typical behaviour.
 
+## Design notes
+
+- [Neural initialization of the SGPlan merge solver](docs/neural-merge-initialization/README.md):
+  a longlist of ten GAT/GCN approaches, a scored selection of the top three,
+  and three design docs for learned warm starts of the merge solver followed by
+  Adam refinement.
+- [Neural guidance for compound-task decomposition](docs/neural-decomposition/README.md):
+  five method-ranking GAT designs and five search-policy/value designs, with
+  selected design docs for a state-conditioned relational method ranker and a
+  frontier GNN policy/value for partial-order refinement.
+
 ## References
 
 The bibliography for the algorithms, languages, tools and benchmark data used
@@ -347,6 +398,13 @@ by the planner is in [`docs/references.bib`](docs/references.bib). Each entry
 has an `annote` field with the places where it should be cited and any caveats
 (for example, the SGPlan paper covers the partitioning and penalty
 formulation, while the Adam-based relaxed merger is an extension of it). The
+neural merge-initialization design note adds `kipf2017gcn`,
+`velickovic2018gat`, `hamilton2017graphsage`, `schlichtkrull2018rgcn`,
+`xu2019gin`, `cuturi2013sinkhorn`, `elmachtoub2022spoplus`, `donti2017dc3`, and
+`agrawal2019differentiable`. The neural-decomposition design note adds
+`silver2018alphazero`, `sutton1999options`, `dietterich2000maxq`,
+`kambhampati2024llmmodulo`, `liu2023llmp`, `ahn2022saycan`,
+`manhaeve2018deepproblog`, and `ellis2021dreamcoder`. The
 PANDA comparison adds `holler2021panda` for the baseline planner and
 `behnke2020grounding` for its grounder. The compound-task design note adds
 `nau2003shop2`, `alford2009translating`, `behnke2019bringing`,
