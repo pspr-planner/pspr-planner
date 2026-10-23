@@ -7,9 +7,11 @@
 # one large terminal session.
 #
 # Usage:
+#   scripts/install_panda.sh      # once, to build the pandaPI toolchain
 #   scripts/run_ipc_vs_panda.sh
 #
 # Environment overrides:
+#   PANDA_ROOT              (default: /tmp/pandaPI; root used by install_panda.sh)
 #   IPC_DIR                 (default: ../hddl/test_data/ipc)
 #   HDDL_PARSER             (default: $HOME/.cargo/bin/hddl_analyzer)
 #   PSPR_BIN                (default: target/release/examples/bench_modes)
@@ -31,13 +33,14 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IPC_DIR=${IPC_DIR:-"$repo_root/../hddl/test_data/ipc"}
 HDDL_PARSER=${HDDL_PARSER:-"$HOME/.cargo/bin/hddl_analyzer"}
 PSPR_BIN=${PSPR_BIN:-"$repo_root/target/release/examples/bench_modes"}
+PANDA_ROOT=${PANDA_ROOT:-/tmp/pandaPI}
 
 PANDA_PARSER=${PANDA_PARSER:-$(command -v pandaPIparser || true)}
-PANDA_PARSER=${PANDA_PARSER:-/tmp/pandaPI/pandaPIparser/pandaPIparser}
+PANDA_PARSER=${PANDA_PARSER:-$PANDA_ROOT/pandaPIparser/pandaPIparser}
 PANDA_GROUNDER=${PANDA_GROUNDER:-$(command -v pandaPIgrounder || true)}
-PANDA_GROUNDER=${PANDA_GROUNDER:-/tmp/pandaPI/pandaPIgrounder/pandaPIgrounder}
+PANDA_GROUNDER=${PANDA_GROUNDER:-$PANDA_ROOT/pandaPIgrounder/pandaPIgrounder}
 PANDA_ENGINE=${PANDA_ENGINE:-$(command -v pandaPIengine || true)}
-PANDA_ENGINE=${PANDA_ENGINE:-/tmp/pandaPI/pandaPIengine/build/pandaPIengine}
+PANDA_ENGINE=${PANDA_ENGINE:-$PANDA_ROOT/pandaPIengine/build/pandaPIengine}
 
 PSPR_TIMEOUT=${PSPR_TIMEOUT:-120}
 PANDA_PARSE_TIMEOUT=${PANDA_PARSE_TIMEOUT:-120}
@@ -81,7 +84,11 @@ CASES=(
 for path in "$IPC_DIR" "$HDDL_PARSER" "$PANDA_PARSER" "$PANDA_GROUNDER" "$PANDA_ENGINE"; do
     if [[ ! -e $path ]]; then
         echo "missing: $path" >&2
-        echo "set IPC_DIR / HDDL_PARSER / PANDA_PARSER / PANDA_GROUNDER / PANDA_ENGINE" >&2
+        if [[ $path == "$PANDA_ROOT"* ]]; then
+            echo "run scripts/install_panda.sh (or set PANDA_PARSER / PANDA_GROUNDER / PANDA_ENGINE)" >&2
+        else
+            echo "set IPC_DIR / HDDL_PARSER" >&2
+        fi
         exit 2
     fi
 done

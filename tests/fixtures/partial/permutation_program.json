@@ -1,0 +1,167 @@
+{
+  "domain": {
+    "name": "PERMUTATION",
+    "requirements": [
+      "Hierarchy",
+      "MethodPreconditions"
+    ],
+    "types": null,
+    "constants": null,
+    "predicates": [
+      {
+        "name": "p",
+        "variables": []
+      },
+      {
+        "name": "q",
+        "variables": []
+      }
+    ],
+    "compound_tasks": [
+      {
+        "name": "first",
+        "parameters": []
+      },
+      {
+        "name": "second",
+        "parameters": []
+      }
+    ],
+    "methods": [
+      {
+        "name": {
+          "name": "m_first",
+          "symbol_type": null
+        },
+        "task": {
+          "name": "first",
+          "symbol_type": null
+        },
+        "task_terms": [],
+        "params": [],
+        "precondition": null,
+        "tn": {
+          "subtasks": [
+            {
+              "id": {
+                "name": "f0",
+                "symbol_type": null
+              },
+              "task": {
+                "name": "need-q",
+                "symbol_type": null
+              },
+              "terms": []
+            }
+          ],
+          "orderings": "Total",
+          "constraints": null
+        }
+      },
+      {
+        "name": {
+          "name": "m_second",
+          "symbol_type": null
+        },
+        "task": {
+          "name": "second",
+          "symbol_type": null
+        },
+        "task_terms": [],
+        "params": [],
+        "precondition": null,
+        "tn": {
+          "subtasks": [
+            {
+              "id": {
+                "name": "s0",
+                "symbol_type": null
+              },
+              "task": {
+                "name": "make-q",
+                "symbol_type": null
+              },
+              "terms": []
+            }
+          ],
+          "orderings": "Total",
+          "constraints": null
+        }
+      }
+    ],
+    "actions": [
+      {
+        "name": "need-q",
+        "parameters": [],
+        "preconditions": {
+          "Atom": {
+            "name": "q",
+            "variables": []
+          }
+        },
+        "effects": {
+          "Atom": {
+            "name": "p",
+            "variables": []
+          }
+        }
+      },
+      {
+        "name": "make-q",
+        "parameters": [],
+        "preconditions": null,
+        "effects": {
+          "Atom": {
+            "name": "q",
+            "variables": []
+          }
+        }
+      }
+    ],
+    "functions": []
+  },
+  "problem": {
+    "name": "perm-p01",
+    "domain_name": "PERMUTATION",
+    "requirements": [
+      "Hierarchy",
+      "MethodPreconditions"
+    ],
+    "init_tn": {
+      "parameters": null,
+      "tn": {
+        "subtasks": [
+          {
+            "id": {
+              "name": "t1",
+              "symbol_type": null
+            },
+            "task": {
+              "name": "first",
+              "symbol_type": null
+            },
+            "terms": []
+          },
+          {
+            "id": {
+              "name": "t2",
+              "symbol_type": null
+            },
+            "task": {
+              "name": "second",
+              "symbol_type": null
+            },
+            "terms": []
+          }
+        ],
+        "orderings": {
+          "Partial": []
+        },
+        "constraints": null
+      }
+    },
+    "init_state": [],
+    "goal": null,
+    "objects": []
+  }
+}

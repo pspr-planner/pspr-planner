@@ -2,11 +2,13 @@
 //!
 //! The binary collects method-ranking and frontier-search traces from the
 //! symbolic C+G pipeline, then trains the shared graph encoder with one of
-//! three objectives:
+//! five objectives:
 //!
 //! * `method`: listwise ranking of grounded method candidates;
 //! * `policy`: listwise ordering of ready tasks plus a value regression;
+//! * `permutation`: listwise ordering of abstract plan steps;
 //! * `both`: a single optimizer step stream containing both losses.
+//! * `all`: one optimizer stream covering method, policy, and permutation.
 //!
 //! The symbolic refiner remains authoritative. The trained model only
 //! reorders applicable methods and ready tasks.
@@ -27,10 +29,10 @@ use pspr::parsing::discovery::discover_sibling_problems;
 use pspr::parsing::parser::{ParserConfig, parse_program, resolve_parser_config};
 use pspr::solver::domain::{Domain, process_domain};
 use pspr::solver::evaluation_tree::{
-    DECOMPOSITION_FEATURE_DIM, DECOMPOSITION_HIDDEN, DecompositionGraph, DecompositionModel,
-    DecompositionSession, DecompositionTraceSink, EvaluationOptions, GraphTensors, GuidanceKind,
-    MethodSummary, MethodTrace, RefinementOptions, SearchTrace, SgplanMerger, evaluate,
-    refine_plan_with_session,
+    AbstractPlanContext, DECOMPOSITION_FEATURE_DIM, DECOMPOSITION_HIDDEN, DecompositionGraph,
+    DecompositionModel, DecompositionSession, DecompositionTraceSink, EvaluationOptions,
+    GraphTensors, GuidanceKind, MAX_GRAPH_NODES, MethodSummary, MethodTrace, RefinementOptions,
+    SearchTrace, SgplanMerger, evaluate, refine_plan_with_session,
 };
 use pspr::solver::problem::{Problem, load_problem};
 #[cfg(any(feature = "neural", feature = "neural-gpu"))]
@@ -42,8 +44,12 @@ enum TrainTask {
     Method,
     /// Train only the frontier policy and value heads.
     Policy,
-    /// Train both heads in one training stream.
+    /// Train only the abstract-plan permutation head.
+    Permutation,
+    /// Train method and frontier-policy heads in one training stream.
     Both,
+    /// Train method, frontier-policy, and permutation heads together.
+    All,
 }
 
 #[derive(Debug, Parser)]
@@ -73,8 +79,8 @@ struct Args {
     /// Adam learning rate.
     #[arg(long, default_value_t = 1.0e-3)]
     learning_rate: f64,
-    /// Maximum number of training decisions; `--task both` splits this
-    /// budget between the two heads.
+    /// Maximum number of training decisions; `--task both` and `--task all`
+    /// split this budget across enabled heads.
     #[arg(long, default_value_t = 4_096)]
     max_samples: usize,
     /// Number of Rayon worker threads for trace collection and example
@@ -112,9 +118,25 @@ struct PolicyExample {
 }
 
 #[derive(Debug)]
+struct PermutationExample {
+    graph: DecompositionGraph,
+    target: Vec<f32>,
+    value_target: f32,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct PermutationTrace {
+    context: AbstractPlanContext,
+    target_order: Vec<usize>,
+    confidence: f32,
+}
+
+#[derive(Debug)]
 enum Example {
     Method(MethodExample),
     Policy(PolicyExample),
+    Permutation(PermutationExample),
 }
 
 impl Example {
@@ -122,14 +144,34 @@ impl Example {
         match self {
             Example::Method(_) => TrainTask::Method,
             Example::Policy(_) => TrainTask::Policy,
+            Example::Permutation(_) => TrainTask::Permutation,
         }
     }
 }
 
-#[derive(Debug, Default)]
+/// Collects the decisions of one refinement run, up to a per-stream budget.
+///
+/// The refiner visits millions of dead ends on a hard instance; keeping every
+/// decision (each one clones the solver state) is what made the trainer grow to
+/// hundreds of gigabytes. Only `max_samples` decisions per head can ever become
+/// training examples, so the collector stops recording once it has that many.
+#[derive(Debug)]
 struct TraceCollector {
     methods: Vec<MethodTrace>,
     searches: Vec<SearchTrace>,
+    method_limit: usize,
+    search_limit: usize,
+}
+
+impl TraceCollector {
+    fn new(method_limit: usize, search_limit: usize) -> Self {
+        TraceCollector {
+            methods: Vec::new(),
+            searches: Vec::new(),
+            method_limit,
+            search_limit,
+        }
+    }
 }
 
 struct CollectedProblem {
@@ -173,11 +215,15 @@ impl PreparedExample {
 
 impl DecompositionTraceSink for TraceCollector {
     fn method_trace(&mut self, trace: MethodTrace) {
-        self.methods.push(trace);
+        if self.methods.len() < self.method_limit {
+            self.methods.push(trace);
+        }
     }
 
     fn search_trace(&mut self, trace: SearchTrace) {
-        self.searches.push(trace);
+        if self.searches.len() < self.search_limit {
+            self.searches.push(trace);
+        }
     }
 }
 
@@ -203,23 +249,40 @@ fn main() -> Result<()> {
         bail!("no domain/problem pairs found");
     }
 
-    let (method_traces, search_traces) = collect_traces(&args, &parser, &pairs)?;
-    let examples = build_examples(args.task, &method_traces, &search_traces, args.max_samples)?;
+    let (method_traces, search_traces, permutation_traces) = collect_traces(&args, &parser, &pairs)?;
+    let examples = build_examples(
+        args.task,
+        &method_traces,
+        &search_traces,
+        &permutation_traces,
+        args.max_samples,
+    )?;
     if examples.is_empty() {
         bail!(
             "no usable {} decision trace found",
             match args.task {
                 TrainTask::Method => "method-ranking",
                 TrainTask::Policy => "frontier-policy",
+                TrainTask::Permutation => "abstract-plan permutation",
                 TrainTask::Both => "decomposition",
+                TrainTask::All => "all decomposition policies",
             }
         );
     }
-    let method_count = examples
+    // The examples themselves were consumed while the tensors were prepared;
+    // the per-head counts are taken from the prepared set.
+    let method_count = prepared
         .iter()
         .filter(|example| example.task() == TrainTask::Method)
         .count();
-    let policy_count = examples.len() - method_count;
+    let policy_count = prepared
+        .iter()
+        .filter(|example| example.task() == TrainTask::Policy)
+        .count();
+    let permutation_count = prepared
+        .iter()
+        .filter(|example| example.task() == TrainTask::Permutation)
+        .count();
     let trained_kind = match args.task {
         TrainTask::Method if method_count == 0 => {
             bail!("no usable method-ranking trace was found")
@@ -228,6 +291,9 @@ fn main() -> Result<()> {
             bail!(
                 "no usable frontier-policy trace was found; the domains need an unordered method network"
             )
+        }
+        TrainTask::Permutation if permutation_count == 0 => {
+            bail!("no usable abstract-plan permutation trace was found")
         }
         TrainTask::Both if method_count == 0 && policy_count == 0 => {
             bail!("no usable decomposition decision trace found")
@@ -240,20 +306,28 @@ fn main() -> Result<()> {
             eprintln!("warning: no frontier-policy trace was found; training the method head only");
             GuidanceKind::Method
         }
+        TrainTask::All if method_count == 0 || policy_count == 0 || permutation_count == 0 => {
+            bail!(
+                "--task all requires usable traces for method, policy, and permutation heads"
+            )
+        }
         TrainTask::Method => GuidanceKind::Method,
         TrainTask::Policy => GuidanceKind::Policy,
+        TrainTask::Permutation => GuidanceKind::Permutation,
         TrainTask::Both => GuidanceKind::Both,
+        TrainTask::All => GuidanceKind::All,
     };
     println!(
-        "collected {} trace(s), {} training example(s) ({} method, {} policy) in {}",
-        method_traces.len() + search_traces.len(),
+        "collected {} trace(s), {} training example(s) ({} method, {} policy, {} permutation) in {}",
+        method_traces.len() + search_traces.len() + permutation_traces.len(),
         examples.len(),
         method_count,
         policy_count,
+        permutation_count,
         format_duration(run_started.elapsed().as_secs_f64())
     );
 
-    train(&args, &examples, trained_kind, run_started)?;
+    train(&args, examples, trained_kind, run_started)?;
     println!("wrote {}", args.output.display());
     Ok(())
 }
@@ -301,11 +375,26 @@ fn find_domains(root: &Path, domains: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Number of problems loaded, evaluated and refined together.
+///
+/// Every problem materialises its domain, its planning problem and its traces,
+/// so processing the corpus in bounded chunks keeps the peak independent of the
+/// number of instances instead of holding all of them at once.
+const COLLECTION_CHUNK: usize = 8;
+
+fn needs_method_traces(task: TrainTask) -> bool {
+    matches!(task, TrainTask::Method | TrainTask::Both | TrainTask::All)
+}
+
+fn needs_search_traces(task: TrainTask) -> bool {
+    matches!(task, TrainTask::Policy | TrainTask::Both | TrainTask::All)
+}
+
 fn collect_traces(
     args: &Args,
     parser: &ParserConfig,
     pairs: &[(PathBuf, PathBuf)],
-) -> Result<(Vec<MethodTrace>, Vec<SearchTrace>)> {
+) -> Result<(Vec<MethodTrace>, Vec<SearchTrace>, Vec<PermutationTrace>)> {
     let evaluation_options = EvaluationOptions {
         max_groundings: args.max_groundings,
         leaf_max_expansions: args.leaf_max_expansions,
@@ -318,118 +407,231 @@ fn collect_traces(
     };
     let mut failures: BTreeMap<String, (usize, PathBuf)> = BTreeMap::new();
 
-    // Parse and load inputs in parallel. This stage does not touch SCIP.
-    #[cfg(any(feature = "neural", feature = "neural-gpu"))]
-    let loaded: Vec<Result<LoadedProblem>> = pairs
-        .par_iter()
-        .map(|(domain_path, problem_path)| load_one(parser, domain_path, problem_path))
-        .collect();
-    #[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
-    let loaded: Vec<Result<LoadedProblem>> = pairs
-        .iter()
-        .map(|(domain_path, problem_path)| load_one(parser, domain_path, problem_path))
-        .collect();
-
-    // `russcip` creates one model per call and its own test suite exercises
-    // concurrent models. If a downstream SCIP build is not thread-safe, run
-    // with `--jobs 1`; the parallel iterator then degenerates to serial work.
-    #[cfg(any(feature = "neural", feature = "neural-gpu"))]
-    let evaluated_with_paths: Vec<(PathBuf, PathBuf, Result<EvaluatedProblem>)> = pairs
-        .par_iter()
-        .zip(loaded.into_par_iter())
-        .map(|((domain_path, problem_path), loaded)| {
-            let result = loaded.and_then(|loaded| {
-                let (domain, problem, plan) = evaluate_one(loaded, &evaluation_options)?;
-                Ok(EvaluatedProblem {
-                    domain_path: domain_path.clone(),
-                    problem_path: problem_path.clone(),
-                    domain,
-                    problem,
-                    plan,
-                })
-            });
-            (domain_path.clone(), problem_path.clone(), result)
-        })
-        .collect();
-    #[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
-    let evaluated_with_paths: Vec<(PathBuf, PathBuf, Result<EvaluatedProblem>)> = pairs
-        .iter()
-        .zip(loaded)
-        .map(|((domain_path, problem_path), loaded)| {
-            let result = loaded.and_then(|loaded| {
-                let (domain, problem, plan) = evaluate_one(loaded, &evaluation_options)?;
-                Ok(EvaluatedProblem {
-                    domain_path: domain_path.clone(),
-                    problem_path: problem_path.clone(),
-                    domain,
-                    problem,
-                    plan,
-                })
-            });
-            (domain_path.clone(), problem_path.clone(), result)
-        })
-        .collect();
-
-    let mut evaluated = Vec::new();
-    for (domain_path, problem_path, result) in evaluated_with_paths {
-        match result {
-            Ok(evaluated_problem) => evaluated.push(evaluated_problem),
-            Err(error) => {
-                let message = format!("{error:#}");
-                if args.verbose {
-                    eprintln!(
-                        "skipping {} + {}: {message}",
-                        domain_path.display(),
-                        problem_path.display()
-                    );
-                }
-                let entry = failures
-                    .entry(message)
-                    .or_insert_with(|| (0, problem_path.clone()));
-                entry.0 += 1;
-            }
-        }
-    }
-
-    #[cfg(any(feature = "neural", feature = "neural-gpu"))]
-    let results: Vec<CollectedProblem> = evaluated
-        .par_iter()
-        .map(|evaluated| refine_one(evaluated, &refinement_options))
-        .collect();
-    #[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
-    let results: Vec<CollectedProblem> = evaluated
-        .iter()
-        .map(|evaluated| refine_one(evaluated, &refinement_options))
-        .collect();
+    // At most `max_samples` decisions per head become training examples, so
+    // collecting more only costs memory.
+    let method_limit = if needs_method_traces(args.task) {
+        args.max_samples
+    } else {
+        0
+    };
+    let search_limit = if needs_search_traces(args.task) {
+        args.max_samples
+    } else {
+        0
+    };
+    let tracing = method_limit > 0 || search_limit > 0;
 
     let mut methods = Vec::new();
     let mut searches = Vec::new();
-    for (evaluated, mut collected) in evaluated.into_iter().zip(results) {
-        if args.verbose {
-            if let Some((actions, methods)) = collected.refined {
-                println!("  refined {actions} action(s), {methods} method(s)");
-            }
-            if let Some(error) = &collected.refinement_error {
-                eprintln!("  refinement ended early: {error}");
-            }
-            println!(
-                "{} + {}: {} method trace(s), {} frontier trace(s)",
-                evaluated.domain_path.display(),
-                evaluated.problem_path.display(),
-                collected.methods.len(),
-                collected.searches.len()
-            );
+    let mut permutations = Vec::new();
+    for chunk in pairs.chunks(COLLECTION_CHUNK) {
+        if methods.len() >= method_limit && searches.len() >= search_limit {
+            break;
         }
-        methods.append(&mut collected.methods);
-        searches.append(&mut collected.searches);
+        // Parse and load this chunk in parallel. This stage does not touch SCIP.
+        #[cfg(any(feature = "neural", feature = "neural-gpu"))]
+        let loaded: Vec<Result<LoadedProblem>> = chunk
+            .par_iter()
+            .map(|(domain_path, problem_path)| load_one(parser, domain_path, problem_path))
+            .collect();
+        #[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
+        let loaded: Vec<Result<LoadedProblem>> = chunk
+            .iter()
+            .map(|(domain_path, problem_path)| load_one(parser, domain_path, problem_path))
+            .collect();
+
+        // `russcip` creates one model per call and its own test suite exercises
+        // concurrent models. If a downstream SCIP build is not thread-safe, run
+        // with `--jobs 1`; the parallel iterator then degenerates to serial work.
+        #[cfg(any(feature = "neural", feature = "neural-gpu"))]
+        let evaluated_with_paths: Vec<(PathBuf, PathBuf, Result<EvaluatedProblem>)> = chunk
+            .par_iter()
+            .zip(loaded.into_par_iter())
+            .map(|((domain_path, problem_path), loaded)| {
+                let result = loaded.and_then(|loaded| {
+                    let (domain, problem, plan) = evaluate_one(loaded, &evaluation_options)?;
+                    Ok(EvaluatedProblem {
+                        domain_path: domain_path.clone(),
+                        problem_path: problem_path.clone(),
+                        domain,
+                        problem,
+                        plan,
+                    })
+                });
+                (domain_path.clone(), problem_path.clone(), result)
+            })
+            .collect();
+        #[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
+        let evaluated_with_paths: Vec<(PathBuf, PathBuf, Result<EvaluatedProblem>)> = chunk
+            .iter()
+            .zip(loaded)
+            .map(|((domain_path, problem_path), loaded)| {
+                let result = loaded.and_then(|loaded| {
+                    let (domain, problem, plan) = evaluate_one(loaded, &evaluation_options)?;
+                    Ok(EvaluatedProblem {
+                        domain_path: domain_path.clone(),
+                        problem_path: problem_path.clone(),
+                        domain,
+                        problem,
+                        plan,
+                    })
+                });
+                (domain_path.clone(), problem_path.clone(), result)
+            })
+            .collect();
+
+        let mut evaluated = Vec::new();
+        for (domain_path, problem_path, result) in evaluated_with_paths {
+            match result {
+                Ok(evaluated_problem) => evaluated.push(evaluated_problem),
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if args.verbose {
+                        eprintln!(
+                            "skipping {} + {}: {message}",
+                            domain_path.display(),
+                            problem_path.display()
+                        );
+                    }
+                    let entry = failures
+                        .entry(message)
+                        .or_insert_with(|| (0, problem_path.clone()));
+                    entry.0 += 1;
+                }
+            }
+        }
+
+        #[cfg(any(feature = "neural", feature = "neural-gpu"))]
+        let results: Vec<CollectedProblem> = evaluated
+            .par_iter()
+            .map(|evaluated| {
+                refine_one(
+                    evaluated,
+                    &refinement_options,
+                    method_limit,
+                    search_limit,
+                    tracing,
+                )
+            })
+            .collect();
+        #[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
+        let results: Vec<CollectedProblem> = evaluated
+            .iter()
+            .map(|evaluated| {
+                refine_one(
+                    evaluated,
+                    &refinement_options,
+                    method_limit,
+                    search_limit,
+                    tracing,
+                )
+            })
+            .collect();
+
+        for (evaluated, mut collected) in evaluated.into_iter().zip(results) {
+            if args.verbose {
+                if let Some((actions, methods)) = collected.refined {
+                    println!("  refined {actions} action(s), {methods} method(s)");
+                }
+                if let Some(error) = &collected.refinement_error {
+                    eprintln!("  refinement ended early: {error}");
+                }
+                println!(
+                    "{} + {}: {} method trace(s), {} frontier trace(s)",
+                    evaluated.domain_path.display(),
+                    evaluated.problem_path.display(),
+                    collected.methods.len(),
+                    collected.searches.len()
+                );
+            }
+            methods.append(&mut collected.methods);
+            searches.append(&mut collected.searches);
+            if needs_permutation_task(args.task)
+                && permutations.len() < args.max_samples
+                && let Some(trace) = permutation_trace(&evaluated, &refinement_options)
+            {
+                permutations.push(trace);
+            }
+        }
     }
+    methods.truncate(method_limit);
+    searches.truncate(search_limit);
     for (reason, (count, example)) in failures {
         eprintln!(
             "skipped {count} problem(s), e.g. {}: {reason}",
             example.display()
         );
     }
-    Ok((methods, searches))
+    Ok((methods, searches, permutations))
+}
+
+fn needs_permutation_task(task: TrainTask) -> bool {
+    matches!(task, TrainTask::Permutation | TrainTask::All)
+}
+
+fn permutation_trace(
+    evaluated: &EvaluatedProblem,
+    options: &RefinementOptions,
+) -> Option<PermutationTrace> {
+    let step_count = evaluated.plan.len();
+    if step_count < 2 {
+        return None;
+    }
+    let mut candidates = vec![(0..step_count).collect::<Vec<_>>()];
+    let shift_limit = step_count.min(4);
+    for shift in 1..shift_limit {
+        let mut order: Vec<usize> = (0..step_count).collect();
+        order.rotate_left(shift);
+        candidates.push(order);
+    }
+    for index in 0..step_count.saturating_sub(1).min(4) {
+        let mut order: Vec<usize> = (0..step_count).collect();
+        order.swap(index, index + 1);
+        candidates.push(order);
+    }
+    let candidate_count = candidates.len();
+
+    let mut best: Option<(Vec<usize>, usize)> = None;
+    let mut successful = 0usize;
+    for order in candidates {
+        let plan: Vec<String> = order
+            .iter()
+            .map(|index| evaluated.plan[*index].clone())
+            .collect();
+        let refinement = refine_plan_with_session(
+            &evaluated.domain,
+            &evaluated.problem,
+            &plan,
+            options,
+            &mut DecompositionSession::default(),
+        );
+        if let Ok(refinement) = refinement {
+            successful += 1;
+            let cost = refinement.plan.len();
+            let replace = best
+                .as_ref()
+                .is_none_or(|(_, best_cost)| cost < *best_cost);
+            if replace {
+                best = Some((order, cost));
+            }
+        }
+    }
+    let (target_order, _) = best?;
+    let confidence = if candidate_count == 0 {
+        0.0
+    } else {
+        successful as f32 / candidate_count as f32
+    };
+    Some(PermutationTrace {
+        context: AbstractPlanContext {
+            steps: evaluated.plan.clone(),
+            precedence: Vec::new(),
+            attempt: 0,
+            max_depth: options.max_depth,
+        },
+        target_order,
+        confidence,
+    })
 }
 
 fn load_one(
@@ -458,7 +660,13 @@ fn evaluate_one(
     Ok((domain, problem, evaluation.plan))
 }
 
-fn refine_one(evaluated: &EvaluatedProblem, options: &RefinementOptions) -> CollectedProblem {
+fn refine_one(
+    evaluated: &EvaluatedProblem,
+    options: &RefinementOptions,
+    method_limit: usize,
+    search_limit: usize,
+    tracing: bool,
+) -> CollectedProblem {
     if evaluated.plan.is_empty() {
         return CollectedProblem {
             methods: Vec::new(),
@@ -468,10 +676,12 @@ fn refine_one(evaluated: &EvaluatedProblem, options: &RefinementOptions) -> Coll
         };
     }
 
-    let mut collector = TraceCollector::default();
+    let mut collector = TraceCollector::new(method_limit, search_limit);
+    // Without a trace budget the refiner runs its fastest path: no candidate
+    // lists, no state clones and no ranking context are built at all.
     let refinement = {
         let mut session = DecompositionSession {
-            trace: Some(&mut collector),
+            trace: tracing.then_some(&mut collector as &mut dyn DecompositionTraceSink),
             ..DecompositionSession::default()
         };
         refine_plan_with_session(
@@ -501,11 +711,12 @@ fn build_examples(
     task: TrainTask,
     method_traces: &[MethodTrace],
     search_traces: &[SearchTrace],
+    permutation_traces: &[PermutationTrace],
     max_samples: usize,
 ) -> Result<Vec<Example>> {
     // Give each head a budget of its own. If one stream is sparse, the other
     // head receives the unused budget instead of leaving it idle.
-    let (method_budget, policy_budget) = if task == TrainTask::Both {
+    let (method_budget, policy_budget, permutation_budget) = if task == TrainTask::Both {
         let method_available = method_traces
             .iter()
             .filter(|trace| usable_method(trace))
@@ -518,28 +729,69 @@ fn build_examples(
         let method_budget = method_available.min(max_samples);
         let policy_budget = policy_available.min(max_samples);
         if method_budget + policy_budget <= max_samples {
-            (method_budget, policy_budget)
+            (method_budget, policy_budget, 0)
         } else {
             let methods = method_budget.min(max_samples - policy_budget.min(half));
             let policies = policy_budget.min(max_samples - methods);
-            (methods, policies)
+            (methods, policies, 0)
         }
+    } else if task == TrainTask::All {
+        let method_available = method_traces
+            .iter()
+            .filter(|trace| usable_method(trace))
+            .count();
+        let policy_available = search_traces
+            .iter()
+            .filter(|trace| usable_policy(trace))
+            .count();
+        let permutation_available = permutation_traces.len();
+        let third = max_samples.div_ceil(3);
+        let mut methods = method_available.min(third);
+        let mut policies = policy_available.min(third);
+        let mut permutations = permutation_available.min(third);
+        let mut spare = max_samples.saturating_sub(methods + policies + permutations);
+        if spare > 0 && methods < method_available {
+            let add = spare.min(method_available - methods);
+            methods += add;
+            spare -= add;
+        }
+        if spare > 0 && policies < policy_available {
+            let add = spare.min(policy_available - policies);
+            policies += add;
+            spare -= add;
+        }
+        if spare > 0 && permutations < permutation_available {
+            let add = spare.min(permutation_available - permutations);
+            permutations += add;
+        }
+        (methods, policies, permutations)
     } else if task == TrainTask::Method {
-        (max_samples, 0)
+        (max_samples, 0, 0)
+    } else if task == TrainTask::Policy {
+        (0, max_samples, 0)
+    } else if task == TrainTask::Permutation {
+        (0, 0, max_samples)
     } else {
-        (0, max_samples)
+        (0, max_samples, 0)
     };
     let method_examples = build_method_examples(method_traces, method_budget);
     let policy_examples = build_policy_examples(search_traces, policy_budget);
-    if !matches!(task, TrainTask::Both) {
-        return Ok(method_examples.into_iter().chain(policy_examples).collect());
+    let permutation_examples = build_permutation_examples(permutation_traces, permutation_budget);
+    if !matches!(task, TrainTask::Both | TrainTask::All) {
+        return Ok(method_examples
+            .into_iter()
+            .chain(policy_examples)
+            .chain(permutation_examples)
+            .collect());
     }
 
     // Alternate the two heads so that a `--task both` run sees both losses
     // interleaved instead of training one head for the whole first half.
-    let mut examples = Vec::with_capacity(method_examples.len() + policy_examples.len());
+    let mut examples =
+        Vec::with_capacity(method_examples.len() + policy_examples.len() + permutation_examples.len());
     let mut methods = method_examples.into_iter();
     let mut policies = policy_examples.into_iter();
+    let mut permutations = permutation_examples.into_iter();
     loop {
         let mut pushed = false;
         if let Some(example) = methods.next() {
@@ -550,11 +802,79 @@ fn build_examples(
             examples.push(example);
             pushed = true;
         }
+        if let Some(example) = permutations.next() {
+            examples.push(example);
+            pushed = true;
+        }
         if !pushed {
             break;
         }
     }
     Ok(examples)
+}
+
+#[cfg(any(feature = "neural", feature = "neural-gpu"))]
+fn build_permutation_examples(traces: &[PermutationTrace], budget: usize) -> Vec<Example> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    let mut examples = Vec::with_capacity(budget);
+    let chunk_size = EXAMPLE_CHUNK.min(budget).max(1);
+    for chunk in traces.chunks(chunk_size) {
+        let mut batch: Vec<Example> = chunk
+            .par_iter()
+            .filter_map(permutation_example)
+            .map(Example::Permutation)
+            .collect();
+        let remaining = budget - examples.len();
+        if batch.len() > remaining {
+            batch.truncate(remaining);
+        }
+        examples.extend(batch);
+        if examples.len() >= budget {
+            break;
+        }
+    }
+    examples
+}
+
+#[cfg(not(any(feature = "neural", feature = "neural-gpu")))]
+fn build_permutation_examples(traces: &[PermutationTrace], budget: usize) -> Vec<Example> {
+    traces
+        .iter()
+        .filter_map(permutation_example)
+        .take(budget)
+        .map(Example::Permutation)
+        .collect()
+}
+
+fn permutation_example(trace: &PermutationTrace) -> Option<PermutationExample> {
+    if trace.context.steps.len() < 2 || trace.target_order.len() != trace.context.steps.len() {
+        return None;
+    }
+    let graph = DecompositionGraph::abstract_plan(&trace.context);
+    if graph.plan_indices.len() != trace.target_order.len() {
+        return None;
+    }
+    let mut rank = vec![0usize; trace.target_order.len()];
+    for (position, index) in trace.target_order.iter().copied().enumerate() {
+        if index >= rank.len() {
+            return None;
+        }
+        rank[index] = position;
+    }
+    let total: f32 = (1..=rank.len()).map(|value| value as f32).sum();
+    let target: Vec<f32> = graph
+        .plan_indices
+        .iter()
+        .map(|index| (rank.len() - rank[*index]) as f32 / total)
+        .collect();
+    Some(PermutationExample {
+        graph,
+        target,
+        value_target: trace.confidence,
+        label: format!("abstract plan {} steps", trace.context.steps.len()),
+    })
 }
 
 fn usable_method(trace: &MethodTrace) -> bool {
@@ -643,19 +963,59 @@ fn build_policy_examples(traces: &[SearchTrace], budget: usize) -> Vec<Example> 
         .collect()
 }
 
+/// Keep at most `MAX_GRAPH_NODES - 2` candidates, preferring the ones that the
+/// refiner actually expanded.
+///
+/// The encoder stores a dense adjacency matrix, so the cost of one example is
+/// quadratic in the number of candidates. Without the cap a single decision
+/// with a few thousand grounded methods costs hundreds of megabytes, which is
+/// why the trainer used to grow without bound.
+fn select_candidates(successful: &[bool]) -> Vec<usize> {
+    let limit = MAX_GRAPH_NODES - 2;
+    if successful.len() <= limit {
+        return (0..successful.len()).collect();
+    }
+    let mut selected: Vec<usize> = (0..successful.len())
+        .filter(|index| successful[*index])
+        .collect();
+    for index in 0..successful.len() {
+        if selected.len() >= limit {
+            break;
+        }
+        if !successful[index] {
+            selected.push(index);
+        }
+    }
+    selected.sort_unstable();
+    selected.truncate(limit);
+    selected
+}
+
 fn method_example(trace: &MethodTrace) -> Option<MethodExample> {
     if trace.candidates.len() < 2 || trace.successful.len() != trace.candidates.len() {
         return None;
     }
-    let positives = trace.successful.iter().filter(|value| **value).count();
-    if positives == 0 {
+    let positive_count = trace.successful.iter().filter(|value| **value).count();
+    if positive_count == 0 {
         return None;
     }
-    let graph = DecompositionGraph::method(&trace.context, &trace.candidates);
-    if graph.candidate_indices.len() != trace.candidates.len() {
+    let selected = select_candidates(&trace.successful);
+    if selected.len() < 2 {
         return None;
     }
-    let target = normalized_labels(&trace.successful);
+    let candidates: Vec<_> = selected
+        .iter()
+        .map(|&index| trace.candidates[index].clone())
+        .collect();
+    let labels: Vec<bool> = selected
+        .iter()
+        .map(|&index| trace.successful[index])
+        .collect();
+    let graph = DecompositionGraph::method(&trace.context, &candidates);
+    if graph.candidate_indices.len() != candidates.len() {
+        return None;
+    }
+    let target = normalized_labels(&labels);
     Some(MethodExample {
         graph,
         target,
@@ -745,7 +1105,7 @@ fn format_duration(seconds: f64) -> String {
 
 fn train(
     args: &Args,
-    examples: &[Example],
+    examples: Vec<Example>,
     trained_kind: GuidanceKind,
     run_started: Instant,
 ) -> Result<()> {
@@ -757,14 +1117,20 @@ fn train(
     let device = training_device();
     let mut model = DecompositionModel::new(&device);
     let mut optimizer = AdamConfig::new().init();
-    let prepared: Vec<PreparedExample> = examples
-        .iter()
-        .filter_map(|example| prepare_example(example, &device))
-        .collect();
-    if prepared.len() != examples.len() {
+    // Each example owns a dense adjacency matrix; converting it to a tensor and
+    // dropping the graph immediately keeps only one copy alive instead of
+    // holding both representations for the whole training set.
+    let example_count = examples.len();
+    let mut prepared: Vec<PreparedExample> = Vec::with_capacity(example_count);
+    for example in examples {
+        if let Some(prepared_example) = prepare_example(&example, &device) {
+            prepared.push(prepared_example);
+        }
+    }
+    if prepared.len() != example_count {
         bail!(
             "{} training example(s) could not be prepared for the selected device",
-            examples.len() - prepared.len()
+            example_count - prepared.len()
         );
     }
     let total_steps = args.epochs.saturating_mul(prepared.len());
@@ -815,7 +1181,9 @@ fn train(
                 match example.task() {
                     TrainTask::Method => "method",
                     TrainTask::Policy => "policy",
+                    TrainTask::Permutation => "permutation",
                     TrainTask::Both => "both",
+                    TrainTask::All => "all",
                 },
                 example.label(),
                 step_loss
@@ -854,7 +1222,7 @@ fn train(
     println!(
         "training complete: {} epoch(s), {} example(s), best epoch loss {best_loss:.6e} | training time {} | total run time {}",
         args.epochs,
-        examples.len(),
+        example_count,
         format_duration(elapsed),
         format_duration(run_started.elapsed().as_secs_f64())
     );
@@ -868,17 +1236,25 @@ fn train(
         .iter()
         .filter(|example| example.task() == TrainTask::Method)
         .count();
-    let policy_count = examples.len() - method_count;
+    let policy_count = examples
+        .iter()
+        .filter(|example| example.task() == TrainTask::Policy)
+        .count();
+    let permutation_count = examples
+        .iter()
+        .filter(|example| example.task() == TrainTask::Permutation)
+        .count();
     fs::write(
         &metadata,
         format!(
-            "{{\"task\":\"{}\",\"hidden\":{},\"feature_dim\":{},\"examples\":{},\"method_examples\":{},\"policy_examples\":{}}}\n",
+            "{{\"task\":\"{}\",\"hidden\":{},\"feature_dim\":{},\"examples\":{},\"method_examples\":{},\"policy_examples\":{},\"permutation_examples\":{}}}\n",
             trained_kind.name(),
             DECOMPOSITION_HIDDEN,
             DECOMPOSITION_FEATURE_DIM,
-            examples.len(),
+            example_count,
             method_count,
-            policy_count
+            policy_count,
+            permutation_count
         ),
     )
     .with_context(|| format!("cannot write {}", metadata.display()))?;
@@ -918,11 +1294,24 @@ fn prepare_example(example: &Example, device: &Device) -> Option<PreparedExample
                 label: example.label.clone(),
             })
         }
+        Example::Permutation(example) => {
+            if example.graph.plan_indices.len() < 2 || example.target.len() != example.graph.plan_indices.len() {
+                return None;
+            }
+            Some(PreparedExample {
+                graph: example.graph.tensors(device),
+                indices: index_tensor(&example.graph.plan_indices, device),
+                target: tensor(&example.target, device),
+                value_target: Some(tensor(&[example.value_target], device)),
+                task: TrainTask::Permutation,
+                label: example.label.clone(),
+            })
+        }
     }
 }
 
 fn example_loss(model: &DecompositionModel, example: &PreparedExample) -> Option<Tensor<1>> {
-    let (method_scores, policy_scores, value) = model.forward(&example.graph);
+    let (method_scores, policy_scores, plan_scores, value) = model.forward(&example.graph);
     match example.task {
         TrainTask::Method => {
             let scores = method_scores.select(0, example.indices.clone());
@@ -935,7 +1324,15 @@ fn example_loss(model: &DecompositionModel, example: &PreparedExample) -> Option
             let value_loss = (value - value_target).square().mean().mul_scalar(0.1);
             Some(policy_loss + value_loss)
         }
+        TrainTask::Permutation => {
+            let scores = plan_scores.select(0, example.indices.clone());
+            let policy_loss = cross_entropy(scores, example.target.clone());
+            let value_target = example.value_target.clone()?;
+            let value_loss = (value - value_target).square().mean().mul_scalar(0.1);
+            Some(policy_loss + value_loss)
+        }
         TrainTask::Both => None,
+        TrainTask::All => None,
     }
 }
 

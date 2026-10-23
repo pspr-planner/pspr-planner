@@ -263,11 +263,13 @@ trains the shared graph encoder with listwise cross-entropy:
 
 - `--task method`: method-ranking loss only;
 - `--task policy`: frontier-policy plus value-regression loss only;
-- `--task both`: both losses interleaved in one Adam step stream.
+- `--task permutation`: abstract-plan permutation loss plus value regression;
+- `--task both`: method and frontier-policy losses interleaved in one stream;
+- `--task all`: method, frontier-policy, and permutation losses interleaved.
 
 ```bash
 cargo run --release --features neural-gpu --bin train_decomposition_model -- \
-  --task both --jobs 16 \
+  --task all --jobs 16 \
   --domain ../hddl/test_data/ipc/Blocksworld-GTOHP/domain.hddl \
   --problem ../hddl/test_data/ipc/Blocksworld-GTOHP/p01.hddl \
   --problem ../hddl/test_data/ipc/Blocksworld-GTOHP/p02.hddl \
@@ -298,7 +300,7 @@ exercises both heads:
 cargo run --features neural-base --bin train_decomposition_model -- \
   --domain tests/fixtures/partial/domain.hddl \
   --problem tests/fixtures/partial/p01.hddl \
-  --task both --epochs 8 --max-samples 64 \
+  --task all --epochs 8 --max-samples 64 \
   --output target/decomposition-partial.burnpack
 ```
 

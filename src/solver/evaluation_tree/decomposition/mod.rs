@@ -43,9 +43,13 @@ pub enum GuidanceKind {
     Method,
     /// Only the frontier policy/value heads are trained.
     Policy,
+    /// Only the abstract-plan permutation head is trained.
+    Permutation,
     /// Both heads were trained together.
     #[default]
     Both,
+    /// All decomposition heads were trained together.
+    All,
 }
 
 impl GuidanceKind {
@@ -53,7 +57,9 @@ impl GuidanceKind {
         match value {
             "method" => Some(Self::Method),
             "policy" => Some(Self::Policy),
+            "permutation" => Some(Self::Permutation),
             "both" => Some(Self::Both),
+            "all" => Some(Self::All),
             _ => None,
         }
     }
@@ -62,16 +68,22 @@ impl GuidanceKind {
         match self {
             Self::Method => "method",
             Self::Policy => "policy",
+            Self::Permutation => "permutation",
             Self::Both => "both",
+            Self::All => "all",
         }
     }
 
     pub fn uses_method(self) -> bool {
-        matches!(self, Self::Method | Self::Both)
+        matches!(self, Self::Method | Self::Both | Self::All)
     }
 
     pub fn uses_policy(self) -> bool {
-        matches!(self, Self::Policy | Self::Both)
+        matches!(self, Self::Policy | Self::Both | Self::All)
+    }
+
+    pub fn uses_permutation(self) -> bool {
+        matches!(self, Self::Permutation | Self::All)
     }
 }
 
@@ -109,6 +121,22 @@ pub struct SearchContext {
     pub depth: usize,
 }
 
+/// Context for proposing abstract-plan permutations before refinement.
+#[derive(Debug, Clone)]
+pub struct AbstractPlanContext {
+    pub steps: Vec<String>,
+    pub precedence: Vec<(usize, usize)>,
+    pub attempt: usize,
+    pub max_depth: usize,
+}
+
+/// One scored permutation candidate.
+#[derive(Debug, Clone)]
+pub struct AbstractPlanPermutation {
+    pub order: Vec<usize>,
+    pub score: f64,
+}
+
 /// Scores method candidates for a compound task.
 pub trait MethodRanker: std::fmt::Debug + Send + Sync {
     /// Return one score per candidate in `candidates`, or `None` to use the
@@ -131,6 +159,13 @@ pub trait SearchPolicy: std::fmt::Debug + Send + Sync {
     fn value(&self, _context: &SearchContext) -> Option<f64> {
         None
     }
+}
+
+/// Proposes one or more abstract-plan permutations.
+pub trait AbstractPlanPermuter: std::fmt::Debug + Send + Sync {
+    /// Return scored permutations, or `None` to keep the symbolic baseline
+    /// order.
+    fn propose(&self, context: &AbstractPlanContext) -> Option<Vec<AbstractPlanPermutation>>;
 }
 
 /// One recorded method-ranking decision.
@@ -166,6 +201,7 @@ pub trait DecompositionTraceSink: std::fmt::Debug {
 pub struct DecompositionSession<'a> {
     pub method_ranker: Option<&'a dyn MethodRanker>,
     pub search_policy: Option<&'a dyn SearchPolicy>,
+    pub plan_permuter: Option<&'a dyn AbstractPlanPermuter>,
     pub trace: Option<&'a mut dyn DecompositionTraceSink>,
 }
 
@@ -179,12 +215,28 @@ pub struct DecompositionGraph {
     pub candidate_indices: Vec<usize>,
     /// Node indices of ready tasks, in task order.
     pub ready_indices: Vec<usize>,
+    /// Node indices of abstract plan steps, in step order.
+    pub plan_indices: Vec<usize>,
     pub global_index: usize,
 }
+
+/// Upper bound on the number of nodes of one encoded graph.
+///
+/// The encoder stores the adjacency matrix densely, so a graph with `n` nodes
+/// costs `n * n * 4` bytes — twice that while the Burn tensor is materialised.
+/// The node count is driven by the number of grounded method candidates, which
+/// `EvaluationOptions::max_groundings` lets grow into the tens of thousands;
+/// such a decision would need hundreds of gigabytes for a single example. The
+/// builders therefore keep at most this many nodes.
+pub const MAX_GRAPH_NODES: usize = 256;
 
 impl DecompositionGraph {
     /// Build a graph for a method-ranking decision.
     pub fn method(context: &MethodRankingContext, candidates: &[MethodCandidate]) -> Self {
+        // Keep the node count bounded; see [`MAX_GRAPH_NODES`]. The retained
+        // candidates are a prefix of `candidates`, so a caller that truncates
+        // its labels by `graph.candidate_indices.len()` stays aligned.
+        let candidates = &candidates[..candidates.len().min(MAX_GRAPH_NODES - 2)];
         let candidate_count = candidates.len();
         let node_count = candidate_count + 2;
         let global_index = node_count - 1;
@@ -247,13 +299,16 @@ impl DecompositionGraph {
             adjacency,
             candidate_indices,
             ready_indices: Vec::new(),
+            plan_indices: Vec::new(),
             global_index,
         }
     }
 
     /// Build a graph for a partial-order frontier.
     pub fn frontier(context: &SearchContext) -> Self {
-        let task_count = context.tasks.len();
+        // See [`MAX_GRAPH_NODES`]: tasks beyond the cap are not encoded, and
+        // `ready_indices` only refers to the encoded ones.
+        let task_count = context.tasks.len().min(MAX_GRAPH_NODES - 1);
         let node_count = task_count + 1;
         let global_index = node_count - 1;
         let mut features = vec![0.0; node_count * FEATURE_DIM];
@@ -261,7 +316,7 @@ impl DecompositionGraph {
         let mut ready_indices = Vec::new();
         let remaining_count = context.remaining.iter().filter(|value| **value).count();
 
-        for (index, task) in context.tasks.iter().enumerate() {
+        for (index, task) in context.tasks.iter().take(task_count).enumerate() {
             let base = index * FEATURE_DIM;
             let ready = context.remaining[index]
                 && !context.predecessors[index]
@@ -291,7 +346,7 @@ impl DecompositionGraph {
             add_edge(&mut adjacency, node_count, global_index, index);
             add_edge(&mut adjacency, node_count, index, global_index);
         }
-        for (after, predecessors) in context.predecessors.iter().enumerate() {
+        for (after, predecessors) in context.predecessors.iter().take(task_count).enumerate() {
             for &before in predecessors {
                 if before < task_count {
                     add_edge(&mut adjacency, node_count, before, after);
@@ -315,6 +370,59 @@ impl DecompositionGraph {
             adjacency,
             candidate_indices: Vec::new(),
             ready_indices,
+            plan_indices: Vec::new(),
+            global_index,
+        }
+    }
+
+    /// Build a graph for abstract-plan permutation.
+    pub fn abstract_plan(context: &AbstractPlanContext) -> Self {
+        // See [`MAX_GRAPH_NODES`].
+        let step_count = context.steps.len().min(MAX_GRAPH_NODES - 1);
+        let node_count = step_count + 1;
+        let global_index = node_count - 1;
+        let mut features = vec![0.0; node_count * FEATURE_DIM];
+        let mut adjacency = vec![0.0; node_count * node_count];
+        let mut plan_indices = Vec::with_capacity(step_count);
+
+        for (index, step) in context.steps.iter().take(step_count).enumerate() {
+            plan_indices.push(index);
+            let base = index * FEATURE_DIM;
+            features[base] = 1.0;
+            features[base + 11] = hash_bucket(step);
+            features[base + 12] = (step.matches(',').count() + 1) as f32 / 8.0;
+            features[base + 8] = normalized(context.attempt, 8);
+            features[base + 21] = normalized(index, step_count.max(1));
+            features[base + 23] = step_count as f32 / 32.0;
+            add_edge(&mut adjacency, node_count, global_index, index);
+            add_edge(&mut adjacency, node_count, index, global_index);
+            if index > 0 {
+                add_edge(&mut adjacency, node_count, index - 1, index);
+                add_edge(&mut adjacency, node_count, index, index - 1);
+            }
+        }
+        for (before, after) in &context.precedence {
+            if *before < step_count && *after < step_count {
+                add_edge(&mut adjacency, node_count, *before, *after);
+                add_edge(&mut adjacency, node_count, *after, *before);
+            }
+        }
+
+        let base = global_index * FEATURE_DIM;
+        features[base + 2] = 1.0;
+        features[base + 14] = step_count as f32 / 32.0;
+        features[base + 8] = normalized(context.attempt, 8);
+        features[base + 23] = step_count as f32 / 32.0;
+        features[base + 18] = normalized(context.max_depth, 64);
+
+        connect_all(&mut adjacency, node_count);
+        DecompositionGraph {
+            node_count,
+            features,
+            adjacency,
+            candidate_indices: Vec::new(),
+            ready_indices: Vec::new(),
+            plan_indices,
             global_index,
         }
     }
@@ -335,6 +443,7 @@ impl DecompositionGraph {
             global_index: self.global_index,
             candidate_indices: self.candidate_indices.clone(),
             ready_indices: self.ready_indices.clone(),
+            plan_indices: self.plan_indices.clone(),
         }
     }
 }
@@ -349,6 +458,7 @@ pub struct GraphTensors {
     pub global_index: usize,
     pub candidate_indices: Vec<usize>,
     pub ready_indices: Vec<usize>,
+    pub plan_indices: Vec<usize>,
 }
 
 /// One graph-attention layer for the unified decomposition model.
@@ -401,6 +511,7 @@ pub struct DecompositionModel {
     layer_three: GraphLayer,
     method_head: Linear,
     policy_head: Linear,
+    plan_head: Linear,
     value_head: Linear,
 }
 
@@ -415,12 +526,14 @@ impl DecompositionModel {
             layer_three: GraphLayer::new(hidden, device),
             method_head: LinearConfig::new(hidden, 1).init(device),
             policy_head: LinearConfig::new(hidden, 1).init(device),
+            plan_head: LinearConfig::new(hidden, 1).init(device),
             value_head: LinearConfig::new(hidden, 1).init(device),
         }
     }
 
-    /// Return method-candidate scores, ready-task scores, and a scalar value.
-    pub fn forward(&self, graph: &GraphTensors) -> (Tensor<1>, Tensor<1>, Tensor<1>) {
+    /// Return method-candidate scores, ready-task scores, plan-step scores,
+    /// and a scalar value.
+    pub fn forward(&self, graph: &GraphTensors) -> (Tensor<1>, Tensor<1>, Tensor<1>, Tensor<1>) {
         let hidden = self.input.forward(graph.features.clone());
         let hidden = self.layer_one.forward(hidden, graph.adjacency.clone());
         let hidden = self.layer_two.forward(hidden, graph.adjacency.clone());
@@ -433,12 +546,16 @@ impl DecompositionModel {
             .policy_head
             .forward(hidden.clone())
             .reshape([graph.node_count]);
+        let plan_scores = self
+            .plan_head
+            .forward(hidden.clone())
+            .reshape([graph.node_count]);
         let global = hidden.slice(s![
             graph.global_index..graph.global_index + 1,
             0..DECOMPOSITION_HIDDEN
         ]);
         let value = self.value_head.forward(global).reshape([1]);
-        (method_scores, policy_scores, value)
+        (method_scores, policy_scores, plan_scores, value)
     }
 }
 
@@ -473,9 +590,9 @@ impl NeuralDecompositionModel {
         self.kind
     }
 
-    fn scores(&self, graph: &DecompositionGraph) -> Option<(Vec<f64>, Vec<f64>, f64)> {
+    fn scores(&self, graph: &DecompositionGraph) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, f64)> {
         let tensors = graph.tensors(&self.device);
-        let (method, policy, value) = self.model.forward(&tensors);
+        let (method, policy, plan, value) = self.model.forward(&tensors);
         let method = method
             .into_data()
             .try_to_vec::<f32>()
@@ -490,13 +607,20 @@ impl NeuralDecompositionModel {
             .into_iter()
             .map(f64::from)
             .collect::<Vec<_>>();
+        let plan = plan
+            .into_data()
+            .try_to_vec::<f32>()
+            .ok()?
+            .into_iter()
+            .map(f64::from)
+            .collect::<Vec<_>>();
         let value = value
             .into_data()
             .try_to_vec::<f32>()
             .ok()?
             .first()
             .copied()?;
-        Some((method, policy, f64::from(value)))
+        Some((method, policy, plan, f64::from(value)))
     }
 }
 
@@ -511,7 +635,7 @@ impl MethodRanker for NeuralDecompositionModel {
             return None;
         }
         let graph = DecompositionGraph::method(context, candidates);
-        let (method, _, _) = self.scores(&graph)?;
+        let (method, _, _, _) = self.scores(&graph)?;
         if method.len() != graph.node_count {
             return None;
         }
@@ -532,7 +656,7 @@ impl SearchPolicy for NeuralDecompositionModel {
         if graph.ready_indices.len() <= 1 {
             return None;
         }
-        let (_, policy, _) = self.scores(&graph)?;
+        let (_, policy, _, _) = self.scores(&graph)?;
         if policy.len() != graph.node_count {
             return None;
         }
@@ -551,8 +675,105 @@ impl SearchPolicy for NeuralDecompositionModel {
 
     fn value(&self, context: &SearchContext) -> Option<f64> {
         let graph = DecompositionGraph::frontier(context);
-        let (_, _, value) = self.scores(&graph)?;
+        let (_, _, _, value) = self.scores(&graph)?;
         value.is_finite().then_some(value)
+    }
+}
+
+#[cfg(feature = "neural-base")]
+impl AbstractPlanPermuter for NeuralDecompositionModel {
+    fn propose(&self, context: &AbstractPlanContext) -> Option<Vec<AbstractPlanPermutation>> {
+        if context.steps.len() <= 1 {
+            return None;
+        }
+        let graph = DecompositionGraph::abstract_plan(context);
+        let (_, _, plan, value) = self.scores(&graph)?;
+        if plan.len() != graph.node_count {
+            return None;
+        }
+        let mut predecessors = vec![HashSet::new(); context.steps.len()];
+        for (before, after) in &context.precedence {
+            if *before < context.steps.len() && *after < context.steps.len() {
+                predecessors[*after].insert(*before);
+            }
+        }
+
+        #[derive(Clone)]
+        struct Beam {
+            order: Vec<usize>,
+            used: Vec<bool>,
+            score: f64,
+        }
+
+        let beam_width = 8usize;
+        let top_k = 8usize;
+        let n = context.steps.len();
+        let mut beams = vec![Beam {
+            order: Vec::new(),
+            used: vec![false; n],
+            score: 0.0,
+        }];
+
+        for _ in 0..n {
+            let mut next = Vec::new();
+            for beam in &beams {
+                let mut ready = Vec::new();
+                for index in 0..n {
+                    if beam.used[index] {
+                        continue;
+                    }
+                    let blocked = predecessors[index].iter().any(|before| !beam.used[*before]);
+                    if !blocked {
+                        ready.push(index);
+                    }
+                }
+                if ready.is_empty() {
+                    continue;
+                }
+                ready.sort_by(|left, right| {
+                    let ls = plan[*left];
+                    let rs = plan[*right];
+                    rs.total_cmp(&ls).then(left.cmp(right))
+                });
+                for index in ready.into_iter().take(beam_width) {
+                    let score = plan[index];
+                    if !score.is_finite() {
+                        continue;
+                    }
+                    let mut child = beam.clone();
+                    child.used[index] = true;
+                    child.order.push(index);
+                    child.score += score;
+                    next.push(child);
+                }
+            }
+            if next.is_empty() {
+                return None;
+            }
+            next.sort_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then(left.order.cmp(&right.order))
+            });
+            next.truncate(beam_width);
+            beams = next;
+        }
+
+        let mut permutations = Vec::new();
+        for beam in beams {
+            if beam.order.len() != n {
+                continue;
+            }
+            permutations.push(AbstractPlanPermutation {
+                order: beam.order,
+                score: beam.score + value,
+            });
+            if permutations.len() >= top_k {
+                break;
+            }
+        }
+        (!permutations.is_empty()).then_some(permutations)
     }
 }
 
@@ -740,15 +961,45 @@ mod tests {
     }
 
     #[test]
+    fn abstract_plan_graph_tracks_step_nodes() {
+        let context = AbstractPlanContext {
+            steps: vec!["a(x)".to_string(), "b(y)".to_string(), "c(z)".to_string()],
+            precedence: vec![(0, 2)],
+            attempt: 1,
+            max_depth: 16,
+        };
+        let graph = DecompositionGraph::abstract_plan(&context);
+        assert_eq!(graph.node_count, 4);
+        assert_eq!(graph.plan_indices, vec![0, 1, 2]);
+        // global -> each step
+        assert_eq!(graph.adjacency[3 * 4], 1.0);
+        assert_eq!(graph.adjacency[3 * 4 + 1], 1.0);
+        assert_eq!(graph.adjacency[3 * 4 + 2], 1.0);
+        // precedence edge is present
+        assert_eq!(graph.adjacency[2], 1.0);
+    }
+
+    #[test]
     fn guidance_kind_parses_names() {
         assert_eq!(GuidanceKind::parse("method"), Some(GuidanceKind::Method));
         assert_eq!(GuidanceKind::parse("policy"), Some(GuidanceKind::Policy));
+        assert_eq!(
+            GuidanceKind::parse("permutation"),
+            Some(GuidanceKind::Permutation)
+        );
         assert_eq!(GuidanceKind::parse("both"), Some(GuidanceKind::Both));
+        assert_eq!(GuidanceKind::parse("all"), Some(GuidanceKind::All));
         assert_eq!(GuidanceKind::parse("other"), None);
         assert!(GuidanceKind::Method.uses_method());
         assert!(!GuidanceKind::Method.uses_policy());
+        assert!(!GuidanceKind::Method.uses_permutation());
         assert!(GuidanceKind::Both.uses_method());
         assert!(GuidanceKind::Both.uses_policy());
+        assert!(!GuidanceKind::Both.uses_permutation());
+        assert!(GuidanceKind::Permutation.uses_permutation());
+        assert!(GuidanceKind::All.uses_method());
+        assert!(GuidanceKind::All.uses_policy());
+        assert!(GuidanceKind::All.uses_permutation());
     }
 
     #[cfg(feature = "neural-base")]
@@ -788,11 +1039,12 @@ mod tests {
             },
         ];
         let graph = DecompositionGraph::method(&context, &candidates);
-        let (method, policy, value) = model.forward(&graph.tensors(&device));
+        let (method, policy, plan, value) = model.forward(&graph.tensors(&device));
         assert_eq!(method.dims(), [graph.node_count]);
         assert_eq!(policy.dims(), [graph.node_count]);
+        assert_eq!(plan.dims(), [graph.node_count]);
         assert_eq!(value.dims(), [1]);
-        for tensor in [method, policy, value] {
+        for tensor in [method, policy, plan, value] {
             let values = tensor.into_data().try_to_vec::<f32>().unwrap();
             assert!(values.iter().all(|value| value.is_finite()));
         }
@@ -810,7 +1062,8 @@ mod tests {
             state: BTreeSet::new(),
             depth: 0,
         };
-        let (_, _, value) = model.forward(&DecompositionGraph::frontier(&context).tensors(&device));
+        let (_, _, _, value) =
+            model.forward(&DecompositionGraph::frontier(&context).tensors(&device));
         assert!(value.into_data().try_to_vec::<f32>().unwrap()[0].is_finite());
     }
 

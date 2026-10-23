@@ -100,9 +100,10 @@ mod verify;
 
 pub use clustering::EvaluationTree;
 pub use decomposition::{
+    AbstractPlanContext, AbstractPlanPermutation, AbstractPlanPermuter,
     DECOMPOSITION_FEATURE_DIM, DecompositionGraph, DecompositionSession, DecompositionTraceSink,
-    GuidanceKind, MethodCandidate, MethodRanker, MethodRankingContext, MethodTrace, SearchContext,
-    SearchPolicy, SearchTrace,
+    GuidanceKind, MAX_GRAPH_NODES, MethodCandidate, MethodRanker, MethodRankingContext,
+    MethodTrace, SearchContext, SearchPolicy, SearchTrace,
 };
 #[cfg(feature = "neural-base")]
 pub use decomposition::{

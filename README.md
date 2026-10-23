@@ -149,9 +149,9 @@ is not thread-safe. `--jobs N` sets the worker count, and
 `RAYON_NUM_THREADS` is the fallback.
 
 ```bash
-# Collect method and frontier traces and train both heads together.
+# Collect method, frontier, and permutation traces and train all heads together.
 cargo run --features neural-gpu --bin train_decomposition_model -- \
-  --task both --jobs 16 --ipc-dir ../hddl/test_data/ipc --epochs 20 \
+  --task all --jobs 16 --ipc-dir ../hddl/test_data/ipc --epochs 20 \
   --output target/decomposition-model.burnpack
 
 # Use the joint checkpoint during refinement. Separate checkpoints can be
@@ -160,8 +160,10 @@ PSPR_DECOMPOSITION_MODEL=target/decomposition-model.burnpack \
   cargo run --features neural-base -- domain.hddl p01.hddl
 ```
 
-`--task method`, `--task policy`, and `--task both` choose the training
-objective; `both` interleaves both listwise losses in one optimizer stream.
+`--task method`, `--task policy`, `--task permutation`, `--task both`, and
+`--task all` choose the training objective. `both` interleaves method and
+frontier-policy losses, while `all` interleaves method, frontier-policy, and
+permutation losses in one optimizer stream.
 The trainer writes a `.json` sidecar recording the heads that actually had
 training examples, and inference uses it so an untrained head is never
 activated. Method ranking only reorders applicable methods; the policy only
@@ -198,7 +200,35 @@ for details and the unordered test fixture used to exercise policy training.
 | `examples/bench_modes.rs` | Machine-readable benchmark for hierarchical refinement |
 | `examples/compare_merge_optimizers.rs` | Adam versus SGD, momentum, adaptive, CG, and quasi-Newton merge optimizers |
 | `scripts/compare_decomposition.sh` | PSPR-versus-pandaPI benchmark harness |
+| `scripts/install_panda.sh` | Builds the pandaPI parser, grounder, and engine under `PANDA_ROOT` |
 | `scripts/run_ipc_vs_panda.sh` | Timeout-safe per-instance IPC runner that reports PSPR and PANDA side-by-side |
+
+## Comparing against pandaPI
+
+The comparison harness needs the `pandaPI` toolchain (parser, grounder, and
+engine). `scripts/install_panda.sh` builds all three plus the `gengetopt` they
+require into a self-contained prefix, so nothing is installed system-wide:
+
+```bash
+scripts/install_panda.sh                     # default PANDA_ROOT=/tmp/pandaPI
+PANDA_ROOT=/opt/panda scripts/install_panda.sh  # or any other prefix
+```
+
+The installer is idempotent, disables the grounder's OpenCL path (the runtime
+library is often present without the headers), and patches the grounder for
+GCC 13+ where `<algorithm>` is no longer included transitively.
+
+`scripts/run_ipc_vs_panda.sh` then runs the IPC case list one instance at a
+time, with per-stage timeouts so a single hard instance cannot stall the whole
+run. It reports a markdown table plus `target/panda-comparison/results.csv`:
+
+```bash
+scripts/run_ipc_vs_panda.sh
+CASE_FILTER='Blocksworld|Depots' scripts/run_ipc_vs_panda.sh
+```
+
+`scripts/compare_decomposition.sh` is the older full sweep that also reports
+PANDA parse/ground/search splits for every mode of the planner.
 
 ## Formula support
 

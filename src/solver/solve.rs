@@ -4,7 +4,8 @@ use crate::solver::evaluation_tree::{
 };
 #[cfg(feature = "neural-base")]
 use crate::solver::evaluation_tree::{
-    DecompositionSession, GuidanceKind, MethodRanker, NeuralDecompositionModel, SearchPolicy,
+    AbstractPlanPermuter, DecompositionSession, GuidanceKind, MethodRanker,
+    NeuralDecompositionModel, SearchPolicy,
 };
 use crate::solver::problem::Problem;
 
@@ -70,7 +71,9 @@ fn solve_hierarchical_once(
     {
         let method_model = model_from_env("PSPR_METHOD_RANKER", Some(GuidanceKind::Method));
         let policy_model = model_from_env("PSPR_SEARCH_POLICY", Some(GuidanceKind::Policy));
-        if method_model.is_some() || policy_model.is_some() {
+        let permutation_model =
+            model_from_env("PSPR_PLAN_PERMUTER", Some(GuidanceKind::Permutation));
+        if method_model.is_some() || policy_model.is_some() || permutation_model.is_some() {
             let mut session = DecompositionSession {
                 method_ranker: method_model
                     .as_ref()
@@ -78,6 +81,9 @@ fn solve_hierarchical_once(
                 search_policy: policy_model
                     .as_ref()
                     .map(|model| model as &dyn SearchPolicy),
+                plan_permuter: permutation_model
+                    .as_ref()
+                    .map(|model| model as &dyn AbstractPlanPermuter),
                 trace: None,
             };
             return evaluation_tree::solve_hierarchical_with_session(
@@ -94,6 +100,9 @@ fn solve_hierarchical_once(
             let mut session = DecompositionSession {
                 method_ranker: kind.uses_method().then_some(&model as &dyn MethodRanker),
                 search_policy: kind.uses_policy().then_some(&model as &dyn SearchPolicy),
+                plan_permuter: kind
+                    .uses_permutation()
+                    .then_some(&model as &dyn AbstractPlanPermuter),
                 trace: None,
             };
             return evaluation_tree::solve_hierarchical_with_session(
@@ -127,7 +136,11 @@ fn model_from_env(
                 None => true,
                 Some(GuidanceKind::Method) => kind.uses_method(),
                 Some(GuidanceKind::Policy) => kind.uses_policy(),
-                Some(GuidanceKind::Both) => kind == GuidanceKind::Both,
+                Some(GuidanceKind::Permutation) => kind.uses_permutation(),
+                Some(GuidanceKind::Both) => kind.uses_method() && kind.uses_policy(),
+                Some(GuidanceKind::All) => {
+                    kind.uses_method() && kind.uses_policy() && kind.uses_permutation()
+                }
             };
             if !supported {
                 eprintln!(

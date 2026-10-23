@@ -12,7 +12,7 @@
 //! method summaries (stage G) unconditionally, because the comparison showed
 //! that C+G is both faster and at least as complete as C alone.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,11 +23,11 @@ use crate::solver::domain::Domain;
 use crate::solver::problem::Problem;
 
 use super::decomposition::{
-    DecompositionSession, MethodCandidate, MethodRankingContext, MethodTrace, SearchContext,
-    SearchTrace,
+    AbstractPlanContext, DecompositionSession, MethodCandidate, MethodRankingContext,
+    MethodTrace, SearchContext, SearchTrace,
 };
 use super::formula::{self, Universe};
-use super::graph::{TaskNode, ground_methods_bounded};
+use super::graph::{TaskNode, ground_methods_bounded, ground_task_network_edges};
 use super::leaf::initial_atoms;
 use super::verify::{GoalStatus, Step, apply_action, holds, parse_step};
 use super::{EvaluationOptions, SgplanMerger, evaluate};
@@ -424,14 +424,32 @@ pub fn solve_hierarchical_with_session(
     );
     let mut last_error = None;
     let mut refinement = None;
+    let precedence = abstract_plan_precedence(
+        domain,
+        problem,
+        &evaluation.plan,
+        evaluation_options.max_groundings,
+    );
     for attempt in 0..REFINEMENT_RETRY_ATTEMPTS {
         let retry = refined_retry_options(options, attempt);
-        match refine_plan_with_session(domain, problem, &evaluation.plan, &retry, session) {
-            Ok(candidate) => {
-                refinement = Some(candidate);
-                break;
+        let candidates = permutation_candidates(
+            &evaluation.plan,
+            &precedence,
+            attempt,
+            &retry,
+            session,
+        );
+        for plan in candidates {
+            match refine_plan_with_session(domain, problem, &plan, &retry, session) {
+                Ok(candidate) => {
+                    refinement = Some(candidate);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
             }
-            Err(error) => last_error = Some(error),
+        }
+        if refinement.is_some() {
+            break;
         }
     }
     let refinement = refinement
@@ -441,6 +459,132 @@ pub fn solve_hierarchical_with_session(
         "the refinement does not reach the problem goal"
     );
     Ok(refinement)
+}
+
+fn abstract_plan_precedence(
+    domain: &Domain,
+    problem: &Problem,
+    abstract_plan: &[String],
+    max_groundings: usize,
+) -> Vec<(usize, usize)> {
+    let Ok(grounded) = ground_task_network_edges(domain, problem, max_groundings) else {
+        return Vec::new();
+    };
+    if grounded.tasks.len() != abstract_plan.len() {
+        return Vec::new();
+    }
+
+    let mut by_task: HashMap<TaskNode, VecDeque<usize>> = HashMap::new();
+    for (index, task) in grounded.tasks.iter().enumerate() {
+        by_task.entry(task.clone()).or_default().push_back(index);
+    }
+
+    let mut step_to_ground = Vec::with_capacity(abstract_plan.len());
+    for step in abstract_plan {
+        let Ok(parsed) = parse_step(step) else {
+            return Vec::new();
+        };
+        let task = parsed.task();
+        let Some(indices) = by_task.get_mut(task) else {
+            return Vec::new();
+        };
+        let Some(ground_index) = indices.pop_front() else {
+            return Vec::new();
+        };
+        step_to_ground.push(ground_index);
+    }
+
+    let mut ground_to_step = vec![usize::MAX; step_to_ground.len()];
+    for (step, ground) in step_to_ground.into_iter().enumerate() {
+        if ground >= ground_to_step.len() {
+            return Vec::new();
+        }
+        ground_to_step[ground] = step;
+    }
+
+    let mut precedence = Vec::new();
+    for (before, after) in grounded.edges {
+        if before >= ground_to_step.len() || after >= ground_to_step.len() {
+            return Vec::new();
+        }
+        let step_before = ground_to_step[before];
+        let step_after = ground_to_step[after];
+        if step_before == usize::MAX || step_after == usize::MAX {
+            return Vec::new();
+        }
+        if step_before != step_after {
+            precedence.push((step_before, step_after));
+        }
+    }
+    precedence.sort_unstable();
+    precedence.dedup();
+    precedence
+}
+
+fn valid_plan_permutation(order: &[usize], step_count: usize, precedence: &[(usize, usize)]) -> bool {
+    if order.len() != step_count {
+        return false;
+    }
+    let mut seen = vec![false; step_count];
+    let mut position = vec![0usize; step_count];
+    for (rank, index) in order.iter().copied().enumerate() {
+        if index >= step_count || seen[index] {
+            return false;
+        }
+        seen[index] = true;
+        position[index] = rank;
+    }
+    precedence
+        .iter()
+        .all(|(before, after)| position[*before] < position[*after])
+}
+
+fn permutation_candidates(
+    abstract_plan: &[String],
+    precedence: &[(usize, usize)],
+    attempt: usize,
+    options: &RefinementOptions,
+    session: &mut DecompositionSession<'_>,
+) -> Vec<Vec<String>> {
+    let mut candidates = vec![abstract_plan.to_vec()];
+    let Some(permuter) = session.plan_permuter else {
+        return candidates;
+    };
+    if abstract_plan.len() <= 1 {
+        return candidates;
+    }
+    let context = AbstractPlanContext {
+        steps: abstract_plan.to_vec(),
+        precedence: precedence.to_vec(),
+        attempt,
+        max_depth: options.max_depth,
+    };
+    let Some(mut proposals) = permuter.propose(&context) else {
+        return candidates;
+    };
+    proposals.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then(left.order.cmp(&right.order))
+    });
+    for proposal in proposals {
+        if !proposal.score.is_finite() {
+            continue;
+        }
+        if !valid_plan_permutation(&proposal.order, abstract_plan.len(), precedence) {
+            continue;
+        }
+        let plan: Vec<String> = proposal
+            .order
+            .into_iter()
+            .map(|index| abstract_plan[index].clone())
+            .collect();
+        if !candidates.iter().any(|existing| existing == &plan) {
+            candidates.push(plan);
+        }
+    }
+    candidates
 }
 
 fn valid_method_order(order: &[usize], candidate_count: usize) -> bool {
@@ -610,11 +754,15 @@ fn refine_task_uncached(
     let (instances, applicable) =
         applicability_cache.lookup(domain, universe, task, state, options.max_groundings)?;
 
-    // Ranking candidates clone method names and bindings and clone the state.
-    // The symbolic default path never needs them, so build them only when a
-    // ranker or a trace sink is attached.
+    // A ranking decision needs alternatives: with fewer than two applicable
+    // methods there is nothing to rank, and a decision in which no candidate
+    // produced a refinement teaches the ranker nothing. Both cases are by far
+    // the most common — the search visits millions of dead ends — and each
+    // trace clones the whole solver state, so the candidates and the context
+    // are only materialised for usable decisions.
+    let decision = applicable.len() >= 2;
     let tracing = session.trace.is_some();
-    let ranked = session.method_ranker.is_some() || tracing;
+    let ranked = decision && (session.method_ranker.is_some() || tracing);
     let candidates: Vec<MethodCandidate> = if ranked {
         applicable
             .iter()
@@ -641,15 +789,15 @@ fn refine_task_uncached(
         depth,
         max_depth: options.max_depth,
     });
-    let baseline: Vec<usize> = (0..applicable.len()).collect();
-    let order = match (session.method_ranker, context.as_ref()) {
+    // The baseline order is the identity, so it is only materialised when a
+    // ranker or the trace needs it; iterating `0..len` below is equivalent.
+    let ranked_order: Option<Vec<usize>> = match (session.method_ranker, context.as_ref()) {
         (Some(ranker), Some(context)) => ranker
             .rank(context, &candidates)
             .filter(|scores| scores.len() == candidates.len())
             .and_then(rank_order)
-            .filter(|order| valid_method_order(order, candidates.len()))
-            .unwrap_or(baseline),
-        _ => baseline,
+            .filter(|order| valid_method_order(order, candidates.len())),
+        _ => None,
     };
 
     let mut results = Vec::new();
@@ -658,11 +806,14 @@ fn refine_task_uncached(
     } else {
         Vec::new()
     };
-    let method_limit = applicable.len();
-    for &candidate_slot in order.iter().take(method_limit) {
+    for slot in 0..applicable.len() {
         if !budget.has_time() {
             break;
         }
+        let candidate_slot = match &ranked_order {
+            Some(order) => order[slot],
+            None => slot,
+        };
         let grounded_index = applicable[candidate_slot] as usize;
         let instance = &instances[grounded_index];
         let before = results.len();
@@ -701,8 +852,12 @@ fn refine_task_uncached(
         }
     }
 
-    if let Some(trace) = session.trace.as_deref_mut() {
+    if let Some(trace) = session.trace.as_deref_mut()
+        && candidates.len() >= 2
+        && successful.iter().any(|successful| *successful)
+    {
         let context = context.expect("a trace sink implies a ranking context");
+        let order = ranked_order.unwrap_or_else(|| (0..candidates.len()).collect());
         trace.method_trace(MethodTrace {
             context,
             candidates,
@@ -969,6 +1124,7 @@ fn search_partial_inner(
     }
 
     if ready.len() > 1
+        && successful.iter().any(|successful| *successful)
         && let Some(trace) = session.trace.as_deref_mut()
     {
         let context = context.expect("a trace sink implies a search context");
